@@ -10,7 +10,7 @@ uv run --no-project python tests/release/run.py --gd ./gd
 uv run --no-project python tests/release/run.py --gd bin/gd.macos.template_release.arm64
 ```
 
-Python を直接使う場合は `python tests/release/run.py --gd ./gd` でも実行できます。Windows では `--gd gd.exe` または実行体の path を指定します。Linux の source build では `bin/gd.linuxbsd.template_release.x86_64` を指定します。
+Python を直接使う場合は `python tests/release/run.py --gd ./gd` でも実行できます。Windows では `--gd gd.exe` または実行体の path を指定します。Linux の source build ではarchitectureに合わせて`bin/gd.linuxbsd.template_release.arm64`または`bin/gd.linuxbsd.template_release.x86_64`を指定します。
 
 | 対象 | 確認する契約 |
 |---|---|

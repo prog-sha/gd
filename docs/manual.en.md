@@ -19,7 +19,7 @@ Built-in HTTP/2 multiplexing and nonblocking networking keep concurrent connecti
 
 ## Install
 
-Supported platforms are macOS arm64/x86_64, Linux x86_64, and Windows x86_64.
+Supported platforms are macOS arm64/x86_64, Linux arm64/x86_64, and Windows x86_64.
 Download the archive for your OS from [Releases](https://github.com/prog-sha/gd/releases/latest)
 and put the `gd` inside on your PATH. When `gd --version` prints a version, the install is done.
 The SHA-256 of each archive can be checked against the bundled `SHA256SUMS`. The macOS build is signed with a Developer ID and notarized by Apple.
@@ -30,7 +30,7 @@ The SHA-256 of each archive can be checked against the bundled `SHA256SUMS`. The
 curl -fsSL https://gd.progsha.com/install.sh | sh
 ```
 
-The installer checks the archive checksum and installs to `~/.local/bin`. Add that directory to your PATH if prompted. Linux binaries require x86_64 and glibc 2.38 or newer.
+The installer checks the archive checksum and installs to `~/.local/bin`. Add that directory to your PATH if prompted. Linux binaries require arm64 or x86_64 and glibc 2.38 or newer.
 
 ### Windows (PowerShell)
 
@@ -52,7 +52,7 @@ brew install prog-sha/gd/gd
 
 This tap lives in the product repository and installs the signed Universal binary. Update with `brew update && brew upgrade prog-sha/gd/gd`; remove with `brew uninstall gd`.
 
-### apt (Linux amd64)
+### apt (Linux amd64 / arm64)
 
 Use an apt-based distribution with glibc 2.38 or newer, such as Ubuntu 24.04 or Debian 13. Ubuntu 22.04 and Debian 12 need a source build. The dedicated repository uses a signing key restricted to this source:
 
@@ -60,7 +60,7 @@ Use an apt-based distribution with glibc 2.38 or newer, such as Ubuntu 24.04 or 
 sudo install -d -m 0755 /etc/apt/keyrings
 curl -fsSL https://gd.progsha.com/apt/gd.asc | sudo tee /etc/apt/keyrings/gd.asc >/dev/null
 sudo chmod 0644 /etc/apt/keyrings/gd.asc
-echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/gd.asc] https://gd.progsha.com/apt stable main' | sudo tee /etc/apt/sources.list.d/gd.list
+echo 'deb [arch=amd64,arm64 signed-by=/etc/apt/keyrings/gd.asc] https://gd.progsha.com/apt stable main' | sudo tee /etc/apt/sources.list.d/gd.list
 sudo apt update
 sudo apt install gd
 ```
@@ -80,7 +80,8 @@ TLS is built in, so no separate TLS library is needed.
 git clone --branch 0.7 https://github.com/prog-sha/gd.git
 cd gd
 scons platform=macos target=template_release -j8
-# Linux: platform=linuxbsd
+# Linux ARM64: platform=linuxbsd arch=arm64
+# Linux x86-64: platform=linuxbsd arch=x86_64
 # Windows: platform=windows windows_subsystem=console
 ```
 

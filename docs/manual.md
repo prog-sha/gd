@@ -19,7 +19,7 @@ HTTP/2の多重化とノンブロッキング通信を内蔵。UTF-8・JSON・he
 
 ## 導入
 
-対応環境はmacOS arm64/x86_64、Linux x86_64、Windows x86_64です。
+対応環境はmacOS arm64/x86_64、Linux arm64/x86_64、Windows x86_64です。
 [Releases](https://github.com/prog-sha/gd/releases/latest)からOSに合うarchiveを取得し、
 中の`gd`をPATHの通ったdirectoryへ置きます。`gd --version`が版を表示すれば導入は完了です。
 配布物のSHA-256は同梱の`SHA256SUMS`で照合できます。macOS版はDeveloper ID署名とAppleの公証を通しています。
@@ -30,7 +30,7 @@ HTTP/2の多重化とノンブロッキング通信を内蔵。UTF-8・JSON・he
 curl -fsSL https://gd.progsha.com/install.sh | sh
 ```
 
-チェックサムを照合して`~/.local/bin`へ導入します。案内が出た場合は、このdirectoryをPATHへ追加してください。Linux配布バイナリにはx86_64とglibc 2.38以降が必要です。
+チェックサムを照合して`~/.local/bin`へ導入します。案内が出た場合は、このdirectoryをPATHへ追加してください。Linux配布バイナリにはarm64またはx86_64とglibc 2.38以降が必要です。
 
 ### Windows（PowerShell）
 
@@ -52,7 +52,7 @@ brew install prog-sha/gd/gd
 
 製品リポジトリをtapとして使い、署名済みUniversal実行体を導入します。更新は`brew update && brew upgrade prog-sha/gd/gd`、削除は`brew uninstall gd`です。
 
-### apt（Linux amd64）
+### apt（Linux amd64 / arm64）
 
 Ubuntu 24.04、Debian 13など、glibc 2.38以降のapt対応環境で利用できます。Ubuntu 22.04やDebian 12ではsourceからbuildしてください。専用の署名鍵を、この配布元だけに適用します。
 
@@ -60,7 +60,7 @@ Ubuntu 24.04、Debian 13など、glibc 2.38以降のapt対応環境で利用で�
 sudo install -d -m 0755 /etc/apt/keyrings
 curl -fsSL https://gd.progsha.com/apt/gd.asc | sudo tee /etc/apt/keyrings/gd.asc >/dev/null
 sudo chmod 0644 /etc/apt/keyrings/gd.asc
-echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/gd.asc] https://gd.progsha.com/apt stable main' | sudo tee /etc/apt/sources.list.d/gd.list
+echo 'deb [arch=amd64,arm64 signed-by=/etc/apt/keyrings/gd.asc] https://gd.progsha.com/apt stable main' | sudo tee /etc/apt/sources.list.d/gd.list
 sudo apt update
 sudo apt install gd
 ```
@@ -80,7 +80,8 @@ TLSは内蔵しているため、別のTLSライブラリは要りません。
 git clone --branch 0.7 https://github.com/prog-sha/gd.git
 cd gd
 scons platform=macos target=template_release -j8
-# Linux: platform=linuxbsd
+# Linux ARM64: platform=linuxbsd arch=arm64
+# Linux x86-64: platform=linuxbsd arch=x86_64
 # Windows: platform=windows windows_subsystem=console
 ```
 
