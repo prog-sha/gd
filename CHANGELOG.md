@@ -2,6 +2,10 @@
 
 公開版の利用者に影響する変更を記録します。版はSemantic Versioningに従います。
 
+## 0.7.5
+
+- macOS配布版でad-hoc署名のGDExtensionとその依存ライブラリを読み込めるよう、CLI専用entitlementを付与します。Hardened Runtimeと公証は維持します。macOSの利用者は新しいarchiveを取得してください。
+
 ## 0.7.4
 
 ### 失敗の返し方

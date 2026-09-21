@@ -7,5 +7,5 @@ status = "stable"
 module_config = ""
 website = "https://gd.progsha.com/"
 docs = "4.7"
-cli = "0.7.4"  # Public runtime version.
+cli = "0.7.5"  # Public runtime version.
 cli_status = "stable"  # Public runtime release channel.
