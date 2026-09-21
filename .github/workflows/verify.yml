@@ -45,13 +45,13 @@ jobs:
           if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:ARCHIVE_HASH) { throw 'Archive fingerprint mismatch' }
           Expand-Archive $archive tmp/candidate
           $build = Get-Content tmp/candidate/gd/BUILD.json -Raw | ConvertFrom-Json
-          if ($build.sha -cne $env:SOURCE_SHA -or $build.platform -cne 'windows') { throw 'Source or platform mismatch' }
+          if ($build.sha -cne $env:SOURCE_SHA -or $build.platform -cne 'windows' -or $build.arch -cne 'x86_64') { throw 'Source, platform, or architecture mismatch' }
           if ((Get-FileHash tmp/candidate/gd/gd.exe -Algorithm SHA256).Hash.ToLowerInvariant() -cne $build.binary_sha256) { throw 'Executable fingerprint mismatch' }
           uv run --no-project python -B tmp/candidate/gd/tests/release/run.py --gd tmp/candidate/gd/gd.exe
           if ($LASTEXITCODE -ne 0) { throw 'Native acceptance failed' }
           uv run --no-project python -B tests/release/sample.py --gd tmp/candidate/gd/gd.exe --sample samples/web
           if ($LASTEXITCODE -ne 0) { throw 'Web sample failed' }
-          @{ public = $env:GITHUB_SHA; tag = $env:RELEASE_TAG; source = $env:SOURCE_SHA; archive = $env:ARCHIVE_HASH; binary = $build.binary_sha256 } | ConvertTo-Json | Set-Content tmp/verification.json
+          @{ public = $env:GITHUB_SHA; tag = $env:RELEASE_TAG; source = $env:SOURCE_SHA; archive = $env:ARCHIVE_HASH; binary = $build.binary_sha256; arch = $build.arch } | ConvertTo-Json | Set-Content tmp/verification.json
       - name: Verify reviewed Windows installer
         if: inputs.installer_sha256 != ''
         shell: pwsh

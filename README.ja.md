@@ -47,7 +47,7 @@ gd serve main.gd
 
 ## 導入
 
-対応環境はmacOS arm64/x86_64、Linux x86_64、Windows x86_64です。
+対応環境はmacOS arm64/x86_64、Linux arm64/x86_64、Windows x86_64です。
 [Releases](https://github.com/prog-sha/gd/releases/latest)からarchiveを取得し、`gd`をPATHの通ったdirectoryへ置いてください。
 sourceからのbuildは[ソースからのビルド](#ソースからのビルド)を参照してください。
 
@@ -128,13 +128,14 @@ cd gd
 scons platform=macos target=template_release -j12
 ```
 
-Linuxは`platform=linuxbsd`、WindowsのMinGWビルドは`platform=windows arch=x86_64 use_mingw=yes windows_subsystem=console`です。
+Linuxは`platform=linuxbsd arch=arm64`または`arch=x86_64`、WindowsのMinGWビルドは`platform=windows arch=x86_64 use_mingw=yes windows_subsystem=console`です。
 実行体は`bin/`へ生成されます。この公開リポジトリには製品ソースと利用文書を収録しています。
 
 同梱の[公開契約テスト](tests/release/README.md)で動作を確認できます。
 
 ```sh
 uv run --no-project python tests/release/run.py --gd bin/gd.macos.template_release.arm64
+# Linux ARM64: --gd bin/gd.linuxbsd.template_release.arm64
 ```
 
 ## 来歴とライセンス

@@ -47,7 +47,7 @@ gd serve main.gd
 
 ## Install
 
-Supported platforms are macOS arm64/x86_64, Linux x86_64, and Windows x86_64.
+Supported platforms are macOS arm64/x86_64, Linux arm64/x86_64, and Windows x86_64.
 Download the archive from [Releases](https://github.com/prog-sha/gd/releases/latest) and put `gd` on your PATH.
 To build from source, see [Build from source](#build-from-source).
 
@@ -128,7 +128,7 @@ cd gd
 scons platform=macos target=template_release -j12
 ```
 
-Use `platform=linuxbsd` on Linux. For a Windows MinGW build, use
+Use `platform=linuxbsd arch=arm64` or `arch=x86_64` on Linux. For a Windows MinGW build, use
 `platform=windows arch=x86_64 use_mingw=yes windows_subsystem=console`.
 Executables are written to `bin/`. This public repository contains product source and user documentation.
 
@@ -136,6 +136,7 @@ Run the bundled [public acceptance tests](tests/release/README.md) to check the 
 
 ```sh
 uv run --no-project python tests/release/run.py --gd bin/gd.macos.template_release.arm64
+# Linux ARM64: --gd bin/gd.linuxbsd.template_release.arm64
 ```
 
 ## Origin and license
