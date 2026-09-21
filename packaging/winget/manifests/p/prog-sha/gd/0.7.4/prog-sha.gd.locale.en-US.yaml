@@ -1,0 +1,12 @@
+# Describe the public command-line package.
+PackageIdentifier: prog-sha.gd
+PackageVersion: 0.7.4
+PackageLocale: en-US
+Publisher: prog-sha
+PackageName: gd
+PackageUrl: https://github.com/prog-sha/gd
+License: MIT
+LicenseUrl: https://github.com/prog-sha/gd/blob/0.7/LICENSE.txt
+ShortDescription: Command-line runtime for typed scripts, services, and data workflows
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0

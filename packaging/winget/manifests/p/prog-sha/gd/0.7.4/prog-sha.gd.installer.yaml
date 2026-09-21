@@ -1,0 +1,14 @@
+# Install the checksum-verified portable executable from the public archive.
+PackageIdentifier: prog-sha.gd
+PackageVersion: 0.7.4
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+- RelativeFilePath: gd\gd.exe
+  PortableCommandAlias: gd
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/prog-sha/gd/releases/download/0.7.4-stable/gd-windows-x86_64.zip
+  InstallerSha256: DE573CA4D4AB087427564EFA5A8BF65C963D673FFCB5C0BE2902B3A9669F4DBB
+ManifestType: installer
+ManifestVersion: 1.10.0
