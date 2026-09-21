@@ -1,0 +1,3 @@
+# Keep installed dependencies and local package locks out of the sample source.
+pkg/
+.godot/

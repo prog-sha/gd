@@ -1,0 +1,43 @@
+#!/usr/bin/env python
+from misc.utility.scons_hints import *
+
+Import("env")
+
+import cli_builders
+
+env_cli = env.Clone()
+
+# Expose the PBKDF2 implementation through its bundled cryptography headers.
+env_cli.Prepend(CPPPATH=["#thirdparty/mbedtls/include/"])
+config_path = "thirdparty/mbedtls/include/godot_module_mbedtls_config.h"
+config_path = f"<{config_path}>" if env_cli["ninja"] and env_cli.msvc else f'\\"{config_path}\\"'
+env_cli.Append(CPPDEFINES=[("MBEDTLS_CONFIG_FILE", config_path)])
+
+# Include the embedded-database amalgamation in the executable.
+env_cli.Prepend(CPPPATH=["#thirdparty/sqlite/"])
+env_cli.add_source_files(env.core_sources, "#thirdparty/sqlite/sqlite.c")
+
+# Collect sources by feature area in alphabetical order.
+for part in ["api", "data", "db", "main", "net", "run", "sys", "tool"]:
+    env_cli.add_source_files(env.core_sources, part + "/*.cpp")
+
+# Embed the package-management script as executable data.
+env_cli.CommandNoCache(
+    "#cli/tool/pkg.gen.h",
+    "#cli/tool/pkg.gd",
+    env.Run(cli_builders.make_pkg_script),
+)
+
+# Embed both language editions of the manual for terminal access.
+env_cli.CommandNoCache(
+    "#cli/main/manual.gen.h",
+    ["#docs/manual.md", "#docs/manual.en.md"],
+    env.Run(cli_builders.make_manual),
+)
+
+# Embed API purpose descriptions from their authoritative documentation sources.
+env_cli.CommandNoCache(
+    "#cli/main/briefs.gen.h",
+    ["#docs/api.json", "#docs/api.en.json"],
+    env.Run(cli_builders.make_briefs),
+)

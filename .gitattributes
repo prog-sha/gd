@@ -1,0 +1,30 @@
+# Properly detect languages on Github
+*.h linguist-language=C++
+*.inc linguist-language=C++
+thirdparty/* linguist-vendored
+docs/index.html linguist-generated
+
+# patchは元sourceの空白を保存するため、本文自体の空白を検査しない。
+patches/godot/*.patch -whitespace
+
+# Normalize EOL for all files that Git considers text files
+* text=auto eol=lf
+# Except for Windows-only / Visual Studio files
+*.bat eol=crlf
+*.sln eol=crlf
+*.csproj eol=crlf
+misc/msvs/* eol=crlf
+# And some test files where the EOL matters
+*.test.txt -text
+
+# The above only works properly for Git 2.10+, so for older versions
+# we need to manually list the binary files we don't want modified.
+*.icns binary
+*.ico binary
+*.jar binary
+*.png binary
+*.ttf binary
+*.tza binary
+
+# Keep benchmark evidence byte-identical to its SHA256 manifest, including patch context.
+ログ/データ/** -text -whitespace

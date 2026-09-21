@@ -1,0 +1,23 @@
+bin/
+.sconsign.dblite
+*.o
+*.a
+tmp/
+.scons_env.json
+.sconsign*.dblite
+core/version_hash.gen.cpp
+dump.rdb
+__pycache__/
+*.pyc
+
+# ビルドが作る生成物。追跡しない
+*.gen.h
+*.gen.cpp
+.DS_Store
+node_modules/
+package-lock.json
+!tests/bench/web/package-lock.json
+.scons_node_count
+
+.env
+.keys/

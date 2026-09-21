@@ -1,0 +1,76 @@
+# Validate distribution archives on the native platform without building or deploying services.
+name: Verify distribution
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release containing the candidate archive
+        required: true
+      sha256:
+        description: Expected Windows archive fingerprint
+        required: true
+      source:
+        description: Build source revision recorded in the archive
+        required: true
+      installer_sha256:
+        description: Optional reviewed website installer fingerprint
+        required: false
+permissions:
+  contents: read
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  windows:
+    permissions:
+      contents: write
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - name: Verify candidate on Windows
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          ARCHIVE_HASH: ${{ inputs.sha256 }}
+          SOURCE_SHA: ${{ inputs.source }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release download $env:RELEASE_TAG --pattern gd-windows-x86_64.zip --dir tmp/candidate
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate download failed' }
+          $archive = 'tmp/candidate/gd-windows-x86_64.zip'
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:ARCHIVE_HASH) { throw 'Archive fingerprint mismatch' }
+          Expand-Archive $archive tmp/candidate
+          $build = Get-Content tmp/candidate/gd/BUILD.json -Raw | ConvertFrom-Json
+          if ($build.sha -cne $env:SOURCE_SHA -or $build.platform -cne 'windows') { throw 'Source or platform mismatch' }
+          if ((Get-FileHash tmp/candidate/gd/gd.exe -Algorithm SHA256).Hash.ToLowerInvariant() -cne $build.binary_sha256) { throw 'Executable fingerprint mismatch' }
+          uv run --no-project python -B tmp/candidate/gd/tests/release/run.py --gd tmp/candidate/gd/gd.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Native acceptance failed' }
+          uv run --no-project python -B tests/release/sample.py --gd tmp/candidate/gd/gd.exe --sample samples/web
+          if ($LASTEXITCODE -ne 0) { throw 'Web sample failed' }
+          @{ public = $env:GITHUB_SHA; tag = $env:RELEASE_TAG; source = $env:SOURCE_SHA; archive = $env:ARCHIVE_HASH; binary = $build.binary_sha256 } | ConvertTo-Json | Set-Content tmp/verification.json
+      - name: Verify reviewed Windows installer
+        if: inputs.installer_sha256 != ''
+        shell: pwsh
+        env:
+          INSTALLER_HASH: ${{ inputs.installer_sha256 }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -UseBasicParsing https://gd.progsha.com/install.ps1 -OutFile tmp/install.ps1
+          if ((Get-FileHash tmp/install.ps1 -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:INSTALLER_HASH) { throw 'Installer fingerprint mismatch' }
+          $dest = Join-Path $PWD 'tmp/installed'
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./tmp/install.ps1 -Version $env:RELEASE_TAG -InstallDir $dest -NoPath
+          if ($LASTEXITCODE -ne 0) { throw 'Installer failed' }
+          if ((Get-FileHash "$dest/gd.exe").Hash -cne (Get-FileHash tmp/candidate/gd/gd.exe).Hash) { throw 'Installed executable differs' }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: windows-verification
+          path: |
+            tmp/verification.json
+            tmp/candidate/gd/tmp/release-check-*/
+          retention-days: 7

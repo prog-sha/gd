@@ -1,0 +1,21 @@
+<!doctype html>
+<!-- Display a greeting and let visitors choose the name. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{message}}</title>
+  <style>
+    body { max-width: 36rem; margin: 4rem auto; padding: 0 1rem; font-family: system-ui, sans-serif; line-height: 1.6; }
+    input, button { padding: .6rem; font: inherit; max-width: 100%; box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <h1>{{message}}</h1>
+  <form action="/" method="get">
+    <label>Your name <input name="name" value="{{name}}"></label>
+    <button type="submit">Say hello</button>
+  </form>
+  <p><a href="/api/hello?name={{name}}">View the JSON response</a></p>
+</body>
+</html>
