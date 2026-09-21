@@ -2,9 +2,9 @@
 class Gd < Formula
   desc "Command-line runtime for typed scripts, services, and data workflows"
   homepage "https://gd.progsha.com/"
-  url "https://github.com/prog-sha/gd/releases/download/0.7.4-stable/gd-macos-universal.zip"
-  version "0.7.4"
-  sha256 "f9524b7262cbee625d3658e541b933d017e0d89b89bb9d56fc9f2cb1a8511407"
+  url "https://github.com/prog-sha/gd/releases/download/0.7.5-stable/gd-macos-universal.zip"
+  version "0.7.5"
+  sha256 "cc433bacfa0ac0715e74de35ab6166bf0d0c40a626a2b4fc5186029486649ff7"
   license "MIT"
   depends_on :macos
   skip_clean "bin/gd" # Preserve the executable signature.
