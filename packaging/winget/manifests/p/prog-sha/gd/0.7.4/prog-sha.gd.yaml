@@ -1,0 +1,6 @@
+# Identify the package and its default locale.
+PackageIdentifier: prog-sha.gd
+PackageVersion: 0.7.4
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.10.0
