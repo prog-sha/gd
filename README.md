@@ -1,7 +1,5 @@
 # gd
 
-`master` is the unstable development branch for 0.8. Use [`0.7`](https://github.com/prog-sha/gd/tree/0.7) for stable source; target pull requests at `master`.
-
 [日本語](README.ja.md) | English
 
 A single command for writing command-line tools, websites, Web APIs, scheduled jobs, and data processing in GDScript.

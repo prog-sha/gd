@@ -1,7 +1,5 @@
 # gd
 
-`master`は0.8の不安定な開発版です。安定版は[`0.7`](https://github.com/prog-sha/gd/tree/0.7)、修正案のPRは`master`へ送ってください。
-
 日本語 | [English](README.md)
 
 GDScriptで端末の道具、Webサイト、Web API、定期処理、データ処理を書くための単体コマンドです。
