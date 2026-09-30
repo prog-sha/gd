@@ -1,6 +1,6 @@
 # Windows Package Manager manifests
 
-These manifests target the published 0.7.4-stable archive. The official community catalog entry is not registered yet. Use the [PowerShell installer](https://gd.progsha.com/#en-install) until registration is accepted.
+These manifests target the published 0.7.4 archive. The official community catalog entry is not registered yet. Use the [PowerShell installer](https://gd.progsha.com/#en-install) until registration is accepted.
 
 On Windows with winget installed, validate the version directory:
 
