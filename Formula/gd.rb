@@ -2,7 +2,7 @@
 class Gd < Formula
   desc "Command-line runtime for typed scripts, services, and data workflows"
   homepage "https://gd.progsha.com/"
-  url "https://github.com/prog-sha/gd/releases/download/0.7.5-stable/gd-macos-universal.zip"
+  url "https://github.com/prog-sha/gd/releases/download/0.7.5/gd-macos-universal.zip"
   version "0.7.5"
   sha256 "cc433bacfa0ac0715e74de35ab6166bf0d0c40a626a2b4fc5186029486649ff7"
   license "MIT"
