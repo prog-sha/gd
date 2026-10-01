@@ -35,6 +35,7 @@
 #endif
 #import "os_macos.h"
 
+#include "cli/view/handoff.h"
 #include "core/profiling/profiling.h"
 #include "main/main.h"
 
@@ -43,6 +44,12 @@
 #endif
 
 __attribute__((visibility("default"))) int main(int argc, char **argv) {
+	// Leave this process before engine startup when a display command is present.
+	int handed = View::handoff(argc, argv);
+	if (handed != 0) {
+		return handed;
+	}
+
 	godot_init_profiler();
 
 #if defined(VULKAN_ENABLED)
@@ -137,7 +144,10 @@ __attribute__((visibility("default"))) int main(int argc, char **argv) {
 	}
 #endif
 
-	// We must override main when testing is enabled.
+#ifdef GD_VIEW
+	// Leave before project startup when recorded unit tests were requested.
+	TEST_MAIN_OVERRIDE
+#endif
 
 	os->run();
 

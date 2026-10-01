@@ -298,7 +298,7 @@ int GDWebServer::h2_body(Conn *c, int64_t maximum, PackedByteArray &data, bool l
 }
 
 // Encode response metadata directly and reuse native streaming body producers.
-void GDWebServer::h2_reply(Conn *c, int64_t code, const PackedByteArray &body, const String &type, const Dictionary *extra, const Ref<GDBodySource> &file) {
+void GDWebServer::h2_reply(Conn *c, int64_t code, const PackedByteArray &body, const String &type, const Dictionary *extra, const Ref<GDBodySource> &file, HttpType kind) {
 	Conn *parent = h2_parent(c);
 	if (!parent || c->request->dead || !c->ready) { if (file.is_valid()) file->abort(); return; }
 	const int status = code >= 100 && code <= 999 && code != 101 ? int(code) : 200;
@@ -316,14 +316,16 @@ void GDWebServer::h2_reply(Conn *c, int64_t code, const PackedByteArray &body, c
 	});
 	if (status < 200) {
 		parent->h2->connection.headers(c->request->stream, fields, false);
-		h2_reply(c, 200, body, type, extra, file);
+		h2_reply(c, 200, body, type, extra, file, kind);
 		return;
 	}
 	const bool no_length = status == 204 || status == 205 || status == 304;
 	const bool no_body = no_length || c->head_only;
 	const int64_t length = file.is_valid() ? file->size() : body.size();
 	if (!no_length && length >= 0) fields.push_back({"content-length", std::to_string(length)});
-	if (!no_length && !has_type && !type.is_empty()) {
+	if (!no_length && !has_type && kind != HTTP_TYPE_CUSTOM) {
+		fields.push_back({"content-type", http_type_bytes(kind)});
+	} else if (!no_length && !has_type && !type.is_empty()) {
 		const CharString value = type.strip_edges().utf8();
 		if (http_field_value(value.get_data(), value.length())) fields.push_back({"content-type", std::string(value.get_data(), value.length())});
 		else ++drop_n;

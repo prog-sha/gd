@@ -6,14 +6,17 @@
 #include "cli/sys/task.h"
 #include "core/templates/list.h"
 
+class GDWebResponse;
+
 // Keep one byte write alive until transport completion or cancellation.
 class GDWebWriteCall : public RefCounted {
 	GDCLASS(GDWebWriteCall, RefCounted);
 	friend class GDWebWriter;
 	int64_t end = 0, count = 0; // Completion position and byte count within the complete response.
-	Ref<R> result; // Single completion result, including a partial byte count.
+	VariantPair result; // Completed byte count and optional failure.
+	bool settled = false; // A null value can still be a completed result.
 	bool waiting = false; // Publish a signal only after the caller actually suspends.
-	void settle(const Ref<R> &p_result); // Defer delivery outside the transport stack.
+	void settle(const VariantPair &p_result); // Defer delivery outside the transport stack.
 	void deliver(); // Resume the waiting producer exactly once.
 protected:
 	static void _bind_methods();
@@ -24,6 +27,7 @@ class GDWebWriter : public GDBodySource {
 	GDCLASS(GDWebWriter, GDBodySource);
 	Callable producer, ready, drain; // Producer, scheduled readiness, and immediate transport progress.
 	Signal wait; // Suspended producer completion.
+	bool wait_pair = false; // Completion signal has separate value and error arguments.
 	Ref<RefCounted> hold; // Suspended producer kept alive until completion or cancellation.
 	Ref<GDAsyncContext> ctx; // Request cancellation while response production is active.
 	List<Ref<GDWebWriteCall>> queue; // Ordered barriers waiting for transport progress.
@@ -43,8 +47,8 @@ class GDWebWriter : public GDBodySource {
 	bool pump_posted = false, pumping = false; // Coalesce work and exclude transport reentry.
 	void post_pump(); // Resume only runnable conversion; transport acknowledgements release backpressure.
 	void pump(); // Publish one complete operation at a time within the shared turn.
-	Variant enqueue(Input &&p_input); // Retain input and return its eventual completion signal.
-	Variant accept(const PackedByteArray &p_bytes, int64_t p_offset, int64_t p_count, const Ref<GDWebWriteCall> &p_call = Ref<GDWebWriteCall>()); // Commit measured bytes using normal barriers.
+	VariantPair enqueue(Input &&p_input); // Retain input and return its eventual completion signal.
+	VariantPair accept(const PackedByteArray &p_bytes, int64_t p_offset, int64_t p_count, const Ref<GDWebWriteCall> &p_call = Ref<GDWebWriteCall>()); // Commit measured bytes using normal barriers.
 	void check_length(); // Check producer EOF only after all unknown lengths are resolved.
 	BodyChunk buffered; // Accepted ranges waiting for the next transport batch.
 	int64_t consumed = 0, sending = 0; // Acknowledged bytes and the current transport batch size.
@@ -54,18 +58,19 @@ class GDWebWriter : public GDBodySource {
 	bool started = false, ended = false, posted = false; // Producer lifetime and coalesced notification.
 	void step(); // Start producer code only when HTTP requests the first body chunk.
 	void received(const Variant &p_value); // Resolve producer suspension and its final result.
+	void received_pair(const Variant &p_value, const Variant &p_error); // Resolve a producer's separate result slots.
 	void post(); // Schedule a transport notification outside the current call stack.
 	void notify(); // Wake the transport when producer output or EOF becomes available.
 	void discard(int64_t p_sent); // Release producer state without ending its request context.
 protected:
 	static void _bind_methods();
 public:
-	static Dictionary reply(const Callable &p_producer, int64_t p_length, const String &p_type, int64_t p_status); // Construct a lazy response.
-	Variant write(const PackedByteArray &p_bytes, int64_t p_offset = 0, int64_t p_count = -1); // Accept a range and wait when transport backpressure applies.
+	static Ref<GDWebResponse> reply(const Callable &p_producer, int64_t p_length, const String &p_type, int64_t p_status); // Construct a lazy response.
+	VariantPair write(const PackedByteArray &p_bytes, int64_t p_offset = 0, int64_t p_count = -1); // Accept a range and wait when transport backpressure applies.
 	Signal write_async(const PackedByteArray &p_bytes, int64_t p_offset = 0, int64_t p_count = -1); // Expose a completion signal even when the transport is already writable.
-	Variant write_text(const String &p_text, int64_t p_offset = 0, int64_t p_count = -1); // Encode a character range and return accepted UTF-8 bytes with normal write backpressure.
+	VariantPair write_text(const String &p_text, int64_t p_offset = 0, int64_t p_count = -1); // Encode a character range and return accepted UTF-8 bytes with normal write backpressure.
 	Signal write_text_async(const String &p_text, int64_t p_offset = 0, int64_t p_count = -1); // Expose text write completion as a signal.
-	Variant flush() { return write(PackedByteArray()); } // Wait behind preceding writes without ending the response.
+	VariantPair flush() { return write(PackedByteArray()); } // Wait behind preceding writes without ending the response.
 	Signal flush_async() { return write_async(PackedByteArray()); } // Expose an explicit asynchronous flush completion.
 	bool take(BodyChunk &r_chunk) override;
 	int64_t size() override { return length; }

@@ -29,7 +29,8 @@ namespace {
 
 HashSet<GDHTTPCall *> http_calls; // Unfinished requests to cancel at shutdown.
 
-constexpr uint64_t WAIT_MS = 30000; // Default request timeout in milliseconds.
+constexpr uint64_t DIAL_MS = 30000; // Default TCP connection timeout in milliseconds.
+constexpr double HANDSHAKE_SEC = 10.0; // Default TLS handshake timeout in seconds.
 constexpr int64_t SINK_PENDING_MAX = 4 * 1024 * 1024; // Pending writer bytes allowed before applying backpressure.
 constexpr int IDLE_MAX = 100; // Maximum idle connections across all origins.
 constexpr int IDLE_HOST_MAX = 2; // Maximum idle connections per origin.
@@ -87,11 +88,11 @@ bool sha256_ok(const String &p_value) {
 Dictionary split_url(const String &p_raw) {
 	// Delegate URL parsing to Url::parse to share authority, user-info, and IPv6 interpretation.
 	// A separate interpretation could connect to a host other than the one validated.
-	const Ref<R> got = Url::parse(p_raw);
-	if (got->get_e().is_valid()) {
+	const VariantPair got = Url::parse(p_raw);
+	if (got.error.get_type() != Variant::NIL) {
 		return Dictionary();
 	}
-	const Dictionary u = got->get_v();
+	const Dictionary u = got.value;
 	Dictionary out;
 	out["scheme"] = u["scheme"];
 	out["host"] = u["host"];
@@ -266,7 +267,7 @@ String GDHTTPResponse::text() const {
 }
 
 // Decode the response body as JSON.
-Ref<R> GDHTTPResponse::json() const {
+VariantPair GDHTTPResponse::json() const {
 	return json_of(body);
 }
 
@@ -278,7 +279,7 @@ void GDHTTPResponse::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("ok"), &GDHTTPResponse::ok);
 	ClassDB::bind_method(D_METHOD("text"), &GDHTTPResponse::text);
 	ClassDB::bind_method(D_METHOD("json"), &GDHTTPResponse::json);
-	ADD_RESULT("json", "Variant");
+	ADD_PAIR_RESULT("json", "Variant");
 
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "status"), "", "get_status");
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "headers"), "", "get_headers");
@@ -298,7 +299,7 @@ void GDHTTPCall::begin(const String &p_url, const Dictionary &p_opts, const Ref<
 	self_hold = Ref<GDHTTPCall>(this);
 	http_calls.insert(this);
 	transport = p_transport;
-	const double timeout = p_opts.get("timeout", double(WAIT_MS) / 1000.0);
+	const double timeout = p_opts.get("timeout", 0.0);
 	uint64_t wait = 0;
 	if (!Limit::seconds_ms(timeout, wait)) {
 		error = Err::make("timeout must be zero or a positive number of seconds", Err::INVALID_DATA);
@@ -389,12 +390,27 @@ void GDHTTPCall::begin(const String &p_url, const Dictionary &p_opts, const Ref<
 
 // Begin opening a new HTTP connection to the destination.
 bool GDHTTPCall::open_client() {
+	clear_handshake();
 	client.instantiate();
 	client->set_callback(callable_mp(this, &GDHTTPCall::step));
-	const Error opened = client->open(host, port, tls_enabled, deadline);
+	const uint64_t dial_due = deadline_after(DIAL_MS);
+	const Error opened = client->open(host, port, tls_enabled, deadline > 0 ? MIN(deadline, dial_due) : dial_due);
 	if (opened == OK) return true;
 	error = client->error().is_valid() ? client->error() : Err::make(vformat("cannot reach %s", host), Err::of(opened));
 	return false;
+}
+
+// Cancel a TLS handshake timer before reusing or releasing the request.
+void GDHTTPCall::clear_handshake() {
+	if (handshake_wait.is_valid()) { handshake_wait->abandon(); handshake_wait.unref(); }
+}
+
+// Stop a TLS handshake that has exceeded its own connection-phase deadline.
+void GDHTTPCall::handshake_timeout() {
+	handshake_wait.unref();
+	if (stage == CONNECTING && client.is_valid() && client->tls_handshaking()) {
+		done("TLS handshake timed out", Err::TIMED_OUT);
+	}
 }
 
 // Register the request deadline; zero waits until caller cancellation.
@@ -406,6 +422,7 @@ void GDHTTPCall::set_due(uint64_t p_wait) {
 
 // Replay retained bodies only after peer-confirmed rejection or a safe stale-connection failure.
 bool GDHTTPCall::retry() {
+	clear_handshake();
 	if (client->can_replay() && res->status_code == 0 && received == 0) {
 		if (retries >= H2_RETRIES) return false;
 		client->close();
@@ -450,12 +467,20 @@ void GDHTTPCall::step() {
 		done(error);
 		return;
 	}
+	if (stage == FLUSHING && save_error.is_valid()) {
+		if (save_sink.is_valid() && save_sink->done()) done(save_error);
+		return;
+	}
 	if (deadline > 0 && GDClock::msec() >= deadline) {
 		done(vformat("%s did not answer in time", host), Err::TIMED_OUT);
 		return;
 	}
 	if (stage == RETRYING) return;
 	client->poll();
+	if (stage == CONNECTING && client->tls_handshaking() && handshake_wait.is_null()) {
+		handshake_wait = Async::start_sleep(HANDSHAKE_SEC);
+		Signal(handshake_wait.ptr(), "finished").connect(callable_mp(this, &GDHTTPCall::handshake_timeout).unbind(1), Object::CONNECT_ONE_SHOT);
+	}
 
 	switch (stage) {
 		case RETRYING: break;
@@ -471,6 +496,7 @@ void GDHTTPCall::step() {
 			if (st != GDHTTPPeer::STATUS_CONNECTED) {
 				return; // Connection is not ready yet.
 			}
+			clear_handshake();
 			if (transport.is_valid() && client->multiplex_link().is_valid()) transport->share(origin, client->multiplex_link());
 			const Error requested = client->request(method, target, head, send_body);
 			if (requested != OK) {
@@ -639,7 +665,7 @@ void GDHTTPCall::step() {
 			save_sink.unref();
 			const String from = save_next;
 			const String to = save_path;
-			Signal signal = GDFileCall::start([from, to]() { return Os::rename(from, to); });
+			Signal signal = GDPairCall::start([from, to]() { return Os::rename(from, to); }, false);
 			signal.connect(callable_mp(this, &GDHTTPCall::moved), Object::CONNECT_ONE_SHOT);
 			stage = MOVING;
 		} break;
@@ -653,12 +679,13 @@ void GDHTTPCall::step() {
 }
 
 // Commit the saved file after receiving the worker's rename result.
-void GDHTTPCall::moved(const Ref<R> &p_result) {
+void GDHTTPCall::moved(const Variant &, const Variant &p_error) {
 	if (self_hold.is_null()) {
 		return;
 	}
-	if (p_result.is_null() || !p_result->get_ok()) {
-		done(p_result.is_valid() && p_result->get_e().is_valid() ? p_result->get_e() : Err::make(vformat("cannot move %s", save_path), Err::NONE));
+	Ref<Err> error = p_error;
+	if (error.is_valid()) {
+		done(error);
 		return;
 	}
 	save_next = "";
@@ -675,6 +702,17 @@ void GDHTTPCall::done(const Ref<Err> &p_error) {
 	if (self_hold.is_null()) {
 		return;
 	}
+	clear_handshake();
+	if (p_error.is_valid() && save_sink.is_valid() && !save_sink->done()) {
+		if (save_error.is_null()) save_error = p_error;
+		stage = FLUSHING;
+		Async::drop_deadline(this, deadline);
+		deadline = 0;
+		watch(false);
+		if (client.is_valid()) client->close();
+		save_sink->abort(save_next);
+		return;
+	}
 	// Retain this call until cleanup finishes; releasing the final reference invalidates further access.
 	Ref<GDHTTPCall> keep(this);
 	watch(false);
@@ -682,7 +720,7 @@ void GDHTTPCall::done(const Ref<Err> &p_error) {
 	deadline = 0;
 	stage = DONE;
 	if (retry_wait.is_valid()) { retry_wait->abandon(); retry_wait.unref(); }
-	if (p_error.is_valid()) error = p_error;
+	if (p_error.is_valid()) error = Err::join(p_error, save_sink.is_valid() ? save_sink->error() : Ref<Err>());
 	if (save_sink.is_valid()) {
 		// Leave partial-file cleanup to the writer so deletion cannot race an unfinished open.
 		// This also avoids deleting a file while Windows still holds it open.
@@ -691,7 +729,7 @@ void GDHTTPCall::done(const Ref<Err> &p_error) {
 		save_next = "";
 	} else if (!save_next.is_empty()) {
 		const String drop = save_next;
-		GDFileCall::start([drop]() { return Os::remove(drop); });
+		GDPairCall::start([drop]() { return Os::remove(drop); }, false);
 		save_next = "";
 	}
 	if (client.is_valid()) {
@@ -705,7 +743,7 @@ void GDHTTPCall::done(const Ref<Err> &p_error) {
 	transport.unref();
 	http_calls.erase(this);
 	self_hold.unref(); // Make cancellation reentry from completion callbacks harmless.
-	emit_signal("finished", error.is_valid() ? R::err(error, Err::NONE, res) : R::ok(res));
+	Async::finish(this, SNAME("finished"), res, error);
 }
 
 // Cancel every event-loop request at process shutdown.
@@ -731,5 +769,5 @@ void GDHTTPCall::cancel() {
 // Register public script methods and properties.
 void GDHTTPCall::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDHTTPCall::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "res", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "res", PROPERTY_HINT_RESOURCE_TYPE, "GDHTTPResponse"), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }

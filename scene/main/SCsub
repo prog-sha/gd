@@ -3,4 +3,11 @@ from misc.utility.scons_hints import *
 
 Import("env")
 
-env.add_source_files(env.scene_sources, "*.cpp")
+# Select the display scene tree only for the view executable.
+if env["view"]:
+    sources = [item for item in Glob("*.cpp") if item.name not in ("node.cpp", "scene_tree.cpp")]
+    sources.append(File("#tmp/view-src/scene/main/node.cpp"))
+    sources.append(File("#tmp/view-src/scene/main/scene_tree.cpp"))
+    env.add_source_files(env.scene_sources, sources)
+else:
+    env.add_source_files(env.scene_sources, "*.cpp")

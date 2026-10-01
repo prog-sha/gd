@@ -28,6 +28,7 @@ register_module_types = env.CommandNoCache(
 )
 
 
+test_headers = []
 # libmodule_<name>.a for each active module.
 for name, path in env.module_list.items():
     env.modules_sources = []
@@ -39,6 +40,19 @@ for name, path in env.module_list.items():
     if env.modules_sources:
         lib = env_modules.add_library("module_%s" % name, env.modules_sources)
         env.Prepend(LIBS=[lib])
+
+    if env["tests"]:
+        # Collect headers the test entry includes for this module.
+        import glob
+
+        module_tests = sorted(glob.glob(os.path.join(base_path, "tests", "*.h")))
+        if module_tests:
+            test_headers += module_tests
+
+
+# Write the header included by the recorded test entry.
+if env["tests"]:
+    env.CommandNoCache("modules_tests.gen.h", test_headers, env.Run(modules_builders.modules_tests_builder))
 
 
 

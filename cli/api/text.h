@@ -29,7 +29,7 @@ public:
 	Error step(const String &p_part = String()); // On ERR_BUSY, load the required partial and resume.
 	String needed() const; // Return the currently required partial name.
 	Error render(const Dictionary &p_data, String &r_out); // Render using only the prepared tree.
-	Ref<R> failure(Error p_error) const; // Preserve the parser location and error category.
+	Ref<Err> failure(Error p_error) const; // Preserve the parser location and error category.
 };
 
 // Manipulate paths using slash separators.
@@ -66,9 +66,9 @@ public:
 	static String tag(const String &p_name, const String &p_body, const Dictionary &p_attrs);
 	// Interpolate Mustache-style templates with context-sensitive HTML, attribute, and URL escaping.
 	// Support raw interpolation, if, unless, each, with, else, and supplied partials.
-	static Ref<R> fill(const String &p_tpl, const Dictionary &p_data, const Dictionary &p_partials = Dictionary());
+	static VariantPair fill(const String &p_tpl, const Dictionary &p_data, const Dictionary &p_partials = Dictionary());
 	// Parse templates and partials into an immutable, concurrently executable renderer.
-	static Ref<R> template_of(const String &p_tpl, const Dictionary &p_partials = Dictionary());
+	static VariantPair template_of(const String &p_tpl, const Dictionary &p_partials = Dictionary());
 	// Render internally while preserving parse and partial-loading errors for callers.
 	static Error fill_checked(const String &p_tpl, const Dictionary &p_data, const Dictionary &p_partials, String &r_out, String &r_bad);
 };
@@ -86,8 +86,8 @@ protected:
 
 public:
 	~GDHTMLTemplate();
-	Ref<R> execute(const Dictionary &p_data) const; // Return HTML with safely interpolated values.
-	Ref<R> execute_bytes(const Dictionary &p_data) const; // Return escaped HTML directly as UTF-8 bytes.
+	VariantPair execute(const Dictionary &p_data) const; // Return HTML with safely interpolated values.
+	VariantPair execute_bytes(const Dictionary &p_data) const; // Return escaped HTML directly as UTF-8 bytes.
 };
 
 // Text operations and formatting.
@@ -117,7 +117,7 @@ class Url {
 public:
 	// Return scheme, host, port, path, query, and fragment.
 	// Include user and password when user information is present.
-	static Ref<R> parse(const String &p_raw);
+	static VariantPair parse(const String &p_raw);
 	// Split host and port; leave r_port empty when absent and return empty for malformed syntax.
 	// Remove brackets from IPv6 hosts without validating the port's numeric form.
 	static String host_port(const String &p_text, String &r_port);
@@ -135,7 +135,7 @@ public:
 	static bool decode_check(const uint8_t *p_data, int p_len, bool p_plus_space, CharString *r_out);
 	// Decode a URL component, returning false when strict validation fails.
 	static bool decode_part(const String &p_raw, bool p_plus_space, String &r_out);
-	static Ref<R> decode_query(const String &p_raw);
+	static VariantPair decode_query(const String &p_raw);
 	static String encode_query(const Dictionary &p_query); // Encode query fields in name order.
 };
 
@@ -143,14 +143,14 @@ public:
 class Semver {
 public:
 	// Represent versions with major, minor, patch, pre, and build.
-	static Ref<R> parse(const String &p_raw);
+	static VariantPair parse(const String &p_raw);
 	static bool is_canonical(const String &p_raw); // Check complete canonical SemVer notation.
 	static int compare(const Dictionary &p_a, const Dictionary &p_b);
 	static bool satisfies(const Dictionary &p_v, const String &p_range);
 	static bool is_stable(const Dictionary &p_v); // Report stable versions without prerelease identifiers.
 	static String text(const Dictionary &p_v);
 	// Select the latest version, optionally restricted by a range.
-	static Ref<R> best(const PackedStringArray &p_list, const String &p_range);
+	static VariantPair best(const PackedStringArray &p_list, const String &p_range);
 };
 
 // Map filename extensions to MIME types.

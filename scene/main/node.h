@@ -30,6 +30,11 @@
 
 #pragma once
 
+#ifdef GD_VIEW
+// Share one object layout with the recorded display declaration.
+#include "../../tmp/view-src/scene/main/node.h"
+#else
+
 #include "core/input/input_event.h"
 #include "core/object/gdvirtual.gen.h"
 #include "core/object/object.h"
@@ -941,3 +946,4 @@ Error Node::rpc_id(int p_peer_id, const StringName &p_method, VarArgs... p_args)
 // Add these macro to your class's 'get_configuration_warnings' function to have warnings show up in the scene tree inspector.
 #define DEPRECATED_NODE_WARNING warnings.push_back(RTR("This node is marked as deprecated and will be removed in future versions.\nPlease check the Godot documentation for information about migration."));
 #define EXPERIMENTAL_NODE_WARNING warnings.push_back(RTR("This node is marked as experimental and may be subject to removal or major changes in future versions."));
+#endif

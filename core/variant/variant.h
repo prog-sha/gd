@@ -982,3 +982,9 @@ Array::ConstIterator &Array::ConstIterator::operator--() {
 // Zero-constructing Variant results in NULL.
 template <>
 struct is_zero_constructible<Variant> : std::true_type {};
+
+// Carry two native return values without allocating a script-visible object.
+struct VariantPair {
+	Variant value; // Value completed by the operation.
+	Variant error; // Failure reason or null on success.
+};

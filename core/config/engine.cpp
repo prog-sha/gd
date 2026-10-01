@@ -38,6 +38,9 @@
 #include "core/object/object.h"
 #include "core/variant/typed_array.h"
 #include "core/version.h"
+#ifdef GD_VIEW
+#include "servers/rendering/rendering_device.h"
+#endif
 
 void Engine::_update_time_scale() {
 	_time_scale = _user_time_scale * _game_time_scale;
@@ -87,7 +90,12 @@ double Engine::get_physics_jitter_fix() const {
 void Engine::set_max_fps(int p_fps) {
 	_max_fps = p_fps > 0 ? p_fps : 0;
 
-	// Keep rendering-device settings in the optional game layer.
+#ifdef GD_VIEW
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	if (rd) {
+		rd->_set_max_fps(_max_fps);
+	}
+#endif
 }
 
 int Engine::get_max_fps() const {
@@ -314,6 +322,14 @@ void Engine::print_header(const String &p_string) const {
 		print_line(p_string);
 	}
 }
+
+#ifdef GD_VIEW
+void Engine::print_header_rich(const String &p_string) const {
+	if (_print_header) {
+		print_line_rich(p_string);
+	}
+}
+#endif
 
 void Engine::add_singleton(const Singleton &p_singleton) {
 	ERR_FAIL_COND_MSG(singleton_ptrs.has(p_singleton.name), vformat("Can't register singleton '%s' because it already exists.", p_singleton.name));

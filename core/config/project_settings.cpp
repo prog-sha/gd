@@ -32,6 +32,7 @@
 
 #include "cli/sys/jail.h"
 #include "cli/sys/mount.h"
+#include "cli/sys/perm.h"
 
 #include "core/input/input_map.h"
 #include "core/io/compression.h"
@@ -569,6 +570,8 @@ void ProjectSettings::_emit_changed() {
 // Expose pack loading to scripts while startup calls _load_resource_pack directly.
 // Only the script-facing entry clears the main-pack flag.
 bool ProjectSettings::load_resource_pack(const String &p_pack, bool p_replace_files, int p_offset) {
+	// Reject denied reads before scanning or modifying the project's resource filesystem.
+	GD_PERM_FAIL_V(READ, p_pack, false);
 	return ProjectSettings::_load_resource_pack(p_pack, p_replace_files, p_offset, false);
 }
 
@@ -858,6 +861,14 @@ Error ProjectSettings::_setup(const String &p_path, const String &p_main_pack, b
 }
 
 Error ProjectSettings::setup(const String &p_path, const String &p_main_pack, bool p_upwards, bool p_ignore_override) {
+	// Bind res:// before settings are read.
+	// Move it when startup names a directory other than the working directory.
+	if (!Mount::has_mount("res") && !Mount::setup()) {
+		return FAILED;
+	}
+	if (!Mount::bind_res(p_path)) {
+		return FAILED;
+	}
 	Error err = _setup(p_path, p_main_pack, p_upwards, p_ignore_override);
 #ifdef OVERRIDE_ENABLED
 	if (err == OK && !p_ignore_override) {

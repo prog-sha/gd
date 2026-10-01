@@ -33,11 +33,14 @@
 #include "cli/net/http.h"
 #include "cli/net/mw.h"
 #include "cli/net/serve.h"
+#include "cli/mail/mail.h"
 #include "cli/net/body_source.h"
 #include "cli/net/tls_call.h"
 #include "cli/net/socket.h"
+#include "cli/online/match.h"
 #include "cli/sys/os.h"
 #include "cli/sys/std.h"
+#include "cli/sys/gdtask.h"
 #include "cli/sys/task.h"
 
 #include "core/object/class_db.h"
@@ -46,20 +49,21 @@
 // Keep registration in the runtime rather than duplicating it in scripts.
 void register_cli_types() {
 	// Results and asynchronous control flow.
-	GDREGISTER_CLASS(Err);
-	GDREGISTER_CLASS(R);
+	GDREGISTER_ABSTRACT_CLASS(Err);
+	Err::init_categories();
 	GDREGISTER_ABSTRACT_CLASS(GDTestCheck);
 	GDREGISTER_INTERNAL_CLASS(GDWait);
 	GDREGISTER_INTERNAL_CLASS(GDLoop);
 	GDREGISTER_ABSTRACT_CLASS(GDAsyncContext);
+	GDREGISTER_ABSTRACT_CLASS(GDTask);
 
 	// Command entry points and logging.
 	GDREGISTER_ABSTRACT_CLASS(GDCLIFlags);
 	GDREGISTER_INTERNAL_CLASS(GDFileLock);
 	GDREGISTER_INTERNAL_ABSTRACT_CLASS(PoolJob);
-	GDREGISTER_INTERNAL_CLASS(GDFileCall);
 	GDREGISTER_INTERNAL_CLASS(GDLogCall);
 	GDREGISTER_INTERNAL_CLASS(GDValueCall);
+	GDREGISTER_INTERNAL_CLASS(GDPairCall);
 	GDREGISTER_INTERNAL_CLASS(GDFormatCall);
 	GDREGISTER_INTERNAL_CLASS(GDFormatJob);
 	GDREGISTER_INTERNAL_CLASS(GDCollectionCall);
@@ -97,6 +101,7 @@ void register_cli_types() {
 	GDREGISTER_ABSTRACT_CLASS(GDWebServer);
 	GDREGISTER_INTERNAL_CLASS(GDWebBodyCall);
 	GDREGISTER_ABSTRACT_CLASS(GDWebRequest);
+	GDREGISTER_ABSTRACT_CLASS(GDWebResponse);
 	GDREGISTER_ABSTRACT_CLASS(GDWebMiddleware);
 	GDREGISTER_INTERNAL_CLASS(GDWebJwt);
 	GDREGISTER_INTERNAL_CLASS(GDWebJwtCall);
@@ -119,6 +124,7 @@ void register_cli_types() {
 	GDREGISTER_ABSTRACT_CLASS(GDDatabaseTx);
 	GDREGISTER_ABSTRACT_CLASS(GDDatabaseRows);
 	GDREGISTER_INTERNAL_CLASS(GDDatabaseTxCall);
+	GDREGISTER_INTERNAL_CLASS(GDDatabaseRetryCall);
 	GDREGISTER_ABSTRACT_CLASS(GDDatabaseClient);
 	GDREGISTER_INTERNAL_CLASS(GDDatabaseCall);
 	GDREGISTER_ABSTRACT_CLASS(GDRedisClient);
@@ -129,6 +135,10 @@ void register_cli_types() {
 	GDREGISTER_ABSTRACT_CLASS(GDSQLiteDB);
 	GDREGISTER_ABSTRACT_CLASS(GDSQLiteStatement);
 	GDREGISTER_INTERNAL_CLASS(GDSQLiteAPI);
+
+	// Online-game services.
+	GDREGISTER_ABSTRACT_CLASS(GDOnlineMatch);
+	GDREGISTER_INTERNAL_CLASS(GDOnlineCall);
 
 	// Encodings and archives.
 	GDREGISTER_ABSTRACT_CLASS(GDJSONLReader);
@@ -143,6 +153,11 @@ void register_cli_types() {
 	GDREGISTER_INTERNAL_CLASS(GDAsyncAPI);
 	GDREGISTER_INTERNAL_CLASS(GDLogAPI);
 	GDREGISTER_INTERNAL_CLASS(GDNetAPI);
+	GDREGISTER_ABSTRACT_CLASS(GDMailMessage);
+	GDREGISTER_ABSTRACT_CLASS(GDSMTPDataWriter);
+	GDREGISTER_ABSTRACT_CLASS(GDSMTPClient);
+	GDREGISTER_INTERNAL_CLASS(GDMailMimeAPI);
+	GDREGISTER_INTERNAL_CLASS(GDMailAPI);
 	GDREGISTER_INTERNAL_CLASS(GDHTTPAPI);
 	GDREGISTER_INTERNAL_CLASS(GDFSAPI);
 	GDREGISTER_INTERNAL_CLASS(GDCollectionsAPI);
@@ -162,11 +177,14 @@ void register_cli_types() {
 	GDREGISTER_INTERNAL_CLASS(GDDatabaseAPI);
 	GDREGISTER_INTERNAL_CLASS(GDPostgresAPI);
 	GDREGISTER_INTERNAL_CLASS(GDRedisAPI);
+	GDREGISTER_INTERNAL_CLASS(GDOnlineAPI);
 	register_cli_singletons();
 }
 
 // Release worker-retained scripts while their language runtime remains alive.
 void shutdown_cli_runtime() {
+	GDAPI *gd = Object::cast_to<GDAPI>(Engine::get_singleton()->get_singleton_object("GD"));
+	if (gd) gd->get_mail()->shutdown(); // Release script instances before stopping the language.
 	Pool::shutdown(); // Stop waiting workers before destroying their signal sources.
 	GDHTTPCall::shutdown_all(); // Cancel pending event-loop HTTP requests.
 	GDWait::shutdown_all(); // Cancel timers and composed waits.
@@ -185,4 +203,5 @@ void shutdown_cli_runtime() {
 void unregister_cli_types() {
 	shutdown_cli_runtime();
 	unregister_cli_singletons(); // Unregister global APIs.
+	Err::clear_categories();
 }

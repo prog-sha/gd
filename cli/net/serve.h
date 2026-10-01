@@ -30,6 +30,49 @@ class GDWebRequest;
 class HtmlBuild;
 class GDWebTLSCall;
 
+// Retain response metadata without allocating a field dictionary for standard replies.
+class GDWebResponse : public RefCounted {
+	GDCLASS(GDWebResponse, RefCounted);
+	int status = 200; // Numeric status passed to the transport.
+	HttpType type = HTTP_TYPE_CUSTOM; // Standard content type identifier; zero selects a custom type.
+	String custom_type; // Content type used only outside the standard set.
+	Variant body; // Text, assembled bytes, or an incremental source.
+	std::unique_ptr<Dictionary> extra; // Additional headers allocated only when requested.
+protected:
+	static void _bind_methods();
+public:
+	// Create a response with its wire metadata and body.
+	static Ref<GDWebResponse> make(int64_t p_status, HttpType p_type, const Variant &p_body, const String &p_custom = String());
+	// Read the status code retained for transport framing.
+	int get_status() const { return status; }
+	// Set the status code checked before transmission.
+	void set_status(int64_t p_status);
+	// Read the internal content type identifier.
+	HttpType get_type() const { return type; }
+	// Read the caller's custom content type, if any.
+	const String &get_custom_type() const { return custom_type; }
+	// Return the content type text for script inspection.
+	String type_name() const;
+	// Read the reply body retained until send completion.
+	Variant get_body() const { return body; }
+	// Borrow the reply body for the internal encoder.
+	const Variant &body_value() const { return body; }
+	// Replace the reply body before it is sent.
+	void set_body(const Variant &p_body) { body = p_body; }
+	// Return all response headers, including Content-Type.
+	Dictionary get_headers() const;
+	// Replace additional response headers.
+	void set_headers(const Dictionary &p_headers);
+	// Borrow optional additional headers without materializing defaults.
+	const Dictionary *extra_headers() const { return extra.get(); }
+	// Report whether additional headers are present.
+	bool has_extra() const { return extra && !extra->is_empty(); }
+	// Copy the reply while replacing or appending one header.
+	Ref<GDWebResponse> with_header(const String &p_name, const Variant &p_value, bool p_append) const;
+	// Copy the reply with security headers filled where absent.
+	Ref<GDWebResponse> guarded() const;
+};
+
 // Consume ready request bodies on the main loop and suspend only unfinished work.
 class GDWebBodyCall : public RefCounted {
 	GDCLASS(GDWebBodyCall, RefCounted);
@@ -44,7 +87,8 @@ class GDWebBodyCall : public RefCounted {
 	};
 
 	Ref<GDWebBodyCall> self_hold; // Self-reference retained until completion.
-	Ref<R> ready; // Result completed before a caller needs to await.
+	VariantPair ready; // Result completed before a caller needs to await.
+	bool ready_done = false; // Inline result may contain a null first value.
 	bool starting = false; // Capture inline completion before signal listeners exist.
 	Ref<GDWebRequest> req; // Request ownership preventing overlapping body operations.
 	Ref<GDWebServer> srv; // Keep the server alive while reading.
@@ -54,7 +98,7 @@ class GDWebBodyCall : public RefCounted {
 	bool converting = false; // A worker is converting body bytes to text or JSON.
 	PackedByteArray data; // Bytes collected for READ or whole-body operations.
 	String path; // Public path included in save failures.
-	Dictionary rule; // Input rule applied by VALIDATE.
+	Variant rule; // Validation schema retained only by VALIDATE.
 	String keep_name; // Request-local name for a validated result.
 	int id = 0; // Unique connection identifier.
 	int64_t want = 0; // Maximum bytes returned by READ.
@@ -64,10 +108,10 @@ class GDWebBodyCall : public RefCounted {
 
 	void step();
 	bool advance(); // Return true when another body read can proceed without waiting.
-	void finish(const Ref<R> &p_result);
+	void finish(const VariantPair &p_result);
 	void schedule();
-	void converted(const Variant &p_result); // Return worker-converted body data to request state.
-	Variant start(const Ref<GDWebRequest> &p_req, const Ref<GDWebServer> &p_srv, int p_id, int p_mode, int64_t p_want, const String &p_path, bool p_deferred = true);
+	void converted(const Variant &p_result, const Variant &p_error); // Return worker-converted body data to request state.
+	VariantPair start(const Ref<GDWebRequest> &p_req, const Ref<GDWebServer> &p_srv, int p_id, int p_mode, int64_t p_want, const String &p_path, bool p_deferred = true);
 
 	friend class GDWebRequest;
 
@@ -95,22 +139,31 @@ class GDWebRequest : public RefCounted {
 	bool query_done = false;
 	Dictionary params_map; // Values captured by named route parameters.
 	Dictionary store; // Request-local values shared between processing stages.
+	Dictionary reply_headers; // Headers supplied by request middleware for the final response.
 	Ref<GDAsyncContext> ctx; // Per-request context conveying disconnect and completion.
 	Ref<GDAsyncContext> ctx_parent; // Parent retained until cancellation monitoring is needed.
 	Ref<Err> ctx_reason; // Observed cancellation reason retained without signal connections.
 	const char *ctx_end = nullptr; // Static completion reason retained for late context access.
 	Ref<GDWebBodyCall> body_active; // Current body operation cancelled with the request.
 	bool body_busy = false; // Prevent two simultaneous operations on the same stream.
+	PackedByteArray body_cache; // Whole body kept after the first complete read so later reads return the same bytes.
+	bool body_cached = false; // Whether body_cache holds the complete body.
+	bool body_saved = false; // Whether the body was streamed to a file instead of memory.
 
 	// Clear request state for reuse.
 	void reset(int p_id, const String &p_path, const Ref<GDAsyncContext> &p_parent);
 	void finish_context(const char *p_reason);
-	Variant body_call(int p_mode, int64_t p_want = 0, bool p_deferred = false); // Share body ownership and completion policy.
+	VariantPair body_call(int p_mode, int64_t p_want = 0, bool p_deferred = false); // Share body ownership and completion policy.
+	VariantPair cached_body(int p_mode) const; // Convert the retained whole body without reading the stream again.
+	Ref<Err> body_error() const; // Reason another stream operation cannot start.
+	Ref<Err> body_whole_error() const; // Reason a whole-body operation cannot start.
 	Signal json_valid(const Dictionary &p_rule, const String &p_name);
 
 	friend class GDWebApp;
 	friend class GDWebBodyCall;
 	friend class GDWebValid;
+	friend class GDWebRateLimit;
+	void set_reply_header(const String &p_name, const String &p_value);
 
 protected:
 	static void _bind_methods();
@@ -131,19 +184,19 @@ public:
 	String header(const String &p_name) const;
 	Dictionary headers() const;
 	// Read up to bytes from the stream; an empty success value denotes EOF.
-	Variant read(int64_t p_bytes = 32768);
+	VariantPair read(int64_t p_bytes = 32768);
 	Signal read_async(int64_t p_bytes = 32768); // Always defer completion for explicit awaiting.
 	// Read the entire remaining body into memory.
-	Variant bytes();
+	VariantPair bytes();
 	Signal bytes_async(); // Always defer collecting the remaining bytes.
 	int64_t body_size() const;
 	// Set a byte-reader limit for this request only.
-	Ref<R> limit(int64_t p_bytes);
+	Ref<Err> limit(int64_t p_bytes);
 	// Save the remaining body inside a mount without expanding it in memory.
 	Signal save(const String &p_path);
-	Variant text();
+	VariantPair text();
 	Signal text_async(); // Always defer decoding the remaining text.
-	Variant json(); // Distinguish valid JSON null from parse failure through R.
+	VariantPair json(); // Keep a valid JSON null separate from parse failure.
 	Signal json_async(); // Always defer decoding the remaining JSON.
 };
 
@@ -160,11 +213,12 @@ class GDWebViewCall : public RefCounted {
 	int64_t status = 200; // HTTP status on successful rendering.
 	String part; // Partial name sent to the I/O queue, empty for the root.
 
-	void loaded(const Variant &p_result); // Pass worker-loaded template data to the renderer.
+	void loaded(const Variant &p_value, const Variant &p_error); // Pass worker-loaded template data to the renderer.
 	void prepared(const Variant &p_result); // Queue missing partials for I/O or return the completed result.
 	void custom_ready(const Variant &p_result); // Pass decoded UTF-8 source to the custom script renderer.
 	void rendered(const Variant &p_result); // Convert renderer output into a reply.
-	void finish(const Ref<R> &p_result); // Deliver a completed reply or cancellation exactly once.
+	void rendered_pair(const Variant &p_result, const Variant &p_error); // Convert a paired renderer output into a reply.
+	void finish(const VariantPair &p_result); // Deliver a completed reply or cancellation exactly once.
 
 protected:
 	static void _bind_methods();
@@ -183,7 +237,7 @@ class GDWebApp : public RefCounted {
 	GDCLASS(GDWebApp, RefCounted);
 	friend class GDWebTLSCall;
 	Ref<RefCounted> opening; // Identity token prevents a cancelled TLS start from opening a listener later.
-	Ref<R> listen_at(int64_t p_port, const String &p_host, const Ref<GDTLSIdentity> &p_identity); // Share listener setup across transports.
+	VariantPair listen_at(int64_t p_port, const String &p_host, const Ref<GDTLSIdentity> &p_identity); // Share listener setup across transports.
 
 	// Handler callable and the owner keeping it alive.
 	struct Mid {
@@ -240,15 +294,17 @@ class GDWebApp : public RefCounted {
 		int static_at = 0; // Next static root to inspect.
 		Ref<FileSource> file; // Incremental reader for a static response.
 		String file_type; // Static response Content-Type.
-		const char *encoded_type = nullptr; // Content type of an internally encoded body without a response envelope.
+		HttpType encoded_type = HTTP_TYPE_CUSTOM; // Content type of an internally encoded body without a response envelope.
 		Variant body; // Encoded envelope body retained independently of middleware-owned dictionaries.
 		bool body_encoded = false; // Whether conversion supplies the final envelope body.
 		bool head_text = false; // Preserve the response envelope while measuring omitted text.
 		bool failing = false; // Prevent recursive error handling.
+		Ref<Err> prior_error; // Original handler failure retained through error response processing.
 		int after_at = 0; // Resume after a failed postprocessor without running it twice.
 		bool ready = false; // Whether route selection alone produced a response.
 		Ref<RefCounted> hold; // Retained suspended state.
 		Signal wait_signal; // Completion signal for a native asynchronous operation.
+		bool pair_pending = false; // The suspended callback completes with value and Err.
 		Callable wait_call; // Exact completion subscription removed on cancellation.
 		uint64_t made = 0; // First suspension time used for expiry.
 		uint64_t due = 0; // Deadline in the timeout-ordered index.
@@ -303,17 +359,18 @@ class GDWebApp : public RefCounted {
 
 	// Advance one request until it responds or suspends.
 	// Only suspended requests enter jobs, avoiding map operations on the synchronous path.
-	void run(int p_id, Job &p_job, const Variant &p_back, bool p_resumed, uint64_t p_until);
+	void run(int p_id, Job &p_job, const VariantPair &p_back, bool p_resumed, uint64_t p_until);
 	void post_poll(); // Schedule another runtime turn when runnable requests remain.
 	// Consume one call's result and advance the processing position.
 	void failed(Job &p_job, const Ref<Err> &p_error); // Route unsent failures through the shared error handler.
-	void step(Job &p_job, const Variant &p_ret);
+	void step(Job &p_job, const VariantPair &p_ret);
 	// Select a route and handler, or construct an immediate unmatched response.
 	void pick(Job &p_job);
 	// Inspect the next static root and return its file-open completion signal.
 	Variant pick_static(Job &p_job);
 	// Resume a suspended handler from its completed signal.
-	void resumed(const Variant &p_value, int p_id);
+	void resumed(const VariantPair &p_result, int p_id);
+	void resumed_unavailable(int p_id); // Deliver a missing signal as an error on the next turn.
 	// Normalize arbitrary signal arguments before resuming the request.
 	Variant resume_signal(const Variant **p_args, int p_count, Callable::CallError &r_err);
 	// Retain a suspended operation and return true; otherwise return false.
@@ -324,10 +381,11 @@ class GDWebApp : public RefCounted {
 	void arm_jobs(); // Register the earliest handler deadline with the runtime timer.
 	// Disconnect the awaited source and prevent the suspended script from resuming.
 	void cancel_job(Job &p_job);
+	void fault_job(int p_id, Job &p_job); // Respond to an unsent script fault and release its work.
 	// Check graceful shutdown after completion or deadline notification.
 	void check_shutdown();
 	// Deliver graceful-shutdown results to the waiting caller.
-	void finish_shutdown(const Ref<R> &p_result);
+	void finish_shutdown(const VariantPair &p_result);
 	// Finish one request with a text, byte-array, or dictionary response.
 	void finish(int p_id, Job &p_job);
 	// Match a route, storing named captures in p_req on success.
@@ -343,8 +401,8 @@ protected:
 
 public:
 	// Centralize web-feature factories on GDWebApp.
-	static Ref<R> jwt_sign(const Dictionary &p_claims, const Variant &p_key, const Dictionary &p_opts);
-	static Ref<R> jwt_verify(const String &p_token, const Variant &p_key, const Dictionary &p_opts);
+	static VariantPair jwt_sign(const Dictionary &p_claims, const Variant &p_key, const Dictionary &p_opts);
+	static VariantPair jwt_verify(const String &p_token, const Variant &p_key, const Dictionary &p_opts);
 	static Ref<GDWebMiddleware> jwt(const Variant &p_key, const Dictionary &p_opts);
 	static Ref<GDWebMiddleware> csrf(const Dictionary &p_opts);
 	static Ref<GDWebSessionStore> sessions(int64_t p_total, int64_t p_per_user, int64_t p_idle_seconds, int64_t p_life_seconds, const String &p_cookie, const String &p_keep);
@@ -356,7 +414,7 @@ public:
 	static Dictionary rule_object(const Dictionary &p_fields, bool p_extra);
 	static Dictionary rule_optional(const Dictionary &p_rule, const Variant &p_fallback);
 	static Dictionary rule_one_of(const Array &p_values);
-	static Ref<R> validate(const Variant &p_value, const Dictionary &p_rule);
+	static VariantPair validate(const Variant &p_value, const Dictionary &p_rule);
 	static Ref<GDWebMiddleware> valid_json(const Dictionary &p_rule, const String &p_name);
 	static Ref<GDWebMiddleware> valid_query(const Dictionary &p_rule, const String &p_name);
 	static Ref<GDWebMiddleware> valid_params(const Dictionary &p_rule, const String &p_name);
@@ -382,8 +440,8 @@ public:
 
 	Signal file_at(const String &p_path) const; // Read a static file into a response or preserve its failure.
 
-	// Start listening and return failure details through R.
-	Ref<R> listen(int64_t p_port, const String &p_host);
+	// Start listening and return failure details through Err.
+	VariantPair listen(int64_t p_port, const String &p_host);
 	Signal listen_tls(int64_t p_port, const String &p_cert, const String &p_key, const String &p_host, const Dictionary &p_opts); // Load credentials and client-auth policy off-loop and return the listen result.
 	// Return the actual listen port, including kernel-selected ports.
 	int port() const;
@@ -392,6 +450,8 @@ public:
 	void stop();
 	void leave(); // Honor deferred stop requests at a work boundary.
 	bool is_listening() const;
+	// Return the cause when a running listener stops accepting connections.
+	Ref<Err> serve_error() const { return srv.is_valid() ? srv->get_failure() : Ref<Err>(); }
 	void poll(); // Advance only requests that received readiness notifications.
 
 	~GDWebApp();
@@ -422,21 +482,21 @@ public:
 	// Await the response and its transport error, retaining partial data.
 	static Signal fetch(const String &p_url, const Dictionary &p_opts, const Ref<GDHTTPTransport> &p_transport);
 
-	static Dictionary text(const String &p_body, int64_t p_status);
-	static Dictionary html(const String &p_body, int64_t p_status);
-	static Variant json_out(const Variant &p_data, int64_t p_status, uint64_t p_until = 0);
+	static Ref<GDWebResponse> text(const String &p_body, int64_t p_status);
+	static Ref<GDWebResponse> html(const String &p_body, int64_t p_status);
+	static VariantPair json_out(const Variant &p_data, int64_t p_status, uint64_t p_until = 0);
 	// Return already-assembled content without an intermediate text conversion.
-	static Dictionary bytes_out(const PackedByteArray &p_body, const String &p_type, int64_t p_status);
+	static Ref<GDWebResponse> bytes_out(const PackedByteArray &p_body, const String &p_type, int64_t p_status);
 	// Redirect within the origin by default; set away explicitly for external targets.
-	static Dictionary redirect(const String &p_to, int64_t p_status, bool p_away);
+	static Ref<GDWebResponse> redirect(const String &p_to, int64_t p_status, bool p_away);
 	// Add protective headers against MIME sniffing, framing, injection, and referrer leakage.
 	// Use security-oriented defaults that callers may explicitly override.
-	static Dictionary guard(const Dictionary &p_reply);
-	static Dictionary not_found(const String &p_msg);
-	// Add one response header and return the same dictionary for chaining.
-	static Dictionary head(const Dictionary &p_reply, const String &p_name, const Variant &p_value);
+	static Ref<GDWebResponse> guard(const Ref<GDWebResponse> &p_reply);
+	static Ref<GDWebResponse> not_found(const String &p_msg);
+	// Copy a response with one header for chaining.
+	static Ref<GDWebResponse> head(const Ref<GDWebResponse> &p_reply, const String &p_name, const Variant &p_value);
 	// Append another field with the same name, such as an additional Set-Cookie.
-	static Dictionary add_head(const Dictionary &p_reply, const String &p_name, const Variant &p_value);
+	static Ref<GDWebResponse> add_head(const Ref<GDWebResponse> &p_reply, const String &p_name, const Variant &p_value);
 	// Map an error category to an HTTP status.
 	static int status_of(const Ref<Err> &p_err);
 };

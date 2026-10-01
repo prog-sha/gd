@@ -346,6 +346,11 @@ public:
 
 	virtual Error move_to_trash(const String &p_path) { return FAILED; }
 
+#ifdef GD_VIEW
+	void create_lock_file();
+	void remove_lock_file();
+#endif
+
 
 	virtual int get_exit_code() const;
 	// `set_exit_code` should only be used from `SceneTree` (or from a similar

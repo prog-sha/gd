@@ -363,7 +363,7 @@ public:
 			int peer_port = udp->get_packet_port();
 			Ref<PacketPeerDTLS> peer = server->take_connection(udp);
 			PacketPeerDTLS::Status status = peer->get_status();
-			if (peers.size() < max_clients && status == PacketPeerDTLS::STATUS_HANDSHAKING || status == PacketPeerDTLS::STATUS_CONNECTED) {
+			if (peers.size() < max_clients && (status == PacketPeerDTLS::STATUS_HANDSHAKING || status == PacketPeerDTLS::STATUS_CONNECTED)) {
 				String key = String(peer_ip) + ":" + itos(peer_port);
 				Peer p;
 				p.conn = peer;

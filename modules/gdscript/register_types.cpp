@@ -32,6 +32,7 @@
 
 #include "gdscript.h"
 #include "gdscript_cache.h"
+#include "gdscript_online.h"
 #include "gdscript_parser.h"
 #include "gdscript_resource_format.h"
 #include "gdscript_tokenizer_buffer.h"
@@ -42,10 +43,76 @@
 #include "core/io/resource_saver.h"
 #include "core/object/class_db.h"
 
+#ifdef TOOLS_ENABLED
+#include "editor/gdscript_highlighter.h"
+#include "editor/gdscript_translation_parser_plugin.h"
+
+#include "editor/editor_node.h"
+#include "editor/export/editor_export.h"
+#include "editor/script/script_editor_plugin.h"
+#include "editor/translations/editor_translation_parser.h"
+#endif // TOOLS_ENABLED
+
 GDScriptLanguage *script_language_gd = nullptr;
 Ref<ResourceFormatLoaderGDScript> resource_loader_gd;
 Ref<ResourceFormatSaverGDScript> resource_saver_gd;
 GDScriptCache *gdscript_cache = nullptr;
+
+#ifdef TOOLS_ENABLED
+
+Ref<GDScriptEditorTranslationParserPlugin> gdscript_translation_parser_plugin; // Extracts translatable strings from scripts in the editor.
+
+// Export scripts as binary tokens when the export preset asks for it.
+class EditorExportGDScript : public EditorExportPlugin {
+	GDCLASS(EditorExportGDScript, EditorExportPlugin);
+
+	static constexpr EditorExportPreset::ScriptExportMode DEFAULT_SCRIPT_MODE = EditorExportPreset::MODE_SCRIPT_BINARY_TOKENS_COMPRESSED; // Mode used without a preset.
+	EditorExportPreset::ScriptExportMode script_mode = DEFAULT_SCRIPT_MODE; // Mode of the export in progress.
+
+protected:
+	// Read the script mode chosen by the current preset.
+	virtual void _export_begin(const HashSet<String> &p_features, bool p_debug, const String &p_path, int p_flags) override {
+		script_mode = DEFAULT_SCRIPT_MODE;
+		const Ref<EditorExportPreset> &preset = get_export_preset();
+		if (preset.is_valid()) {
+			script_mode = preset->get_script_export_mode();
+		}
+	}
+
+	// Replace a script source with its token form.
+	virtual void _export_file(const String &p_path, const String &p_type, const HashSet<String> &p_features) override {
+		if (p_path.get_extension() != "gd" || script_mode == EditorExportPreset::MODE_SCRIPT_TEXT) {
+			return;
+		}
+		Vector<uint8_t> file = FileAccess::get_file_as_bytes(p_path);
+		if (file.is_empty()) {
+			return;
+		}
+		const String source = String::utf8(reinterpret_cast<const char *>(file.ptr()), file.size());
+		const GDScriptTokenizerBuffer::CompressMode compress_mode = script_mode == EditorExportPreset::MODE_SCRIPT_BINARY_TOKENS_COMPRESSED ? GDScriptTokenizerBuffer::COMPRESS_ZSTD : GDScriptTokenizerBuffer::COMPRESS_NONE;
+		file = GDScriptTokenizerBuffer::parse_code_string(source, compress_mode);
+		if (file.is_empty()) {
+			return;
+		}
+		add_file(p_path.get_basename() + ".gdc", file, true);
+	}
+
+public:
+	virtual String get_name() const override { return "GDScript"; }
+};
+
+// Register the script exporter and syntax highlighting once the editor exists.
+static void _editor_init() {
+	Ref<EditorExportGDScript> gd_export;
+	gd_export.instantiate();
+	EditorExport::get_singleton()->add_export_plugin(gd_export);
+
+	Ref<GDScriptSyntaxHighlighter> highlighter;
+	highlighter.instantiate();
+	ScriptEditor::get_singleton()->register_syntax_highlighter(highlighter);
+}
+
+#endif // TOOLS_ENABLED
 
 void initialize_gdscript_module(ModuleInitializationLevel p_level) {
 	if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
@@ -64,7 +131,21 @@ void initialize_gdscript_module(ModuleInitializationLevel p_level) {
 		gdscript_cache = memnew(GDScriptCache);
 
 		GDScriptUtilityFunctions::register_functions();
+
+		// Set up the @online analysis tables and safety boundary inside this language.
+		GDScriptOnline::initialize();
 	}
+
+#ifdef TOOLS_ENABLED
+	// Give the editor script highlighting, export and translation support.
+	if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
+		EditorNode::add_init_callback(_editor_init);
+		gdscript_translation_parser_plugin.instantiate();
+		EditorTranslationParser::get_singleton()->add_parser(gdscript_translation_parser_plugin, EditorTranslationParser::STANDARD);
+	} else if (p_level == MODULE_INITIALIZATION_LEVEL_EDITOR) {
+		GDREGISTER_CLASS(GDScriptSyntaxHighlighter);
+	}
+#endif // TOOLS_ENABLED
 }
 
 void uninitialize_gdscript_module(ModuleInitializationLevel p_level) {
@@ -80,6 +161,8 @@ void uninitialize_gdscript_module(ModuleInitializationLevel p_level) {
 			memdelete(script_language_gd);
 		}
 
+		GDScriptOnline::shutdown();
+
 		ResourceLoader::remove_resource_format_loader(resource_loader_gd);
 		resource_loader_gd.unref();
 
@@ -89,4 +172,11 @@ void uninitialize_gdscript_module(ModuleInitializationLevel p_level) {
 		GDScriptParser::cleanup();
 		GDScriptUtilityFunctions::unregister_functions();
 	}
+
+#ifdef TOOLS_ENABLED
+	if (p_level == MODULE_INITIALIZATION_LEVEL_EDITOR) {
+		EditorTranslationParser::get_singleton()->remove_parser(gdscript_translation_parser_plugin, EditorTranslationParser::STANDARD);
+		gdscript_translation_parser_plugin.unref();
+	}
+#endif // TOOLS_ENABLED
 }

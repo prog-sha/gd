@@ -1,6 +1,6 @@
 # gd
 
-[日本語](README.ja.md) | English
+English | [日本語](README.ja.md)
 
 A single command for writing command-line tools, websites, Web APIs, scheduled jobs, and data processing in GDScript.
 It is Godot built without a display, and it runs a `.gd` file directly without a `project.godot`.
@@ -23,18 +23,18 @@ gd hello.gd
 - Waiting APIs are ordinary function calls. Only the calling GDScript waits; everything else continues.
 - Failures are not exceptions. Functions return `return value, failure`, and `?` passes a failure to the caller.
 - The same script runs on macOS, Linux, and Windows, and links with C++ through GDExtension.
-- Together with Godot itself, apps, servers, and CLI tools can all be written in GDScript. It is designed for AI agents to write and run code.
+- Together with Godot itself, apps, servers, and CLI tools can all be written in GDScript.
 
 ```gdscript
 var app := GD.web.app()
 
-func home(_req):
-	return GD.web.html("<h1>gd</h1>"), null
+func home(_req: GDWebRequest) -> GDWebResponse, Err:
+	return GD.web.html("<h1>gd</h1>")
 
-func hello(req):
+func hello(req: GDWebRequest) -> GDWebResponse, Err:
 	return GD.web.json({"message": "hello", "ip": req.ip})
 
-func main():
+func main() -> int:
 	app.route("GET", "/", home)
 	app.route("GET", "/api/hello", hello)
 	app.listen(8080, "127.0.0.1")!
@@ -43,6 +43,19 @@ func main():
 
 ```sh
 gd serve main.gd
+```
+
+Receive the value and `Err` separately. A `null` error means success; a partial value can still be present on failure. Create `message.txt` and save this as `read.gd`, then run `gd read.gd`:
+
+```gdscript
+# Read a file and handle its failure separately from its contents.
+func main():
+	var text, err := GD.file.read_text("message.txt")
+	if err:
+		printerr(err)
+		return 1
+	print(text)
+	return 0
 ```
 
 ## Install
@@ -72,6 +85,7 @@ Use `@import` to shorten module declarations and access shared constants. See th
 |---|---|
 | `GD.file`, `GD.data` | Files, formats such as CSV, TOML, and YAML, JSON, hashes |
 | `GD.http`, `GD.net` | HTTP client, TCP, UDP, TLS |
+| `GD.mail` | Mail parsing, SMTP submission, MIME |
 | `GD.web` | HTTP/HTTPS server, router, middleware, input validation, authentication, HTML templates |
 | `GD.database` | SQLite, PostgreSQL, Redis |
 | `GD.async` | Concurrency, timeouts, cancellation |
@@ -95,7 +109,7 @@ gd add / install / remove       manage dependencies
 gd doc [name|manual|all]        read the manual and the API
 ```
 
-`gd --help` lists the remaining commands.
+`gd help` lists the remaining commands.
 
 ## Permissions
 
@@ -113,17 +127,18 @@ gd --strict \
 ## Documentation
 
 - [Manual](docs/manual.en.md) ([日本語](docs/manual.md)): [Quick start](docs/manual.en.md#quick-start), [Tutorial](docs/manual.en.md#tutorial-a-notes-api-on-sqlite)
-- [Web manual and API reference](https://gd.progsha.com/)
+- [gd-godot manual](docs/gd-godot.en.md) ([日本語](docs/gd-godot.md)): editor, projects, and online features (in development)
+- [API reference and tutorials](https://gd.progsha.com/docs/en/index.html)
 - In the terminal: `gd doc`, `gd doc manual`, `gd doc GD.file`
-- [Official extensions](https://gd.progsha.com/pkg/): Discord Bot, Memcached, Supabase
-- [Changelog](CHANGELOG.md), [Security policy](SECURITY.md), [Contributing](CONTRIBUTING.md)
+- [Official extensions](https://gd.progsha.com/pkg/): Discord Bot, Supabase
+- [Changelog](CHANGELOG.md), [Security policy](SECURITY.md), [Contributing](CONTRIBUTING.md), [Code of conduct](CODE_OF_CONDUCT.md)
 
 ## Build from source
 
 Install Python, SCons, and a C/C++ compiler.
 
 ```sh
-git clone --branch 0.7 https://github.com/prog-sha/gd.git
+git clone --branch master https://github.com/prog-sha/gd.git
 cd gd
 scons platform=macos target=template_release -j12
 ```
@@ -132,10 +147,10 @@ Use `platform=linuxbsd arch=arm64` or `arch=x86_64` on Linux. For a Windows MinG
 `platform=windows arch=x86_64 use_mingw=yes windows_subsystem=console`.
 Executables are written to `bin/`. This public repository contains product source and user documentation.
 
-Run the bundled [public acceptance tests](tests/release/README.md) to check the executable:
+Run the bundled [smoke tests](tests/README.md) to check the executable:
 
 ```sh
-uv run --no-project python tests/release/run.py --gd bin/gd.macos.template_release.arm64
+uv run --no-project python tests/run.py --gd bin/gd.macos.template_release.arm64
 # Linux ARM64: --gd bin/gd.linuxbsd.template_release.arm64
 ```
 

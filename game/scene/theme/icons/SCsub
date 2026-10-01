@@ -6,7 +6,7 @@ Import("env")
 import default_theme_icons_builders
 
 env.CommandNoCache(
-    "#scene/theme/default_theme_icons.gen.h",
+    "#game/scene/theme/default_theme_icons.gen.h",
     Glob("*.svg"),
     env.Run(default_theme_icons_builders.make_default_theme_icons_action),
 )

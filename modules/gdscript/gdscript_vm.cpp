@@ -31,9 +31,13 @@
 #include "gdscript.h"
 #include "cli/sys/pkgscope.h"
 #include "gdscript_function.h"
+#include "cli/sys/std.h"
 #include "gdscript_lambda_callable.h"
+#include "gdscript_online.h"
 
 #include "cli/sys/wait.h"
+#include "cli/sys/gdtask.h"
+#include "cli/sys/task.h"
 #include "cli/sys/sched.h"
 #include "core/object/class_db.h"
 #include "core/os/main_loop.h"
@@ -47,6 +51,8 @@ thread_local int script_call_depth = 0; // Current script call-stack depth.
 thread_local int slice_depth = 0; // Depth of the outermost call eligible for automatic suspension.
 thread_local uint64_t slice_due = 0; // Deadline for yielding at the next safe point.
 thread_local uint32_t slice_checks = 0; // Safe-point counter used to reduce clock reads.
+thread_local uint64_t fault_epoch = 0; // Script faults seen by the current execution thread.
+thread_local uint64_t pair_fault_epoch = 0; // Paired-function faults that unwind every caller.
 
 // Keep callbacks synchronous while a builtin owns a native stack frame.
 struct BuiltinScope {
@@ -96,6 +102,45 @@ uint64_t GDScriptFunction::native_time_slice_deadline() {
 // Expose the existing slice without resetting the allowance for each native call.
 uint64_t GDScriptFunction::time_slice_deadline() {
 	return slice_depth != 0 && script_call_depth >= slice_depth ? slice_due : 0;
+}
+
+// Report script faults without mapping them onto a recoverable Err value.
+uint64_t GDScriptFunction::runtime_fault_epoch() {
+	return fault_epoch;
+}
+
+// Switch to Server privileges when Server code starts or resumes from await, and always restore on every exit path.
+class OnlineServerFunctionScope {
+	Object *server = nullptr;
+
+public:
+	OnlineServerFunctionScope(bool p_online, Object *p_owner) {
+		if (p_online && p_owner != nullptr && p_owner->is_class(SNAME("Online"))) {
+			server = p_owner;
+			server->call(SNAME("__begin_online_call"));
+		}
+	}
+
+	~OnlineServerFunctionScope() {
+		if (server != nullptr) {
+			server->call(SNAME("__end_online_call"));
+		}
+	}
+};
+
+// Decide whether a write from author code on a Client copy to an @online value is blocked; it never changes the Online value.
+// The caller has already checked the cached flag for whether this is a Client copy.
+static bool online_client_read_only(GDScriptInstance *p_instance, const StringName &p_name) {
+	Object *owner = p_instance->get_owner();
+	if (owner == nullptr) {
+		return false;
+	}
+	const Dictionary marks = owner->get_meta(SNAME("mark"), Dictionary());
+	const int flags = marks.get(p_name, 0);
+	if (flags & GDScriptOnline::F_INPUT) {
+		return !GDScriptOnline::is_mine(owner); // Input is written only on the owner's client; drop silently elsewhere.
+	}
+	return Ref<GDScript>(p_instance->get_script())->is_online_client() && (flags & GDScriptOnline::F_ONLINE) && !(flags & (GDScriptOnline::F_METHOD | GDScriptOnline::F_SIGNAL));
 }
 
 #ifdef DEBUG_ENABLED
@@ -357,12 +402,15 @@ void (*type_init_function_table[])(Variant *) = {
 		&&OPCODE_CONSTRUCT_TYPED_DICTIONARY, \
 		&&OPCODE_CALL, \
 		&&OPCODE_CALL_RETURN, \
+		&&OPCODE_CALL_PAIR, \
+		&&OPCODE_CALL_PAIR_ASYNC, \
 		&&OPCODE_CALL_ASYNC, \
 		&&OPCODE_CALL_UTILITY, \
 		&&OPCODE_CALL_UTILITY_VALIDATED, \
 		&&OPCODE_CALL_GDSCRIPT_UTILITY, \
 		&&OPCODE_CALL_BUILTIN_TYPE_VALIDATED, \
 		&&OPCODE_CALL_SELF_BASE, \
+		&&OPCODE_CALL_SELF_BASE_PAIR, \
 		&&OPCODE_CALL_METHOD_BIND, \
 		&&OPCODE_CALL_METHOD_BIND_RET, \
 		&&OPCODE_CALL_BUILTIN_STATIC, \
@@ -373,6 +421,7 @@ void (*type_init_function_table[])(Variant *) = {
 		&&OPCODE_CALL_METHOD_BIND_VALIDATED_NO_RETURN, \
 		&&OPCODE_AWAIT, \
 		&&OPCODE_AWAIT_RESUME, \
+		&&OPCODE_AWAIT_RESUME_PAIR, \
 		&&OPCODE_CREATE_LAMBDA, \
 		&&OPCODE_CREATE_SELF_LAMBDA, \
 		&&OPCODE_JUMP, \
@@ -381,6 +430,7 @@ void (*type_init_function_table[])(Variant *) = {
 		&&OPCODE_JUMP_TO_DEF_ARGUMENT, \
 		&&OPCODE_JUMP_IF_SHARED, \
 		&&OPCODE_RETURN, \
+		&&OPCODE_RETURN_PAIR, \
 		&&OPCODE_RETURN_TYPED_BUILTIN, \
 		&&OPCODE_RETURN_TYPED_ARRAY, \
 		&&OPCODE_RETURN_TYPED_DICTIONARY, \
@@ -569,6 +619,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 	GodotProfileZoneScript(this, source, name, name, _initial_line);
 
 	OPCODES_TABLE;
+	r_err.runtime_failed = false;
 
 	if (!_code_ptr) {
 		return _get_default_variant_for_data_type(return_type);
@@ -578,6 +629,9 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 	if (unlikely(++script_call_depth > MAX_CALL_DEPTH)) {
 		script_call_depth--;
+		++fault_epoch;
+		if (result_pair) ++pair_fault_epoch;
+		r_err.runtime_failed = true;
 #ifdef DEBUG_ENABLED
 		String err_file;
 		if (p_instance && ObjectDB::get_instance(p_instance->owner_id) != nullptr && p_instance->script->is_valid() && !p_instance->script->path.is_empty()) {
@@ -745,7 +799,33 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 	memnew_placement(&stack[ADDR_STACK_NIL], Variant);
 
 	String err_text;
+	// Use argument validation when a null value reaches a statically typed native call.
+	auto validated_method = [&](MethodBind *p_method, Object *p_base, Variant **p_args, int p_count, Variant *r_value) -> bool {
+		for (int i = 0; i < p_count; i++) {
+			if (p_args[i]->get_type() == Variant::NIL) {
+				Callable::CallError call_error;
+				Variant value = p_method->call(p_base, (const Variant **)p_args, p_count, call_error);
+				if (call_error.error != Callable::CallError::CALL_OK) {
+					err_text = _get_call_error("function '" + String(p_method->get_name()) + "'", (const Variant **)p_args, p_count, value, call_error);
+					return false;
+				}
+				if (r_value) {
+					*r_value = value;
+				}
+				return true;
+			}
+		}
+		p_method->validated_call(p_base, (const Variant **)p_args, r_value);
+		return true;
+	};
 	bool forced_failure = false; // Whether the error comes from the ! operator, which stops the program.
+	bool inherited_fault = p_state && p_state->runtime_fault; // An awaited script failed before this frame resumed.
+	const uint64_t entered_fault_epoch = fault_epoch; // Detect faults from nested script calls.
+	const uint64_t entered_pair_fault_epoch = pair_fault_epoch; // Preserve paired faults through single-result callers.
+	const bool online_dynamic = _script != nullptr && _script->is_online_dynamic();
+	OnlineServerFunctionScope server_scope(online_dynamic, p_instance ? p_instance->owner : nullptr);
+	// Whether this is a Client copy is fixed per script; don't recheck on every assignment.
+	const bool online_client = p_instance != nullptr && p_instance->script.is_valid() && p_instance->script->is_online_guarded();
 
 	GDScriptLanguage::CallLevel call_level;
 	GDScriptLanguage::get_singleton()->enter_function(&call_level, p_instance, this, stack, &ip, &line);
@@ -821,22 +901,32 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 		profile.call_count.increment();
 		profile.frame_call_count.increment();
 	}
-	bool exit_ok = false;
 	int variant_address_limits[ADDR_TYPE_MAX] = { _stack_size, _constant_count, p_instance ? (int)p_instance->members.size() : 0 };
 #endif
 
+	bool exit_ok = false; // Distinguish a completed frame from a runtime fault in every build.
 	bool awaited = false;
 	Variant *variant_addresses[ADDR_TYPE_MAX] = { stack, _constants_ptr, p_instance ? p_instance->members.ptrw() : nullptr };
 	if (p_state && p_state->result_addr >= 0) {
 		// Write the child's completion value to the saved call-instruction destination.
 		const int address = p_state->result_addr;
-		variant_addresses[(address & ADDR_TYPE_MASK) >> ADDR_BITS][address & ADDR_MASK] = p_state->result;
+		Variant &target = variant_addresses[(address & ADDR_TYPE_MASK) >> ADDR_BITS][address & ADDR_MASK];
+		if (p_state->result_error_addr >= 0) {
+			const int error_address = p_state->result_error_addr;
+			Variant &error_target = variant_addresses[(error_address & ADDR_TYPE_MASK) >> ADDR_BITS][error_address & ADDR_MASK];
+			target = p_state->result;
+			error_target = p_state->result_error;
+			p_state->result_error_addr = -1;
+		} else {
+			target = p_state->result;
+		}
 		p_state->result_addr = -1;
 	}
 
 	// Save the VM frame on the heap and create a continuation resumed by the selected Signal.
-	auto suspend = [&](int p_ip, Signal p_signal, bool p_scheduled = false, int p_result_addr = -1, bool p_automatic = false) -> Error {
+	auto suspend = [&](int p_ip, Signal p_signal, bool p_scheduled = false, int p_result_addr = -1, bool p_automatic = false, int p_result_error_addr = -1, bool p_pair_signal = false) -> Error {
 		Ref<GDScriptFunctionState> state = memnew(GDScriptFunctionState);
+		state->async_scope = Async::scope();
 		state->function = this;
 		state->state.stack.resize(alloca_size);
 		for (int i = FIXED_ADDRESSES_MAX; i < _stack_size; i++) {
@@ -861,6 +951,10 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 #endif
 		state->state.defarg = defarg;
 		state->state.result_addr = p_result_addr;
+		state->state.result_error_addr = p_result_error_addr;
+		state->state.awaited_child = Ref<GDScriptFunctionState>(Object::cast_to<GDScriptFunctionState>(p_signal.get_object()));
+		state->state.result_pair_signal = p_pair_signal;
+		state->state.pair_return = p_state ? p_state->pair_return : result_pair && r_err.result_error != nullptr;
 		state->state.completed = p_state ? p_state->completed : Signal(state.ptr(), SNAME("completed"));
 		if (p_state) {
 			state->state.completion_owner = p_state->completion_owner;
@@ -872,13 +966,11 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 		retvalue = state;
 		const Error err = p_scheduled ? state->schedule() : p_signal.connect(Callable(state.ptr(), "_signal_callback").bind(retvalue), Object::CONNECT_ONE_SHOT);
 		awaited = err == OK;
-#ifdef DEBUG_ENABLED
 		exit_ok = awaited;
-#endif
 		return err;
 	};
 	// Link the parent frame to an automatically suspended child, excluding ordinary asynchronous functions.
-	auto chain_child = [&](const Variant &p_value, int p_ip, int p_result_addr) -> bool {
+	auto chain_child = [&](const Variant &p_value, int p_ip, int p_result_addr, int p_result_error_addr = -1) -> bool {
 		if (p_value.get_type() != Variant::OBJECT) {
 			return false;
 		}
@@ -886,7 +978,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 		if (!child || !child->is_automatic()) {
 			return false;
 		}
-		if (suspend(p_ip, Signal(child, SNAME("completed")), false, p_result_addr, true) != OK) {
+		if (suspend(p_ip, Signal(child, SNAME("completed")), false, p_result_addr, true, p_result_error_addr, p_result_error_addr >= 0) != OK) {
 			err_text = "Error connecting VM continuation.";
 		}
 		return true;
@@ -956,22 +1048,35 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 		}
 	};
 	// Automatically await only native method Signals with registered completion types.
-	// Return ordinary Signal values unchanged while supporting automatic-wait API calls.
-	auto chain_native = [&](const Variant &p_value, StringName p_class, StringName p_method, int p_ip, int p_result_addr, const Variant *p_base = nullptr, const Variant **p_call_args = nullptr, int p_call_argc = 0) -> bool {
+	// An explicitly started operation instead stores a GDTask in r_task, which keeps its result for later waits.
+	// Return ordinary Signal values unchanged.
+	auto chain_native = [&](const Variant &p_value, StringName p_class, StringName p_method, int p_ip, int p_result_addr, const Variant *p_base = nullptr, const Variant **p_call_args = nullptr, int p_call_argc = 0, int p_result_error_addr = -1, Variant *r_task = nullptr) -> bool {
 		if (p_value.get_type() != Variant::SIGNAL) {
 			return false;
 		}
 		if (p_base) {
 			indirect_target(*p_base, p_method, p_call_args, p_call_argc, p_class, p_method);
 		}
-		if (p_class == StringName() || !ClassDB::is_auto_wait(p_class, p_method)) {
+		if (p_class == StringName()) {
 			return false;
+		}
+		if (!ClassDB::is_auto_wait(p_class, p_method)) {
+			if (r_task && ClassDB::get_await_class(p_class, p_method) != StringName()) {
+				const Signal started = p_value;
+				*r_task = GDTask::follow(started);
+			}
+			return false;
+		}
+		// Require separate receiving slots for native value-and-error completions.
+		if (p_result_error_addr < 0 && String(ClassDB::get_await_class(p_class, p_method)).begins_with("Pair:")) {
+			err_text = "A two-result function needs two receiving slots; use a typed receiver with var value, error = call(), or var value, _ = call().";
+			return true;
 		}
 		if (!may_suspend) {
 			err_text = vformat("Cannot wait for %s() here: this function was called by native code (a callback, iterator, or initializer). Use %s_async() with await, or call it from a coroutine.", p_method, p_method);
 			return true;
 		}
-		if (suspend(p_ip, p_value, false, p_result_addr, true) != OK) {
+		if (suspend(p_ip, p_value, false, p_result_addr, true, p_result_error_addr, p_result_error_addr >= 0) != OK) {
 			err_text = "Error connecting native continuation.";
 		}
 		return true;
@@ -979,11 +1084,20 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 // Yield only after completed bytecode instructions, never inside a native call.
 #define MAYBE_TIME_SLICE \
+	if (unlikely(inherited_fault || pair_fault_epoch != entered_pair_fault_epoch || (result_pair && fault_epoch != entered_fault_epoch))) { \
+		inherited_fault = true; \
+		OPCODE_BREAK; \
+	} \
 	if (can_preempt && unlikely(time_slice_due())) { \
 		if (suspend(ip, Signal(), true) == OK) { \
 			OPCODE_BREAK; \
 		} \
 	}
+
+// Also block the optimized path where Client code writes the member array directly, for synced variables.
+#define ONLINE_READ_ONLY_MEMBER(m_code_ofs) \
+	(online_client && ((_code_ptr[ip + 1 + (m_code_ofs)] & ADDR_TYPE_MASK) >> ADDR_BITS) == ADDR_TYPE_MEMBER && \
+			p_instance->online_read_only_member(_code_ptr[ip + 1 + (m_code_ofs)] & ADDR_MASK))
 
 #ifdef DEBUG_ENABLED
 	OPCODE_WHILE(ip < _code_size) {
@@ -1496,6 +1610,10 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				GD_ERR_BREAK(indexname < 0 || indexname >= _global_names_count);
 				const StringName *index = &_global_names_ptr[indexname];
 
+				if (online_client && online_client_read_only(p_instance, *index)) {
+					ip += 3;
+					DISPATCH_OPCODE;
+				}
 				bool valid;
 #ifndef DEBUG_ENABLED
 				ClassDB::set_property(p_instance->owner, *index, *src, &valid);
@@ -1570,6 +1688,10 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 			OPCODE(OPCODE_ASSIGN) {
 				CHECK_SPACE(3);
+				if (ONLINE_READ_ONLY_MEMBER(0)) {
+					ip += 3;
+					DISPATCH_OPCODE;
+				}
 				GET_VARIANT_PTR(dst, 0);
 				GET_VARIANT_PTR(src, 1);
 
@@ -1581,6 +1703,10 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 			OPCODE(OPCODE_ASSIGN_NULL) {
 				CHECK_SPACE(2);
+				if (ONLINE_READ_ONLY_MEMBER(0)) {
+					ip += 2;
+					DISPATCH_OPCODE;
+				}
 				GET_VARIANT_PTR(dst, 0);
 
 				*dst = Variant();
@@ -1591,6 +1717,10 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 			OPCODE(OPCODE_ASSIGN_TRUE) {
 				CHECK_SPACE(2);
+				if (ONLINE_READ_ONLY_MEMBER(0)) {
+					ip += 2;
+					DISPATCH_OPCODE;
+				}
 				GET_VARIANT_PTR(dst, 0);
 
 				*dst = true;
@@ -1601,6 +1731,10 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 			OPCODE(OPCODE_ASSIGN_FALSE) {
 				CHECK_SPACE(2);
+				if (ONLINE_READ_ONLY_MEMBER(0)) {
+					ip += 2;
+					DISPATCH_OPCODE;
+				}
 				GET_VARIANT_PTR(dst, 0);
 
 				*dst = false;
@@ -1611,6 +1745,10 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 			OPCODE(OPCODE_ASSIGN_TYPED_BUILTIN) {
 				CHECK_SPACE(4);
+				if (ONLINE_READ_ONLY_MEMBER(0)) {
+					ip += 4;
+					DISPATCH_OPCODE;
+				}
 				GET_VARIANT_PTR(dst, 0);
 				GET_VARIANT_PTR(src, 1);
 
@@ -1640,6 +1778,10 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 			OPCODE(OPCODE_ASSIGN_TYPED_ARRAY) {
 				CHECK_SPACE(6);
+				if (ONLINE_READ_ONLY_MEMBER(0)) {
+					ip += 6;
+					DISPATCH_OPCODE;
+				}
 				GET_VARIANT_PTR(dst, 0);
 				GET_VARIANT_PTR(src, 1);
 
@@ -1675,6 +1817,10 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 			OPCODE(OPCODE_ASSIGN_TYPED_DICTIONARY) {
 				CHECK_SPACE(9);
+				if (ONLINE_READ_ONLY_MEMBER(0)) {
+					ip += 9;
+					DISPATCH_OPCODE;
+				}
 				GET_VARIANT_PTR(dst, 0);
 				GET_VARIANT_PTR(src, 1);
 
@@ -1719,6 +1865,10 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 			OPCODE(OPCODE_ASSIGN_TYPED_NATIVE) {
 				CHECK_SPACE(4);
+				if (ONLINE_READ_ONLY_MEMBER(0)) {
+					ip += 4;
+					DISPATCH_OPCODE;
+				}
 				GET_VARIANT_PTR(dst, 0);
 				GET_VARIANT_PTR(src, 1);
 
@@ -1755,6 +1905,10 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 			OPCODE(OPCODE_ASSIGN_TYPED_SCRIPT) {
 				CHECK_SPACE(4);
+				if (ONLINE_READ_ONLY_MEMBER(0)) {
+					ip += 4;
+					DISPATCH_OPCODE;
+				}
 				GET_VARIANT_PTR(dst, 0);
 				GET_VARIANT_PTR(src, 1);
 
@@ -2085,11 +2239,14 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 			}
 			DISPATCH_OPCODE;
 
+			OPCODE(OPCODE_CALL_PAIR)
+			OPCODE(OPCODE_CALL_PAIR_ASYNC)
 			OPCODE(OPCODE_CALL_ASYNC)
 			OPCODE(OPCODE_CALL_RETURN)
 			OPCODE(OPCODE_CALL) {
+				bool call_pair = (_code_ptr[ip]) == OPCODE_CALL_PAIR || (_code_ptr[ip]) == OPCODE_CALL_PAIR_ASYNC;
 				bool call_ret = (_code_ptr[ip]) != OPCODE_CALL;
-				bool call_async = (_code_ptr[ip]) == OPCODE_CALL_ASYNC;
+				bool call_async = (_code_ptr[ip]) == OPCODE_CALL_ASYNC || (_code_ptr[ip]) == OPCODE_CALL_PAIR_ASYNC;
 				LOAD_INSTRUCTION_ARGS
 				CHECK_SPACE(3 + instr_arg_count);
 
@@ -2123,7 +2280,23 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				Variant temp_ret;
 				Callable::CallError err;
-				const int result_addr = call_ret ? _code_ptr[ip] : -1;
+				if (call_pair) {
+					GET_INSTRUCTION_ARG(error, argc + 2);
+					*error = Variant();
+					err.result_error = error;
+				}
+				const int result_addr = call_ret ? _code_ptr[ip - (call_pair ? 1 : 0)] : -1;
+				const int result_error_addr = call_pair ? _code_ptr[ip] : -1;
+				// Resolve forwarded native calls before starting an operation whose error cannot be received.
+				if (!call_pair) {
+					StringName target_class = base_class;
+					StringName target_method = *methodname;
+					indirect_target(*base, target_method, (const Variant **)argptrs, argc, target_class, target_method);
+					if (ClassDB::is_auto_wait(target_class, target_method) && String(ClassDB::get_await_class(target_class, target_method)).begins_with("Pair:")) {
+						err_text = "A two-result function needs two receiving slots; use a typed receiver with var value, error = call(), or var value, _ = call().";
+						OPCODE_BREAK;
+					}
+				}
 				if (call_ret) {
 					GET_INSTRUCTION_ARG(ret, argc + 1);
 					{
@@ -2135,10 +2308,10 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 						preemptible_entry = false;
 					}
 					*ret = temp_ret;
-					if (!call_async && chain_child(*ret, ip + 3, result_addr)) {
+					if (!call_async && chain_child(*ret, ip + 3, result_addr, result_error_addr)) {
 						OPCODE_BREAK;
 					}
-					if (!call_async && chain_native(*ret, base_class, *methodname, ip + 3, result_addr, base, (const Variant **)argptrs, argc)) {
+					if (!call_async && chain_native(temp_ret, base_class, *methodname, ip + 3, result_addr, base, (const Variant **)argptrs, argc, result_error_addr, ret)) {
 						OPCODE_BREAK;
 					}
 #ifdef DEBUG_ENABLED
@@ -2285,10 +2458,12 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				const bool script_call = method->get_name() == SNAME("call") || method->get_name() == SNAME("callv");
 				suspendable_entry = may_suspend && script_call;
 				preemptible_entry = can_preempt && script_call;
+				Variant *ret_slot = nullptr; // Destination that receives a GDTask for an explicitly started operation.
 				if (call_ret) {
 					GET_INSTRUCTION_ARG(ret, argc + 1);
 					temp_ret = method->call(base_obj, (const Variant **)argptrs, argc, err);
 					*ret = temp_ret;
+					ret_slot = ret;
 				} else {
 					temp_ret = method->call(base_obj, (const Variant **)argptrs, argc, err);
 				}
@@ -2297,7 +2472,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				if (script_call && chain_child(temp_ret, ip + 3, call_ret ? _code_ptr[ip] : -1)) {
 					OPCODE_BREAK;
 				}
-				if (chain_native(temp_ret, method->get_instance_class(), method->get_name(), ip + 3, call_ret ? _code_ptr[ip] : -1, base, (const Variant **)argptrs, argc)) {
+				if (chain_native(temp_ret, method->get_instance_class(), method->get_name(), ip + 3, call_ret ? _code_ptr[ip] : -1, base, (const Variant **)argptrs, argc, -1, ret_slot)) {
 					OPCODE_BREAK;
 				}
 
@@ -2445,7 +2620,9 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 #endif
 
 				GET_INSTRUCTION_ARG(ret, argc);
-				method->validated_call(nullptr, (const Variant **)argptrs, ret);
+				if (!validated_method(method, nullptr, argptrs, argc, ret)) {
+					OPCODE_BREAK;
+				}
 
 #ifdef DEBUG_ENABLED
 				if (GDScriptLanguage::get_singleton()->profiling && GDScriptLanguage::get_singleton()->profile_native_calls) {
@@ -2483,7 +2660,9 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				GET_INSTRUCTION_ARG(ret, argc);
 				VariantInternal::initialize(ret, Variant::NIL);
-				method->validated_call(nullptr, (const Variant **)argptrs, nullptr);
+				if (!validated_method(method, nullptr, argptrs, argc, nullptr)) {
+					OPCODE_BREAK;
+				}
 
 #ifdef DEBUG_ENABLED
 				if (GDScriptLanguage::get_singleton()->profiling && GDScriptLanguage::get_singleton()->profile_native_calls) {
@@ -2540,13 +2719,15 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				const bool script_call = method->get_name() == SNAME("call") || method->get_name() == SNAME("callv");
 				suspendable_entry = may_suspend && script_call;
 				preemptible_entry = can_preempt && script_call;
-				method->validated_call(base_obj, (const Variant **)argptrs, ret);
+				if (!validated_method(method, base_obj, argptrs, argc, ret)) {
+					OPCODE_BREAK;
+				}
 				suspendable_entry = false;
 				preemptible_entry = false;
 				if (script_call && chain_child(*ret, ip + 3, _code_ptr[ip])) {
 					OPCODE_BREAK;
 				}
-				if (chain_native(*ret, method->get_instance_class(), method->get_name(), ip + 3, _code_ptr[ip], base, (const Variant **)argptrs, argc)) {
+				if (chain_native(*ret, method->get_instance_class(), method->get_name(), ip + 3, _code_ptr[ip], base, (const Variant **)argptrs, argc, -1, ret)) {
 					OPCODE_BREAK;
 				}
 
@@ -2600,7 +2781,9 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				GET_INSTRUCTION_ARG(ret, argc + 1);
 				VariantInternal::initialize(ret, Variant::NIL);
-				method->validated_call(base_obj, (const Variant **)argptrs, nullptr);
+				if (!validated_method(method, base_obj, argptrs, argc, nullptr)) {
+					OPCODE_BREAK;
+				}
 
 #ifdef DEBUG_ENABLED
 				if (GDScriptLanguage::get_singleton()->profiling && GDScriptLanguage::get_singleton()->profile_native_calls) {
@@ -2636,7 +2819,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					method(base, (const Variant **)argptrs, argc, ret);
 				}
 				// A Callable invoked through its typed call()/callv() may reach a waiting API like a direct call does.
-				if (base->get_type() == Variant::CALLABLE && chain_native(*ret, StringName(), SNAME("callv"), ip + 3, _code_ptr[ip], base, (const Variant **)argptrs, argc)) {
+				if (base->get_type() == Variant::CALLABLE && chain_native(*ret, StringName(), SNAME("callv"), ip + 3, _code_ptr[ip], base, (const Variant **)argptrs, argc, -1, ret)) {
 					OPCODE_BREAK;
 				}
 
@@ -2739,7 +2922,9 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 			}
 			DISPATCH_OPCODE;
 
-			OPCODE(OPCODE_CALL_SELF_BASE) {
+			OPCODE(OPCODE_CALL_SELF_BASE)
+			OPCODE(OPCODE_CALL_SELF_BASE_PAIR) {
+				const bool call_pair = _code_ptr[ip] == OPCODE_CALL_SELF_BASE_PAIR;
 				LOAD_INSTRUCTION_ARGS
 				CHECK_SPACE(3 + instr_arg_count);
 
@@ -2762,6 +2947,12 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				Variant **argptrs = instruction_args;
 
 				GET_INSTRUCTION_ARG(dst, argc);
+				Variant *pair_error = nullptr;
+				if (call_pair) {
+					GET_INSTRUCTION_ARG(error_dst, argc + 1);
+					pair_error = error_dst;
+					*pair_error = Variant();
+				}
 
 				const GDScript *gds = _script;
 
@@ -2775,6 +2966,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				}
 
 				Callable::CallError err;
+				err.result_error = pair_error;
 
 				if (E) {
 					suspendable_entry = may_suspend;
@@ -2782,7 +2974,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					*dst = E->value->call(p_instance, (const Variant **)argptrs, argc, err);
 					suspendable_entry = false;
 					preemptible_entry = false;
-					if (chain_child(*dst, ip + 3, _code_ptr[ip])) {
+					if (chain_child(*dst, ip + 3, _code_ptr[ip - (call_pair ? 1 : 0)], call_pair ? _code_ptr[ip] : -1)) {
 						OPCODE_BREAK;
 					}
 				} else if (gds->native.ptr()) {
@@ -2823,6 +3015,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				Signal sig;
 				bool is_signal = true;
+				GDTask *finished_task = nullptr; // Task whose result is already known.
 
 				{
 					Variant result = *argobj;
@@ -2840,6 +3033,11 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 						if (obj) {
 							if (obj->is_class_ptr(GDScriptFunctionState::get_class_ptr_static())) {
 								result = Signal(obj, SNAME("completed"));
+							} else if (GDTask *task = Object::cast_to<GDTask>(obj)) {
+								// A finished task answers at once; a pending one is awaited through its signal.
+								const bool pair = _code_ptr[ip + 2] == OPCODE_AWAIT_RESUME_PAIR;
+								finished_task = task->is_done() ? task : nullptr;
+								result = !finished_task ? Variant(task->signal(pair)) : (pair ? task->value() : task->packed());
 							}
 						}
 					}
@@ -2848,7 +3046,11 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 						// Not async, return immediately using the target from OPCODE_AWAIT_RESUME.
 						GET_VARIANT_PTR(target, 2);
 						*target = result;
-						ip += 4; // Skip OPCODE_AWAIT_RESUME and its data.
+						if (finished_task && _code_ptr[ip + 2] == OPCODE_AWAIT_RESUME_PAIR) {
+							GET_VARIANT_PTR(error, 3);
+							*error = finished_task->error();
+						}
+						ip += _code_ptr[ip + 2] == OPCODE_AWAIT_RESUME_PAIR ? 5 : 4; // Skip the resume instruction and its destinations.
 						is_signal = false;
 					} else {
 						sig = result;
@@ -2856,7 +3058,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				}
 
 				if (is_signal) {
-					Error err = suspend(ip + 2, sig);
+					Error err = suspend(ip + 2, sig, false, -1, false, -1, _code_ptr[ip + 2] == OPCODE_AWAIT_RESUME_PAIR);
 					if (err != OK) {
 						err_text = "Error connecting to signal: " + sig.get_name() + " during await.";
 						OPCODE_BREAK;
@@ -2877,6 +3079,18 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				GET_VARIANT_PTR(result, 0);
 				*result = p_state->result;
 				ip += 2;
+			}
+			DISPATCH_OPCODE;
+
+			OPCODE(OPCODE_AWAIT_RESUME_PAIR) {
+				CHECK_SPACE(3);
+				GET_VARIANT_PTR(value, 0);
+				GET_VARIANT_PTR(error, 1);
+				if (p_state) {
+					*value = p_state->result;
+					*error = p_state->result_error;
+				}
+				ip += 3;
 			}
 			DISPATCH_OPCODE;
 
@@ -3013,9 +3227,61 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				CHECK_SPACE(2);
 				GET_VARIANT_PTR(r, 0);
 				retvalue = *r;
-#ifdef DEBUG_ENABLED
 				exit_ok = true;
+				OPCODE_BREAK;
+			}
+
+			OPCODE(OPCODE_RETURN_PAIR) {
+				CHECK_SPACE(3);
+				GET_VARIANT_PTR(value, 0);
+				GET_VARIANT_PTR(error, 1);
+				retvalue = *value;
+				const Ref<Err> failure = *error;
+				// Reject an invalid failure slot before it can become an apparent success.
+				bool freed_error = false;
+				const bool empty_error = error->get_type() == Variant::NIL || (error->get_type() == Variant::OBJECT && error->get_validated_object_with_check(freed_error) == nullptr && !freed_error);
+				if (!empty_error && failure.is_null()) {
+				#ifdef DEBUG_ENABLED
+					err_text = vformat(R"(Trying to return a second value of type "%s" instead of "Err".)", _get_var_type(error));
 #endif
+					OPCODE_BREAK;
+				}
+				const auto payload = return_type;
+				if (payload.kind == GDScriptDataType::BUILTIN && retvalue.get_type() != payload.builtin_type) {
+					if (Variant::can_convert_strict(retvalue.get_type(), payload.builtin_type)) {
+						Callable::CallError ce;
+						const Variant *source = &retvalue;
+						Variant converted;
+						Variant::construct(payload.builtin_type, converted, &source, 1, ce);
+						retvalue = converted;
+					} else if (failure.is_valid()) {
+						retvalue = _get_default_variant_for_data_type(payload);
+					} else {
+#ifdef DEBUG_ENABLED
+						err_text = vformat(R"(Trying to return a value of type "%s" from a function whose return type is "%s".)", _get_var_type(&retvalue), Variant::get_type_name(payload.builtin_type));
+#endif
+						OPCODE_BREAK;
+					}
+				} else if (payload.has_type() && !payload.is_type(retvalue, false)) {
+					if (failure.is_valid()) {
+						retvalue = _get_default_variant_for_data_type(payload);
+					} else {
+#ifdef DEBUG_ENABLED
+						err_text = vformat(R"(Trying to return a value of type "%s" from a function whose return type is "%s".)", _get_var_type(&retvalue), payload.native_type.is_empty() ? Variant::get_type_name(payload.builtin_type) : String(payload.native_type));
+#endif
+						OPCODE_BREAK;
+					}
+				}
+				const Variant error_value = failure.is_valid() ? Variant(failure->is_shared() ? failure : failure->with_partial(retvalue)) : Variant();
+				if (r_err.result_error != nullptr) {
+					*r_err.result_error = error_value;
+				} else {
+#ifdef DEBUG_ENABLED
+					err_text = "A two-result function needs two receiving slots.";
+#endif
+					OPCODE_BREAK;
+				}
+				exit_ok = true;
 				OPCODE_BREAK;
 			}
 
@@ -3044,9 +3310,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				} else {
 					retvalue = *r;
 				}
-#ifdef DEBUG_ENABLED
 				exit_ok = true;
-#endif // DEBUG_ENABLED
 				OPCODE_BREAK;
 			}
 
@@ -3080,9 +3344,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				retvalue = *array;
 
-#ifdef DEBUG_ENABLED
 				exit_ok = true;
-#endif // DEBUG_ENABLED
 				OPCODE_BREAK;
 			}
 
@@ -3125,9 +3387,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				retvalue = *dictionary;
 
-#ifdef DEBUG_ENABLED
 				exit_ok = true;
-#endif // DEBUG_ENABLED
 				OPCODE_BREAK;
 			}
 
@@ -3167,9 +3427,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				}
 				retvalue = *r;
 
-#ifdef DEBUG_ENABLED
 				exit_ok = true;
-#endif // DEBUG_ENABLED
 				OPCODE_BREAK;
 			}
 
@@ -3232,9 +3490,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				}
 				retvalue = *r;
 
-#ifdef DEBUG_ENABLED
 				exit_ok = true;
-#endif // DEBUG_ENABLED
 				OPCODE_BREAK;
 			}
 
@@ -4163,9 +4419,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 			DISPATCH_OPCODE;
 
 			OPCODE(OPCODE_END) {
-#ifdef DEBUG_ENABLED
 				exit_ok = true;
-#endif
 				OPCODE_BREAK;
 			}
 
@@ -4179,41 +4433,50 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 		OPCODES_END
 #undef MAYBE_TIME_SLICE
-#ifdef DEBUG_ENABLED
+#undef ONLINE_READ_ONLY_MEMBER
 		if (exit_ok) {
 			OPCODE_OUT;
 		}
-		//error
-		// function, file, line, error, explanation
-		String err_file;
-		bool instance_valid_with_script = p_instance && ObjectDB::get_instance(p_instance->owner_id) != nullptr && p_instance->script->is_valid();
-		if (instance_valid_with_script && !get_script()->path.is_empty()) {
-			err_file = get_script()->path;
-		} else if (script) {
-			err_file = script->path;
+		if (!inherited_fault) ++fault_epoch;
+		if (result_pair && pair_fault_epoch == entered_pair_fault_epoch) ++pair_fault_epoch;
+		r_err.runtime_failed = true;
+		if (p_state) {
+			GDScriptFunctionState *owner = Object::cast_to<GDScriptFunctionState>(p_state->completed.get_object());
+			if (owner) owner->runtime_faulted = true;
 		}
-		if (err_file.is_empty()) {
-			err_file = "<built-in>";
-		}
-		String err_func = name;
-		if (instance_valid_with_script && p_instance->script->local_name != StringName()) {
-			err_func = p_instance->script->local_name.operator String() + "." + err_func;
-		}
-		int err_line = line;
-		if (err_text.is_empty()) {
-			err_text = "Internal script error! Opcode: " + itos(last_opcode) + " (please report).";
+#ifdef DEBUG_ENABLED
+		if (!inherited_fault) {
+			// Report the frame where the script fault began.
+			String err_file;
+			bool instance_valid_with_script = p_instance && ObjectDB::get_instance(p_instance->owner_id) != nullptr && p_instance->script->is_valid();
+			if (instance_valid_with_script && !get_script()->path.is_empty()) {
+				err_file = get_script()->path;
+			} else if (script) {
+				err_file = script->path;
+			}
+			if (err_file.is_empty()) {
+				err_file = "<built-in>";
+			}
+			String err_func = name;
+			if (instance_valid_with_script && p_instance->script->local_name != StringName()) {
+				err_func = p_instance->script->local_name.operator String() + "." + err_func;
+			}
+			int err_line = line;
+			if (err_text.is_empty()) {
+				err_text = "Internal script error! Opcode: " + itos(last_opcode) + " (please report).";
+			}
+
+			_err_print_error(err_func.utf8().get_data(), err_file.utf8().get_data(), err_line, err_text.utf8().get_data(), false, ERR_HANDLER_SCRIPT);
+			GDScriptLanguage::get_singleton()->debug_break(err_text, false);
+			// A forced result never lets its caller continue with a default value.
+			if (forced_failure && GDScriptFunction::on_forced_failure != nullptr) {
+				GDScriptFunction::on_forced_failure();
+			}
 		}
 
-		_err_print_error(err_func.utf8().get_data(), err_file.utf8().get_data(), err_line, err_text.utf8().get_data(), false, ERR_HANDLER_SCRIPT);
-		GDScriptLanguage::get_singleton()->debug_break(err_text, false);
-		// A forced result never lets its caller continue with a default value.
-		if (forced_failure && GDScriptFunction::on_forced_failure != nullptr) {
-			GDScriptFunction::on_forced_failure();
-		}
-
-		// Get a default return type in case of failure
-		retvalue = _get_default_variant_for_data_type(return_type);
 #endif
+		// Return a typed placeholder only to satisfy the native calling convention.
+		retvalue = _get_default_variant_for_data_type(return_type);
 
 		OPCODE_OUT;
 	}
@@ -4239,8 +4502,14 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 		// This ensures the call stack can be properly shown when using `await`, showing what resumed the function.
 
 		// Signal the next function-state to resume.
-		const Variant *args[1] = { &retvalue };
-		p_state->completed.emit(args, 1);
+		if (p_state->pair_return && r_err.result_error != nullptr) {
+			// Deliver both result slots to the frame waiting on this function.
+			const Variant *args[2] = { &retvalue, r_err.result_error };
+			p_state->completed.emit(args, 2);
+		} else {
+			const Variant *args[1] = { &retvalue };
+			p_state->completed.emit(args, 1);
+		}
 	}
 
 	GDScriptLanguage::get_singleton()->exit_function();

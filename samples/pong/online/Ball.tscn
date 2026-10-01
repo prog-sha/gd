@@ -1,0 +1,17 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://online/ball.gd" id="1"]
+
+[node name="Ball" type="Node2D"]
+position = Vector2(576, 354)
+z_index = 12
+script = ExtResource("1")
+motion = Vector2(430, 250)
+
+[node name="Glow" type="Polygon2D" parent="."]
+polygon = PackedVector2Array(-20, -8, -8, -20, 8, -20, 20, -8, 20, 8, 8, 20, -8, 20, -20, 8)
+color = Color(0.35, 0.95, 1, 0.3)
+
+[node name="Body" type="Polygon2D" parent="."]
+polygon = PackedVector2Array(-11, -5, -5, -11, 5, -11, 11, -5, 11, 5, 5, 11, -5, 11, -11, 5)
+color = Color(0.95, 1, 1, 1)

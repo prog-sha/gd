@@ -33,18 +33,29 @@ bool GDNative::interrupted(int p_error) {
 #endif
 }
 
-// Distinguish kernel waits, permission failures, and packet-size errors.
+// Classify kernel waits, permission failures, timeouts, and packet-size errors.
 Error GDNative::failure(int p_error) {
 #ifdef WINDOWS_ENABLED
 	if (p_error == WSAEWOULDBLOCK) return ERR_BUSY;
 	if (p_error == WSAEACCES) return ERR_UNAUTHORIZED;
 	if (p_error == WSAEMSGSIZE) return ERR_INVALID_PARAMETER;
+	if (p_error == WSAETIMEDOUT) return ERR_TIMEOUT;
 #else
 	if (p_error == EAGAIN || p_error == EWOULDBLOCK) return ERR_BUSY;
 	if (p_error == EACCES || p_error == EPERM) return ERR_UNAUTHORIZED;
 	if (p_error == EMSGSIZE) return ERR_INVALID_PARAMETER;
+	if (p_error == ETIMEDOUT) return ERR_TIMEOUT;
 #endif
 	return FAILED;
+}
+
+// Identify a refused connection without conflating it with unrelated socket failures.
+bool GDNative::refused(int p_error) {
+#ifdef WINDOWS_ENABLED
+	return p_error == WSAECONNREFUSED;
+#else
+	return p_error == ECONNREFUSED;
+#endif
 }
 
 // Make an acquired descriptor nonblocking and noninheritable while preserving its other flags.
@@ -115,7 +126,7 @@ void GDNative::watch(bool p_read, bool p_write, const Callable &p_call) {
 			info["op"] = "register";
 			info["syscall"] = IdleWait::operation();
 			const Error code = SourceError::put(info, FAILED);
-			poll_error = R::err(Err::make("cannot register socket readiness", Err::of(code), info));
+			poll_error = Err::make("cannot register socket readiness", Err::of(code), info);
 			const Callable notify = p_call; // Keep the destination before close clears the readiness callback.
 			close(); // Destroy the descriptor to remove any partially installed kernel registration.
 			Async::post(Ref<RefCounted>(this), notify); // Deliver failure after the caller has connected its await continuation.

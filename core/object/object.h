@@ -55,7 +55,7 @@
 // Attach the post-await type to a signal-returning method.
 #define ADD_AWAIT(m_method, m_await_class) ::ClassDB::set_await_class(get_class_static(), m_method, m_await_class)
 #define ADD_AUTO_WAIT(m_method) ::ClassDB::set_auto_wait(get_class_static(), m_method)
-#define ADD_RESULT(m_method, m_result_class) ::ClassDB::set_result_class(get_class_static(), m_method, m_result_class)
+#define ADD_PAIR_RESULT(m_method, m_result_class) ::ClassDB::set_pair_result(get_class_static(), m_method, m_result_class)
 
 #ifdef TOOLS_ENABLED
 #define ADD_CLASS_DEPENDENCY(m_class) ::ClassDB::add_class_dependency(get_class_static(), m_class)

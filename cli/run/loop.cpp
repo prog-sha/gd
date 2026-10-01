@@ -12,6 +12,8 @@
 #include "modules/gdscript/gdscript_function.h"
 #include "scene/main/scene_tree.h"
 
+#include <cstdio>
+
 // Allow shutdown requests through the current main loop.
 void GDLoop::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("quit", "exit_code"), &GDLoop::quit, DEFVAL(0));
@@ -54,6 +56,8 @@ bool GDLoop::iteration() {
 	const double next = Async::time_to_next_timer();
 	const double max_sec = double(UINT64_MAX) / 1000000.0;
 	const uint64_t usec = next < 0.0 || next >= max_sec ? UINT64_MAX : uint64_t(next * 1000000.0);
+	// Publish printed output before sleeping, so pipes and logs see it while the script waits.
+	std::fflush(stdout);
 	IdleWait::wait(usec);
 	polled = GDClock::usec();
 	return false;

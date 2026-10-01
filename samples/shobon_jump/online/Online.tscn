@@ -1,0 +1,11 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://online/online.gd" id="1"]
+[ext_resource type="PackedScene" path="res://online/Shobon.tscn" id="2"]
+
+[node name="Online" type="Online"]
+script = ExtResource("1")
+
+[node name="Vault" type="Secret" parent="."]
+player_scene = ExtResource("2")
+listen_host = "127.0.0.1"

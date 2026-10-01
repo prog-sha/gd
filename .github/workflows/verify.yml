@@ -9,6 +9,9 @@ on:
       sha256:
         description: Expected Windows archive fingerprint
         required: true
+      editor_sha256:
+        description: Expected Windows editor archive fingerprint
+        required: true
       source:
         description: Build source revision recorded in the archive
         required: true
@@ -36,6 +39,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
           ARCHIVE_HASH: ${{ inputs.sha256 }}
+          EDITOR_HASH: ${{ inputs.editor_sha256 }}
           SOURCE_SHA: ${{ inputs.source }}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -47,11 +51,21 @@ jobs:
           $build = Get-Content tmp/candidate/gd/BUILD.json -Raw | ConvertFrom-Json
           if ($build.sha -cne $env:SOURCE_SHA -or $build.platform -cne 'windows' -or $build.arch -cne 'x86_64') { throw 'Source, platform, or architecture mismatch' }
           if ((Get-FileHash tmp/candidate/gd/gd.exe -Algorithm SHA256).Hash.ToLowerInvariant() -cne $build.binary_sha256) { throw 'Executable fingerprint mismatch' }
-          uv run --no-project python -B tmp/candidate/gd/tests/release/run.py --gd tmp/candidate/gd/gd.exe
+          uv run --no-project python -B tmp/candidate/gd/tests/run.py --gd tmp/candidate/gd/gd.exe
           if ($LASTEXITCODE -ne 0) { throw 'Native acceptance failed' }
-          uv run --no-project python -B tests/release/sample.py --gd tmp/candidate/gd/gd.exe --sample samples/web
+          uv run --no-project python -B tests/sample.py --gd tmp/candidate/gd/gd.exe --sample samples/web
           if ($LASTEXITCODE -ne 0) { throw 'Web sample failed' }
-          @{ public = $env:GITHUB_SHA; tag = $env:RELEASE_TAG; source = $env:SOURCE_SHA; archive = $env:ARCHIVE_HASH; binary = $build.binary_sha256; arch = $build.arch } | ConvertTo-Json | Set-Content tmp/verification.json
+          gh release download $env:RELEASE_TAG --pattern gd-godot-windows-x86_64.zip --dir tmp/editor-candidate
+          if ($LASTEXITCODE -ne 0) { throw 'Editor download failed' }
+          $editorArchive = 'tmp/editor-candidate/gd-godot-windows-x86_64.zip'
+          if ((Get-FileHash $editorArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:EDITOR_HASH) { throw 'Editor archive fingerprint mismatch' }
+          Expand-Archive $editorArchive tmp/editor-candidate
+          $editorBuild = Get-Content tmp/editor-candidate/gd/BUILD.json -Raw | ConvertFrom-Json
+          if ($editorBuild.sha -cne $env:SOURCE_SHA -or $editorBuild.platform -cne 'windows' -or $editorBuild.arch -cne 'x86_64') { throw 'Editor identity mismatch' }
+          if ((Get-FileHash tmp/editor-candidate/gd/gd-godot.exe -Algorithm SHA256).Hash.ToLowerInvariant() -cne $editorBuild.binary_sha256) { throw 'Editor executable fingerprint mismatch' }
+          & .\tmp\editor-candidate\gd\gd-godot.exe --headless --version
+          if ($LASTEXITCODE -ne 0) { throw 'Editor startup failed' }
+          @{ public = $env:GITHUB_SHA; tag = $env:RELEASE_TAG; source = $env:SOURCE_SHA; archive = $env:ARCHIVE_HASH; binary = $build.binary_sha256; editor_archive = $env:EDITOR_HASH; editor_binary = $editorBuild.binary_sha256; arch = $build.arch } | ConvertTo-Json | Set-Content tmp/verification.json
       - name: Verify reviewed Windows installer
         if: inputs.installer_sha256 != ''
         shell: pwsh

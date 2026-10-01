@@ -41,17 +41,24 @@ public:
 class GDPriorityQueue : public RefCounted {
 	GDCLASS(GDPriorityQueue, RefCounted);
 
-	Ref<GDBinaryHeap> heap;
-	int seq = 0; // Sequence preserving insertion order.
+	// Keep priority and insertion order separate so close priorities stay ordered.
+	struct Slot {
+		Variant value; // Value returned to the caller.
+		double priority = 0; // Numeric ordering key.
+		uint64_t seq = 0; // Insertion order for equal priorities.
+	};
+	LocalVector<Slot> items; // Heap entries ordered by priority and sequence.
+	uint64_t seq = 0; // Next insertion order.
 
-	// Use insertion sequence to break equal-priority ties.
-	static double rank_slot(const Variant &p_slot);
+	// Compare priorities first and preserve insertion order for ties.
+	static bool before(const Slot &p_a, const Slot &p_b);
+	// Restore heap order after removing its first entry.
+	void sink();
 
 protected:
 	static void _bind_methods();
 
 public:
-	GDPriorityQueue();
 	void push(const Variant &p_value, double p_priority);
 	Variant pop(); // Return null when empty.
 	Variant peek() const;
@@ -99,15 +106,19 @@ public:
 	bool has(const Variant &p_key);
 	void erase(const Variant &p_key);
 	void clear();
+	// Return the number of entries currently retained in the cache.
 	int size() const { return box.size(); }
+	// Return the configured maximum number of retained entries.
 	int limit() const { return cap; }
+	// Return the accumulated count of successful cache lookups.
 	uint64_t hit_count() const { return hits; }
+	// Return the accumulated count of lookups whose key was absent.
 	uint64_t miss_count() const { return misses; }
 	double hit_rate() const; // Return the hit ratio from zero to one.
 };
 
 // Memoize results for repeated arguments.
-// Argument sequences form keys, so values must support text representation.
+// Argument sequences form keys with their native Variant values.
 class GDMemoizedCallable : public RefCounted {
 	GDCLASS(GDMemoizedCallable, RefCounted);
 

@@ -122,7 +122,9 @@ public:
 	virtual void write_store_named_global(const Address &p_dst, const StringName &p_global) = 0;
 	virtual void write_cast(const Address &p_target, const Address &p_source, const GDScriptDataType &p_type) = 0;
 	virtual void write_call(const Address &p_target, const Address &p_base, const StringName &p_function_name, const Vector<Address> &p_arguments) = 0;
+	virtual void write_call_pair(const Address &p_value, const Address &p_error, const Address &p_base, const StringName &p_function_name, const Vector<Address> &p_arguments, bool p_async = false) = 0;
 	virtual void write_super_call(const Address &p_target, const StringName &p_function_name, const Vector<Address> &p_arguments) = 0;
+	virtual void write_super_call_pair(const Address &p_value, const Address &p_error, const StringName &p_function_name, const Vector<Address> &p_arguments) = 0;
 	virtual void write_call_async(const Address &p_target, const Address &p_base, const StringName &p_function_name, const Vector<Address> &p_arguments) = 0;
 	virtual void write_call_utility(const Address &p_target, const StringName &p_function, const Vector<Address> &p_arguments) = 0;
 	virtual void write_call_gdscript_utility(const Address &p_target, const StringName &p_function, const Vector<Address> &p_arguments) = 0;
@@ -142,6 +144,7 @@ public:
 	virtual void write_construct_dictionary(const Address &p_target, const Vector<Address> &p_arguments) = 0;
 	virtual void write_construct_typed_dictionary(const Address &p_target, const GDScriptDataType &p_key_type, const GDScriptDataType &p_value_type, const Vector<Address> &p_arguments) = 0;
 	virtual void write_await(const Address &p_target, const Address &p_operand) = 0;
+	virtual void write_await_pair(const Address &p_value, const Address &p_error, const Address &p_operand) = 0;
 	virtual void write_if(const Address &p_condition) = 0;
 	virtual void write_else() = 0;
 	virtual void write_endif() = 0;
@@ -160,6 +163,7 @@ public:
 	virtual void write_breakpoint() = 0;
 	virtual void write_newline(int p_line) = 0;
 	virtual void write_return(const Address &p_return_value, bool p_use_conversion) = 0;
+	virtual void write_return_pair(const Address &p_value, const Address &p_error) = 0;
 	virtual void write_assert(const Address &p_test, const Address &p_message) = 0;
 	virtual void write_fail(const Address &p_message) = 0; // Raise an execution error for a failed ! expression.
 

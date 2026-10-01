@@ -1188,13 +1188,6 @@ bool ClassDB::is_auto_wait(const StringName &p_class, const StringName &p_method
 	return false;
 }
 
-void ClassDB::set_result_class(const StringName &p_class, const StringName &p_method, const StringName &p_result_class) {
-	Locker::Lock lock(Locker::STATE_WRITE);
-	ClassInfo *type = classes.getptr(p_class);
-	ERR_FAIL_NULL(type);
-	type->result_class_map[p_method] = p_result_class;
-}
-
 StringName ClassDB::get_result_class(const StringName &p_class, const StringName &p_method) {
 	Locker::Lock lock(Locker::STATE_READ);
 	ClassInfo *type = classes.getptr(p_class);
@@ -1206,6 +1199,28 @@ StringName ClassDB::get_result_class(const StringName &p_class, const StringName
 		type = type->inherits_ptr;
 	}
 	return StringName();
+}
+
+// Record a native method's first result type and its two-result calling convention.
+void ClassDB::set_pair_result(const StringName &p_class, const StringName &p_method, const StringName &p_result_class) {
+	Locker::Lock lock(Locker::STATE_WRITE);
+	ClassInfo *type = classes.getptr(p_class);
+	ERR_FAIL_NULL(type);
+	type->result_class_map[p_method] = p_result_class;
+	type->pair_result_methods.insert(p_method);
+}
+
+// Find the two-result calling convention across native inheritance.
+bool ClassDB::is_pair_result(const StringName &p_class, const StringName &p_method) {
+	Locker::Lock lock(Locker::STATE_READ);
+	ClassInfo *type = classes.getptr(p_class);
+	while (type) {
+		if (type->pair_result_methods.has(p_method)) {
+			return true;
+		}
+		type = type->inherits_ptr;
+	}
+	return false;
 }
 
 // Register a purpose group for organizing public method documentation.

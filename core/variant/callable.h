@@ -66,6 +66,8 @@ public:
 		Error error = Error::CALL_OK;
 		int argument = 0;
 		int expected = 0;
+		Variant *result_error = nullptr; // Receive the second value of a result function.
+		bool runtime_failed = false; // Report a script fault without treating it as a returned error.
 	};
 
 	template <typename... VarArgs>

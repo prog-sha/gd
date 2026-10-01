@@ -9,11 +9,10 @@
 #include "cli/api/box.h"
 #include "cli/sys/clock.h"
 
-#include "core/io/json.h"
-#include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
-#include "core/templates/pair.h"
 #include "core/templates/sort_array.h"
+
+#include <cmath>
 
 // ---------------- Binary heap ----------------
 
@@ -132,47 +131,87 @@ void GDBinaryHeap::_bind_methods() {
 
 // ---------------- Priority queue ----------------
 
-double GDPriorityQueue::rank_slot(const Variant &p_slot) {
-	const Dictionary d = p_slot;
-	return (double)d["p"] * 1000000.0 + (double)d["n"];
-}
-
-// Initialize priority-ordered retrieval.
-GDPriorityQueue::GDPriorityQueue() {
-	heap.instantiate();
-	heap->set_pick(callable_mp_static(&GDPriorityQueue::rank_slot));
+// Compare exact priority values before resolving equal-priority ties.
+bool GDPriorityQueue::before(const Slot &p_a, const Slot &p_b) {
+	// Place NaN after numeric priorities to keep the ordering transitive.
+	if (std::isnan(p_a.priority)) {
+		return std::isnan(p_b.priority) && p_a.seq < p_b.seq;
+	}
+	if (std::isnan(p_b.priority)) {
+		return true;
+	}
+	if (p_a.priority < p_b.priority) {
+		return true;
+	}
+	if (p_b.priority < p_a.priority) {
+		return false;
+	}
+	return p_a.seq < p_b.seq;
 }
 
 // Insert a value with its priority.
 void GDPriorityQueue::push(const Variant &p_value, double p_priority) {
-	seq++;
-	Dictionary slot;
-	slot["v"] = p_value;
-	slot["p"] = p_priority;
-	slot["n"] = seq;
-	heap->push(slot);
+	items.push_back({ p_value, p_priority, seq++ });
+	int at = items.size() - 1;
+	while (at > 0) {
+		const int parent = (at - 1) / 2;
+		if (!before(items[at], items[parent])) {
+			break;
+		}
+		SWAP(items[at], items[parent]);
+		at = parent;
+	}
+}
+
+// Move the first entry down until the next priority is at the root.
+void GDPriorityQueue::sink() {
+	int at = 0;
+	while (true) {
+		const int left = at * 2 + 1;
+		if (left >= (int)items.size()) {
+			return;
+		}
+		const int right = left + 1;
+		int first = left;
+		if (right < (int)items.size() && before(items[right], items[left])) {
+			first = right;
+		}
+		if (!before(items[first], items[at])) {
+			return;
+		}
+		SWAP(items[at], items[first]);
+		at = first;
+	}
 }
 
 // Remove and return the next value.
 Variant GDPriorityQueue::pop() {
-	const Variant slot = heap->pop();
-	return slot.get_type() == Variant::DICTIONARY ? Dictionary(slot)["v"] : Variant();
+	if (items.is_empty()) {
+		return Variant();
+	}
+	const Variant out = items[0].value;
+	const Slot last = items[items.size() - 1];
+	items.remove_at(items.size() - 1);
+	if (!items.is_empty()) {
+		items[0] = last;
+		sink();
+	}
+	return out;
 }
 
 // Return the next value without removing it.
 Variant GDPriorityQueue::peek() const {
-	const Variant slot = heap->peek();
-	return slot.get_type() == Variant::DICTIONARY ? Dictionary(slot)["v"] : Variant();
+	return items.is_empty() ? Variant() : items[0].value;
 }
 
 // Return the retained element count.
 int GDPriorityQueue::size() const {
-	return heap->size();
+	return items.size();
 }
 
 // Report whether the container is empty.
 bool GDPriorityQueue::is_empty() const {
-	return heap->is_empty();
+	return items.is_empty();
 }
 
 // Register public script methods and properties.
@@ -298,7 +337,7 @@ Variant GDLRUCache::fetch(const Variant &p_key, const Callable &p_make) {
 	Variant made;
 	Callable::CallError err;
 	p_make.callp(&arg, 1, made, err);
-	if (err.error != Callable::CallError::CALL_OK) {
+	if (err.error != Callable::CallError::CALL_OK || err.runtime_failed) {
 		ERR_PRINT(vformat("GDLRUCache.fetch: cannot call the maker (%s)",
 				Variant::get_callable_error_text(p_make, &arg, 1, err)));
 		return Variant(); // Do not cache failed invocation.
@@ -369,12 +408,13 @@ void GDMemoizedCallable::setup(const Callable &p_fn, int p_limit) {
 	box->setup(p_limit);
 }
 
-// Invoke the retained Callable with arguments.
+// Invoke the retained Callable with arguments and compare native Variant values.
 Variant GDMemoizedCallable::call_with(const Array &p_args) {
-	const String key = JSON::stringify(p_args);
-	if (box->has(key)) {
-		return box->take(key);
+	if (box->has(p_args)) {
+		return box->take(p_args);
 	}
+	// Snapshot only a miss so a caller cannot mutate the retained key.
+	const Array key = p_args.duplicate(true);
 	const Variant v = fn.callv(p_args);
 	box->put(key, v);
 	return v;
@@ -388,19 +428,40 @@ void GDMemoizedCallable::_bind_methods() {
 
 namespace {
 
-// Compare selected keys through Variant ordering, supporting numeric and textual values.
+// Keep the source position with each selected key for stable ordering.
+struct Ranked {
+	Variant key;
+	Variant item;
+	int order = 0; // Original input position for equal ranking keys.
+};
+
+// Compare selected keys and preserve input order when neither key ranks first.
 struct RankLess {
-	bool operator()(const Pair<Variant, Variant> &p_a, const Pair<Variant, Variant> &p_b) const {
+	bool operator()(const Ranked &p_a, const Ranked &p_b) const {
+		const bool a_nan = p_a.key.get_type() == Variant::FLOAT && std::isnan((double)p_a.key);
+		const bool b_nan = p_b.key.get_type() == Variant::FLOAT && std::isnan((double)p_b.key);
+		if (a_nan != b_nan) {
+			return !a_nan;
+		}
+		if (a_nan) {
+			return p_a.order < p_b.order;
+		}
 		bool valid = false;
 		Variant out;
-		Variant::evaluate(Variant::OP_LESS, p_a.first, p_b.first, out, valid);
-		if (valid) {
-			return (bool)out;
+		Variant::evaluate(Variant::OP_LESS, p_a.key, p_b.key, out, valid);
+		if (valid && (bool)out) {
+			return true;
+		}
+		const bool forward_valid = valid;
+		Variant::evaluate(Variant::OP_LESS, p_b.key, p_a.key, out, valid);
+		if (valid && (bool)out) {
+			return false;
 		}
 		// Order incomparable values, such as mixed types or missing keys, by type ID.
-		// Always returning false would fail to establish consistent ordering.
-		// That could disturb even comparable elements during larger sorts.
-		return p_a.first.get_type() < p_b.first.get_type();
+		if ((!forward_valid || !valid) && p_a.key.get_type() != p_b.key.get_type()) {
+			return p_a.key.get_type() < p_b.key.get_type();
+		}
+		return p_a.order < p_b.order;
 	}
 };
 
@@ -562,24 +623,25 @@ Variant Coll::min_by(const Array &p_items, const Callable &p_pick) {
 Array Coll::sort_key(const Array &p_items, const String &p_key) {
 	// Read ranking fields directly from dictionaries instead of invoking scripts.
 	const int n = p_items.size();
-	LocalVector<Pair<Variant, Variant>> pairs;
+	LocalVector<Ranked> pairs;
 	pairs.resize(n);
 	for (int i = 0; i < n; i++) {
 		const Variant &item = p_items[i];
 		if (item.get_type() == Variant::DICTIONARY) {
-			pairs[i].first = Dictionary(item).get(p_key, Variant());
+			pairs[i].key = Dictionary(item).get(p_key, Variant());
 		} else {
 			bool ok = false;
-			pairs[i].first = item.get_named(p_key, ok);
+			pairs[i].key = item.get_named(p_key, ok);
 		}
-		pairs[i].second = item;
+		pairs[i].item = item;
+		pairs[i].order = i;
 	}
-	SortArray<Pair<Variant, Variant>, RankLess> sorter;
+	SortArray<Ranked, RankLess> sorter;
 	sorter.sort(pairs.ptr(), n);
 	Array out;
 	out.resize(n);
 	for (int i = 0; i < n; i++) {
-		out[i] = pairs[i].second;
+		out[i] = pairs[i].item;
 	}
 	return out;
 }
@@ -590,18 +652,19 @@ Array Coll::sort_by(const Array &p_items, const Callable &p_pick) {
 	// Calling the selector on every comparison would multiply script invocations.
 	// Store key-value pairs directly instead of allocating a separate array for each pair.
 	const int n = p_items.size();
-	LocalVector<Pair<Variant, Variant>> pairs;
+	LocalVector<Ranked> pairs;
 	pairs.resize(n);
 	for (int i = 0; i < n; i++) {
-		pairs[i].first = p_pick.call(p_items[i]); // Retain key types so textual ordering remains available.
-		pairs[i].second = p_items[i];
+		pairs[i].key = p_pick.call(p_items[i]); // Retain key types so textual ordering remains available.
+		pairs[i].item = p_items[i];
+		pairs[i].order = i;
 	}
-	SortArray<Pair<Variant, Variant>, RankLess> sorter;
+	SortArray<Ranked, RankLess> sorter;
 	sorter.sort(pairs.ptr(), n);
 	Array out;
 	out.resize(n);
 	for (int i = 0; i < n; i++) {
-		out[i] = pairs[i].second;
+		out[i] = pairs[i].item;
 	}
 	return out;
 }

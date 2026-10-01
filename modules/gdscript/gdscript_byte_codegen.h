@@ -514,7 +514,9 @@ public:
 	virtual void write_store_named_global(const Address &p_dst, const StringName &p_global) override;
 	virtual void write_cast(const Address &p_target, const Address &p_source, const GDScriptDataType &p_type) override;
 	virtual void write_call(const Address &p_target, const Address &p_base, const StringName &p_function_name, const Vector<Address> &p_arguments) override;
+	virtual void write_call_pair(const Address &p_value, const Address &p_error, const Address &p_base, const StringName &p_function_name, const Vector<Address> &p_arguments, bool p_async = false) override;
 	virtual void write_super_call(const Address &p_target, const StringName &p_function_name, const Vector<Address> &p_arguments) override;
+	virtual void write_super_call_pair(const Address &p_value, const Address &p_error, const StringName &p_function_name, const Vector<Address> &p_arguments) override;
 	virtual void write_call_async(const Address &p_target, const Address &p_base, const StringName &p_function_name, const Vector<Address> &p_arguments) override;
 	virtual void write_call_utility(const Address &p_target, const StringName &p_function, const Vector<Address> &p_arguments) override;
 	void write_call_builtin_type(const Address &p_target, const Address &p_base, Variant::Type p_type, const StringName &p_method, bool p_is_static, const Vector<Address> &p_arguments);
@@ -535,6 +537,7 @@ public:
 	virtual void write_construct_dictionary(const Address &p_target, const Vector<Address> &p_arguments) override;
 	virtual void write_construct_typed_dictionary(const Address &p_target, const GDScriptDataType &p_key_type, const GDScriptDataType &p_value_type, const Vector<Address> &p_arguments) override;
 	virtual void write_await(const Address &p_target, const Address &p_operand) override;
+	virtual void write_await_pair(const Address &p_value, const Address &p_error, const Address &p_operand) override;
 	virtual void write_if(const Address &p_condition) override;
 	virtual void write_else() override;
 	virtual void write_endif() override;
@@ -553,6 +556,7 @@ public:
 	virtual void write_breakpoint() override;
 	virtual void write_newline(int p_line) override;
 	virtual void write_return(const Address &p_return_value, bool p_use_conversion) override;
+	virtual void write_return_pair(const Address &p_value, const Address &p_error) override;
 	virtual void write_assert(const Address &p_test, const Address &p_message) override;
 	virtual void write_fail(const Address &p_message) override;
 

@@ -13,16 +13,16 @@
 #endif
 
 // Resolve on a worker and return all address candidates in OS order.
-Ref<R> GDLookup::all(const String &p_host) {
-	if (p_host.is_empty()) return R::err("host must not be empty", Err::INVALID_DATA);
+VariantPair GDLookup::all(const String &p_host) {
+	if (p_host.is_empty()) return { Variant(), Err::make("host must not be empty", Err::INVALID_DATA) };
 	for (int i = 0; i < p_host.length(); i++) {
-		if (p_host[i] == 0) return R::err("host contains NUL", Err::INVALID_DATA);
+		if (p_host[i] == 0) return { Variant(), Err::make("host contains NUL", Err::INVALID_DATA) };
 	}
 	sockaddr_storage literal;
 	if (p_host != "*" && GDAddress::parse(p_host, 0, literal)) {
 		PackedStringArray addresses;
 		addresses.push_back(GDAddress::text(reinterpret_cast<sockaddr *>(&literal)));
-		return R::ok(addresses);
+		return { addresses, Variant() };
 	}
 #ifdef WINDOWS_ENABLED
 	ADDRINFOW hints = {};
@@ -50,8 +50,8 @@ Ref<R> GDLookup::all(const String &p_host) {
 		info["host"] = p_host;
 		info["resolver_error"] = error;
 		info["temporary"] = error == EAI_AGAIN;
-		return R::err(Err::make(vformat("cannot resolve %s (resolver error %d)", p_host, error),
-				error == EAI_NONAME ? Err::NOT_FOUND : Err::NONE, info));
+		return { Variant(), Err::make(vformat("cannot resolve %s (resolver error %d)", p_host, error),
+				error == EAI_NONAME ? Err::NOT_FOUND : Err::NONE, info) };
 	}
 	PackedStringArray addresses;
 	HashSet<String> seen; // Deduplicate resolver results in time proportional to the number of candidates.
@@ -68,5 +68,5 @@ Ref<R> GDLookup::all(const String &p_host) {
 #else
 	if (found) ::freeaddrinfo(found);
 #endif
-	return addresses.is_empty() ? R::err(vformat("no address for %s", p_host), Err::NOT_FOUND) : R::ok(addresses);
+	return addresses.is_empty() ? VariantPair{ Variant(), Err::make(vformat("no address for %s", p_host), Err::NOT_FOUND) } : VariantPair{ addresses, Variant() };
 }

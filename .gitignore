@@ -11,12 +11,15 @@ __pycache__/
 *.pyc
 
 # ビルドが作る生成物。追跡しない
+# view=yes tests=yes が展開するモジュールテストと試験データ
+modules/*/tests
+tests/data
 *.gen.h
 *.gen.cpp
 .DS_Store
 node_modules/
 package-lock.json
-!tests/bench/web/package-lock.json
+!dev_tests/bench/web/package-lock.json
 .scons_node_count
 
 .env

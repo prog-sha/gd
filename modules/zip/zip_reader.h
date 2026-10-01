@@ -40,6 +40,7 @@ class ZIPReader : public RefCounted {
 
 	Ref<FileAccess> fa;
 	unzFile uzf = nullptr;
+	Error last_error = OK; // Distinguish an empty member from failed enumeration or decoding.
 
 protected:
 	static void _bind_methods();
@@ -48,6 +49,8 @@ public:
 	Error open(const String &p_path);
 	Error close();
 
+	// Report the last enumeration or member-read result without conflating empty data with failure.
+	Error get_last_error() const { return last_error; }
 	PackedStringArray get_files();
 	PackedByteArray read_file(const String &p_path, bool p_case_sensitive);
 	bool file_exists(const String &p_path, bool p_case_sensitive);

@@ -7,10 +7,41 @@ env.main_sources = []
 
 env_main = env.Clone()
 
-env_main.add_source_files(env.main_sources, "*.cpp")
+if env["view"]:
+    skip = ("main.cpp", "main_timer_sync.cpp", "performance.cpp")
+    sources = [item for item in env_main.Glob("*.cpp") if item.name not in skip]
+    sources.append(env_main.File("#tmp/view-src/main/main.cpp"))
+    sources.append(env_main.File("#tmp/view-src/main/main_timer_sync.cpp"))
+    sources.append(env_main.File("#tmp/view-src/main/performance.cpp"))
+    env_main.add_source_files(env.main_sources, sources)
+else:
+    env_main.add_source_files(env.main_sources, "*.cpp")
+
+if env["tests"]:
+    env_main.Append(CPPDEFINES=["TESTS_ENABLED"])  # Call the recorded unit-test entry from display startup.
 
 if env["steamapi"] and env.editor_build:
     env_main.Append(CPPDEFINES=["STEAMAPI_ENABLED"])
+
+if env["view"]:
+    import main_builders
+
+    env_main.CommandNoCache(
+        "#main/splash.gen.h",
+        "#main/splash.png",
+        env.Run(main_builders.make_splash),
+    )
+    env_main.CommandNoCache(
+        "#main/app_icon.gen.h",
+        "#main/app_icon.png",
+        env.Run(main_builders.make_app_icon),
+    )
+    if env.editor_build and not env.get("no_editor_splash", False):
+        env_main.CommandNoCache(
+            "#main/splash_editor.gen.h",
+            "#main/splash_editor.png",
+            env.Run(main_builders.make_splash_editor),
+        )
 
 lib = env_main.add_library("main", env.main_sources)
 env.Prepend(LIBS=[lib])

@@ -102,9 +102,9 @@ def redirect_emitter(target, source, env):
         if path.parent == base_folder / "bin":
             pass
         elif base_folder in path.parents:
-            item = env.File(f"#bin/obj/{path.relative_to(base_folder)}")
+            item = env.File(f"#bin/{env.get('obj_folder', 'obj')}/{path.relative_to(base_folder)}")
         elif (alt_base := Path(env.Dir(".").get_abspath()).resolve().parent) in path.parents:
-            item = env.File(f"#bin/obj/external/{path.relative_to(alt_base)}")
+            item = env.File(f"#bin/{env.get('obj_folder', 'obj')}/external/{path.relative_to(alt_base)}")
         else:
             print_warning(f'Failed to redirect "{path}"')
         redirected_targets.append(item)
@@ -154,6 +154,7 @@ def get_version_info(module_version_string="", silent=False):
         "website": str(version.website),
         "docs_branch": str(version.docs),
         "cli_version": str(version.cli),
+        "cli_status": str(version.cli_status),
     }
 
     # For dev snapshots (alpha, beta, RC, etc.) we do not commit status change to Git,

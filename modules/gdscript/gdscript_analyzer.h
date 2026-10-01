@@ -55,8 +55,8 @@ class GDScriptAnalyzer {
 	List<GDScriptParser::LambdaNode *> pending_body_resolution_lambdas;
 	HashMap<const GDScriptParser::ClassNode *, Ref<GDScriptParserRef>> external_class_parser_cache;
 	bool static_context = false;
-	bool result_pair_context = false; // Whether a call must expose enough type information for R unpacking.
-	bool result_inference_context = false; // Whether := is searching for a forwarded R.
+	bool result_pair_context = false; // Whether a call must expose its paired result types.
+	bool result_inference_context = false; // Whether inferred assignment needs a call's declared type.
 	StringName result_value_name; // Variable receiving a checked success value, so its message names it.
 	bool in_default_argument = false; // Whether a parameter default is being resolved, where ? has no function to return from.
 
@@ -120,6 +120,7 @@ class GDScriptAnalyzer {
 	void reduce_cast(GDScriptParser::CastNode *p_cast);
 	void reduce_dictionary(GDScriptParser::DictionaryNode *p_dictionary);
 	void reduce_get_node(GDScriptParser::GetNodeNode *p_get_node);
+	void _online_my(GDScriptParser::IdentifierNode *p_identifier);
 	void reduce_identifier(GDScriptParser::IdentifierNode *p_identifier, bool can_be_builtin = false);
 	void reduce_identifier_from_base(GDScriptParser::IdentifierNode *p_identifier, GDScriptParser::DataType *p_base = nullptr);
 	void reduce_lambda(GDScriptParser::LambdaNode *p_lambda);
@@ -182,6 +183,7 @@ class GDScriptAnalyzer {
 #endif // DEBUG_ENABLED
 
 public:
+	static bool is_task_type(const GDScriptParser::DataType &p_type); // Whether a value is a GDTask following a started operation.
 	Error resolve_inheritance();
 	Error resolve_interface();
 	Error resolve_body();

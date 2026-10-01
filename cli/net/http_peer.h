@@ -68,6 +68,7 @@ public:
 	void read_wait(bool p_on); // Pause this request's delivery without blocking other streams.
 	int available() const; // Detect unread response bytes without treating multiplexed control frames as dirty HTTP/1 input.
 	Status get_status() const { return status; } // Return the HTTP state.
+	bool tls_handshaking() const { return secure && link.is_valid() && link->wire.is_wrapped() && status == STATUS_CONNECTING; } // Identify the TLS phase after TCP connects.
 	bool has_response() const { return ready; } // Report whether final headers are complete.
 	int get_response_code() const { return code; } // Return the response status code.
 	int64_t get_response_body_length() const { return length; } // Return the declared body length.

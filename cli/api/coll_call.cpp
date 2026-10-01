@@ -18,6 +18,7 @@
 #include "core/object/class_db.h"
 #include "core/config/engine.h"
 #include "core/os/os.h"
+#include "cli/sys/task.h"
 
 List<Ref<GDCollectionCall>> GDCollectionCall::queue;
 GDCollectionCall *GDCollectionCall::runner = nullptr;
@@ -225,7 +226,7 @@ void GDCollectionCall::done(const Variant &p_value) {
 	fn = Callable();
 	items.clear();
 	src.clear();
-	emit_signal("finished", p_value);
+	Async::finish(this, SNAME("finished"), p_value);
 	self_hold.unref();
 }
 

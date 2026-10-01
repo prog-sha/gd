@@ -1,7 +1,6 @@
 # gd Manual
 
-The [online manual and API reference](https://gd.progsha.com/) uses your browser’s preferred English or Japanese language, with English as the fallback.
-Use the language button or `?lang=ja` for Japanese; an explicit selection is remembered locally.
+English | [日本語](manual.md)
 
 ## What gd is for
 
@@ -13,16 +12,14 @@ a Web server, and a standalone executable are available in the same GDScript. Fo
 
 Together with Godot itself, apps, frontends, servers, and CLI tools can all be written in one language, GDScript.
 The same script runs on macOS, Linux, and Windows, and waits on networking and databases do not stop other work.
-It links directly with C++ through GDExtension. It is designed for AI agents to write and run code.
+It links directly with C++ through GDExtension.
 
-Built-in HTTP/2 multiplexing and nonblocking networking keep concurrent connections moving. SIMD/SWAR paths accelerate UTF-8, JSON, and hex processing, while connection, buffer, and parsed-template reuse reduce repeated work and allocations.
+Speed matters too. gd supports HTTP/2, other work proceeds while a connection waits, and text and JSON processing is fast.
 
 ## Install
 
-Supported platforms are macOS arm64/x86_64, Linux arm64/x86_64, and Windows x86_64.
-Download the archive for your OS from [Releases](https://github.com/prog-sha/gd/releases/latest)
-and put the `gd` inside on your PATH. When `gd --version` prints a version, the install is done.
-The SHA-256 of each archive can be checked against the bundled `SHA256SUMS`. The macOS build is signed with a Developer ID and notarized by Apple.
+Prebuilt downloads are available for macOS arm64/x86_64, Linux x86_64, and Windows x86_64. Linux arm64 can be built from source.
+You can also download an archive from [Releases](https://github.com/prog-sha/gd/releases/latest) and put `gd` on your PATH.
 
 ### macOS / Linux
 
@@ -30,7 +27,7 @@ The SHA-256 of each archive can be checked against the bundled `SHA256SUMS`. The
 curl -fsSL https://gd.progsha.com/install.sh | sh
 ```
 
-The installer checks the archive checksum and installs to `~/.local/bin`. Add that directory to your PATH if prompted. Linux binaries require arm64 or x86_64 and glibc 2.38 or newer.
+Installs to `~/.local/bin`. If the directory is missing from PATH, a `y/N` prompt offers to save it in your shell settings. Choose `y`, then open a new terminal to use it. Linux downloads require x86_64 and glibc 2.38 or newer.
 
 ### Windows (PowerShell)
 
@@ -39,9 +36,7 @@ Invoke-WebRequest -UseBasicParsing https://gd.progsha.com/install.ps1 -OutFile i
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install-gd.ps1
 ```
 
-Run these commands in PowerShell. Administrator access is not required. The installer verifies the SHA-256 checksum, installs `gd.exe` into `%LOCALAPPDATA%\gd\bin`, and adds that directory to your user PATH. Open a new terminal and run `gd --version`.
-
-For a manual install, download `gd-windows-x86_64.zip` from Releases, extract it, and add the directory containing `gd.exe` to your user PATH. Do not run the Unix `curl | sh` command in PowerShell.
+If the installation directory is missing from PATH, a `y/N` prompt offers to add it to your user PATH.
 
 ### Homebrew (macOS)
 
@@ -50,39 +45,40 @@ brew tap prog-sha/gd https://github.com/prog-sha/gd
 brew install prog-sha/gd/gd
 ```
 
-This tap lives in the product repository and installs the signed Universal binary. Update with `brew update && brew upgrade prog-sha/gd/gd`; remove with `brew uninstall gd`.
+### apt (Linux amd64)
 
-### apt (Linux amd64 / arm64)
-
-Use an apt-based distribution with glibc 2.38 or newer, such as Ubuntu 24.04 or Debian 13. Ubuntu 22.04 and Debian 12 need a source build. The dedicated repository uses a signing key restricted to this source:
+Use an apt-based distribution with glibc 2.38 or newer, such as Ubuntu 24.04 or Debian 13.
 
 ```sh
 sudo install -d -m 0755 /etc/apt/keyrings
 curl -fsSL https://gd.progsha.com/apt/gd.asc | sudo tee /etc/apt/keyrings/gd.asc >/dev/null
 sudo chmod 0644 /etc/apt/keyrings/gd.asc
-echo 'deb [arch=amd64,arm64 signed-by=/etc/apt/keyrings/gd.asc] https://gd.progsha.com/apt stable main' | sudo tee /etc/apt/sources.list.d/gd.list
+echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/gd.asc] https://gd.progsha.com/apt stable main' | sudo tee /etc/apt/sources.list.d/gd.list
 sudo apt update
 sudo apt install gd
 ```
 
-Subsequent versions arrive through normal apt updates. Remove with `sudo apt remove gd`. Repository metadata and packages use HTTPS; apt also verifies the signed metadata.
+### Upgrading
 
-### winget (Windows)
+```sh
+gd upgrade            # Move to the latest release.
+gd upgrade 0.8.0      # Move to a chosen version.
+gd upgrade --dry-run  # Show the version without installing it.
+```
 
-The official winget catalog entry is pending submission and review. Until it is accepted, use the PowerShell installer above. Maintainers can validate or submit the [prepared manifests](https://github.com/prog-sha/gd/tree/0.7/packaging/winget); `winget install prog-sha.gd` is not yet an available installation route.
+The download is checked against the release's SHA-256 before the running `gd` is replaced. A `gd` installed through Homebrew or apt is upgraded with `brew upgrade gd` or `apt upgrade gd` instead.
 
 ### Build from source
 
-Building from source needs Python, uv, SCons, and a C/C++ compiler. The executable is `gd.*.template_release.*` under `bin/`.
-TLS is built in, so no separate TLS library is needed.
+Install Python, uv, SCons, and a C/C++ compiler. Executables are written to `bin/`.
 
 ```sh
-git clone --branch 0.7 https://github.com/prog-sha/gd.git
+git clone --branch master https://github.com/prog-sha/gd.git
 cd gd
 scons platform=macos target=template_release -j8
 # Linux ARM64: platform=linuxbsd arch=arm64
 # Linux x86-64: platform=linuxbsd arch=x86_64
-# Windows: platform=windows windows_subsystem=console
+# Windows: platform=windows arch=x86_64 use_mingw=yes windows_subsystem=console
 ```
 
 ## Quick start
@@ -128,7 +124,9 @@ func main():
 
 This prints `Hello, world!`. Use this pattern when values need to be shared.
 
-Access values as `settings.TITLE` instead of copying a `const` declaration for each value into the caller. Keep values and functions used by only one script in that script. Use `as` when a name conflicts or needs clarification. Built-in APIs such as `GD.web` need no import.
+- Keep values and functions used by only one script in that script.
+- Use `as` only when a name conflicts.
+- Built-in APIs such as `GD.web` need no import.
 
 See [Packages and distribution](#en-packages-and-distribution) for installation and version locking.
 
@@ -141,10 +139,15 @@ The standard API has one entry point, `GD`, with a child per purpose. Scripts wr
 | Files, text, time, HTTP client, async | `GD` | `GD.file.read_text("a.txt")` |
 | Websites and Web APIs | `GD.web` | `GD.web.app()` |
 | SQLite or PostgreSQL | `GD.database` | `GD.database.client()` |
+| Redis | `GD.database.redis` | `GD.database.redis.client()` |
+| TCP, UDP, TLS | `GD.net` | `GD.net.listen_tcp("127.0.0.1", 8080)` |
+| Mail parsing and SMTP submission | `GD.mail` | `GD.mail.parse_address("me@example.com")` |
 
 `GD.database.postgres` and `GD.database.redis` are advanced entries for features specific to one backend.
 
 ## Looking up the API
+
+`gd --help` lists the commands, and `gd install --help` describes one command's arguments and options.
 
 Pass the same spelling you write in a script to `gd doc`. Signatures come from the executable, so they match the implementation.
 
@@ -159,14 +162,14 @@ gd doc SceneTree           # Inspect a public engine class.
 gd doc all                 # every public class
 ```
 
-Return types such as `R`, `Err`, and `GDWebRequest` are looked up by name alone. For Godot classes such as Node, SceneTree, and Timer,
+Return types such as `Err` and `GDWebRequest` are looked up by name alone. For Godot classes such as Node, SceneTree, and Timer,
 see the [Godot class reference](https://docs.godotengine.org/en/stable/classes/) as well.
 The manual is shown in Japanese when `LC_ALL` or `LANG` starts with `ja`, and in English otherwise.
 The web version at [gd.progsha.com](https://gd.progsha.com/) switches between Japanese and English.
 
 ## GDScript basics
 
-The examples avoid repeating type names. Variables assigned with `:=` and success values returned as `return value, failure` infer their types.
+The examples avoid repeating type names. Variables assigned with `:=` infer their types from the right-hand side.
 Parameters without annotations remain dynamic. Add annotations only where you want to fix a type boundary.
 
 ### Arguments and flags
@@ -192,8 +195,8 @@ To interpret them as flags, use `GD.cli.flags()`. It accepts `--name gd`, `--nam
 func main(argv):
 	var flags := GD.cli.flags()
 	flags.flag_str("name", "world", "who to greet")
-	var parsed := flags.parse(argv)
-	if not parsed.ok:
+	var _parsed, parse_err := flags.parse(argv)
+	if parse_err:
 		print(flags.usage())
 		return 1
 	print("Hello, " + flags.get_str("name"))
@@ -207,14 +210,14 @@ Under `--strict` it needs `--allow-run`. You can narrow the target, as in `--all
 
 ```gdscript
 func main():
-	var got := GD.cli.run("git", ["rev-parse", "HEAD"])
-	if not got.ok:
+	var got, err := await GD.cli.run("git", ["rev-parse", "HEAD"])
+	if err:
 		return 1
-	print("code=", got.v["code"], " out=", got.v["output"])
+	print("code=", got["code"], " out=", got["output"])
 	return 0
 ```
 
-A nonzero child exit returns Err. Inspect `value.code` or `e.info.code` for its status and `value.output` for captured output. Timeout and cancellation retain captured output too.
+A nonzero child exit returns an `Err`. Read the exit code from `value.code` and the output from `value.output`. A timeout or cancellation keeps the output captured so far.
 
 The third argument, `opts`, changes the behavior.
 
@@ -223,21 +226,11 @@ The third argument, `opts`, changes the behavior.
 | `timeout` | `0` | Seconds before giving up. 0 is unlimited. Past it, the child is shut down and `Err.TIMED_OUT` is returned |
 | `output` | `true` | Collect the output. With `false`, the child uses the parent's standard I/O directly and nothing is collected |
 
-### Commands during development
-
-```sh
-gd check main.gd        # check types and syntax without running
-gd fmt main.gd          # normalize formatting
-gd test                 # collect and run *_test.gd
-gd --watch main.gd      # run again on every save
-gd eval 'print(1 + 1)'  # try one line
-gd repl                 # try interactively
-```
-
 ## Values and failures
 
-A function that can fail returns two values, the success value and the failure, instead of throwing.
-The caller receives both with `var value, e :=`, and a non-`null` `e` means failure.
+A function that can fail returns two values: a value and an `Err`.
+Receive both with `var value, e :=`. Their types come from the function declaration; a non-`null` `e` means failure.
+Assign them to existing variables with `value, e = call()`. Variables declared without types remain `Variant`; declare `var value: T` and `var e: Err` when you want static checks.
 
 ```gdscript
 func main():
@@ -251,13 +244,13 @@ func main():
 
 ### Shorter failure handling
 
-Instead of writing `if e` every time, append `?` to the call. The failure is returned to the caller as is, and only the success value remains.
-A function that uses `?` also returns a success value and a failure itself, with `return value, failure`.
+Append `?` to a call to return its value and `Err` to the caller on failure. On success, use the value alone.
+A function using `?` returns a value and `Err`. Without a return annotation, its first result is inferred from its `return` values; you can specify it as `-> String, Err`. On success, `return value` omits the `null` second result.
 
 ```gdscript
-func title(path):
+func title(path) -> String, Err:
 	var text := GD.file.read_text(path)?
-	return text.strip_edges(), null
+	return text.strip_edges()
 
 func main():
 	var text, e := title("note.txt")
@@ -268,70 +261,41 @@ func main():
 	return 0
 ```
 
-| Form | Meaning |
-|---|---|
-| `var value, e := call()` | Receive the success value and the failure separately |
-| `return value, null` / `return null, failure` | Return success or failure. The success type is inferred from `value` |
-| `call()?` | On failure, return it to the caller as is |
-| `call()!` | On failure, print the reason and stop the program there with exit code 1. For prototypes and tests. Under `gd serve`, only that handler fails |
-| `e.note("purpose")` | Add working context to a failure. It prints as "purpose: original reason" |
-| `e.kind` | The kind, such as `Err.NOT_FOUND` or `Err.INVALID_DATA`. Use it to branch |
-| `Err.err("reason", Err.NOT_FOUND)` | Create a failure yourself |
+### Return your own error
 
-In `main()`, which does not pass failures up, receive them with `var value, e :=` or `!`.
-
-File-operation failures put `op`, `path`, `source`, and `source_code` in `e.info`.
-A rename has `old` and `new` instead of `path`. `source` is one of `posix`, `win32`, and `engine`.
-A `kind` is set only when its meaning, such as NotFound, is known; an unknown I/O failure keeps its source details with `Err.NONE`.
-
-Some APIs retain processed values on failure. Receive both with `var value, e := call()` when decoding, parsing queries, running child processes, or executing Redis batches. Causes remain accessible through `e.cause`; use `e.is(kind)` to inspect their categories.
-
-The MessagePack, CBOR, TAR, TOML, YAML, XML, dotenv, front-matter encoding, and PBKDF2 APIs in `GD.data` return a value and Err in both synchronous and async forms. Unrepresentable entries are not silently omitted.
-
-`base64_decode(text)` and `base32_decode(text)` require standard padding; pass `true` as the second argument for raw input. Base32 uses uppercase letters. `base64url_decode(text)` uses raw input by default; pass `false` for padded input. Both synchronous and async decoders retain partial bytes on failure.
-
-`GD.http.decode_query(raw)` returns Arrays of all values per key and the first Err. `req.query` provides the first value; `req.query_all` retains every value. Keys and values containing NUL or invalid UTF-8 remain `PackedByteArray`, preserving their exact bytes. `encode_query()` repeats Array values and accepts byte arrays. `parse_url()` preserves the original spelling in `raw_query`. After editing `query`, call `url.erase("raw_query")` before rebuilding the URL to use the edited dictionary.
-
-### Return value rules
-
-Code works without written types. When you do write types, these are the detailed rules.
-
-- A result signature has two types, such as `-> int, Err`: one success type and `Err`. The runtime type is `R`; `-> R` or no return annotation is also allowed.
-- A comma return always has two values. The last must have type `Err` or be `null` for success. A string cannot be returned there directly; wrap it with `Err.err(reason)`.
-- Fix a failure variable's type with `var e: Err = ...` or `var e := Err.err(...)`. A variable declared with `var e = ...` can change type and cannot occupy the last slot.
-- To return several items, put them in one array or dictionary, as in `return [1, 0.0, ""], null`. `return null, null` returns null as the success value.
-- Unpack an `R` with exactly two names: `var value, e := call()`. A declaration that lists expressions, such as `var a, b, c := 1, "a", 0.0`, is a different thing: it has no count limit and infers each name from its expression. It may also assign variables visible in the function, including those of enclosing blocks, when it introduces at least one new name, and every right-hand expression is evaluated before any assignment. Constants, parameters, and variables a lambda captured cannot be assigned.
-- Using `?` in a function whose annotated return type lacks `, Err` gives `The "?" operator needs a function returning "R" or "Err".`
-- Writing `return R.ok("a")` under `-> int, Err` is a compile error. When the type is dynamic, it is checked at runtime.
-- When a typed Array or Dictionary is the success value, give the original container the same element type.
-- A function returning a value and a failure returns on every path. One that only propagates with `?` still ends with `return null, null`.
-- A function declaring a single return type such as `-> int` cannot use a comma return. Declare `-> int, Err`.
-- A lambda cannot use a comma return. Use `return R.ok(value)` and `return R.err(reason)`.
-
-### Carrying results in R
-
-To carry the value and the failure around as one value, use `R`. Read `ok` for the outcome, `v` for the success value, and `e` for the failure.
-Build one with `R.ok(value)` or `R.err(reason, kind, partial_value)`. Web handlers and database transactions can also be written to return this `R`.
+A readable file can still be invalid for your application. Create an `Err` when the message is empty. `Err("message", kind, details)` takes a description, a kind such as `Err.INVALID_DATA`, and optional details. Save this as `read_message.gd`:
 
 ```gdscript
-func find(items, want):
-	for item in items:
-		if item == want:
-			return R.ok(item)
-	return R.err("not found: " + want, Err.NOT_FOUND)
+# Read a message and reject empty contents.
+func read_message(path: String) -> String, Err:
+    var text := GD.file.read_text(path)?
+    if text.strip_edges().is_empty():
+        return "", Err("Message is empty", Err.INVALID_DATA, {"path": path})
+    return text, null
 
-func main():
-	var got = find(["a", "b"], "c")
-	if not got.ok:
-		print(got.e.text())
-		return 1
-	print(got.v)
-	return 0
+# Print the message or report the failure to the caller.
+func main() -> int:
+    var text, err := read_message("message.txt")
+    if err != null:
+        printerr(err)
+        return 1
+    print(text)
+    return 0
 ```
 
-`R.ok()` carries null as its success value, not integer 0. I/O APIs that make partial progress keep the completed amount in `v` as a partial value even on failure.
-`note()` preserves the partial value, and `v_or(fallback)` returns the fallback on failure.
-When `?` propagates a failure whose partial value does not fit the caller's success type, only the partial value is dropped; the reason and kind are kept.
+```sh
+printf 'Hello!\n' > message.txt
+gd read_message.gd
+printf '' > message.txt
+gd read_message.gd
+```
+
+The first run prints `Hello!`. After emptying the file, the second run reports `Message is empty` and exits with status 1.
+
+- `-> String, Err` declares two return values: a string and an error.
+- Return `text, null` on success and `"", Err(...)` on failure.
+- The caller receives them with `var text, err := read_message(...)` and checks `err` before using `text`.
+- If reading the file fails, `?` returns that error as it is.
 
 ### Waiting and concurrency
 
@@ -353,8 +317,9 @@ func main():
 		GD.http.fetch_async.bind("https://example.com/a"),
 		GD.http.fetch_async.bind("https://example.com/b"),
 	])
-	for result in got:
-		var res, e := result as R
+	for result: Array in got:
+		var res: GDHTTPResponse = result[0]
+		var e: Err = result[1]
 		if e:
 			print(e.text())
 			return 1
@@ -364,19 +329,32 @@ func main():
 
 | Entry | Purpose |
 |---|---|
-| `name_async()` | Start the operation and return a Signal. `await` gives the same result as the regular name |
-| `GD.async.all(list)` | Accept Callables and Signals and return all results in input order. An invalid input becomes an error in its result slot |
-| `GD.async.spawn(fn)` | Run a GDScript function in the background. It keeps running after `main()` returns |
+| `name_async()` | Start the operation and return a `GDTask` that keeps its result. `await` it later, even after other waits, for the same result as the regular name. `cancel()` stops it |
+| `GD.async.all(list)` | Run several operations together and return the results in the order given |
+| `GD.async.spawn(fn)` | Run a function in the background. It keeps running after `main()` returns |
 | `GD.async.sleep(sec)` | Wait the given number of seconds |
 
-Pass Callables rather than Signals to `all()`. It subscribes to completion before starting each one, so it cannot lose a result that finishes early.
+To wait for a single one, receive it in the same shape as the regular name: `var value, e := await GD.http.fetch_async(url)`.
 
-A signal saved with `:=` retains its completion type. Reassignment from a different or unknown completion type is rejected.
-For dynamic completions, declare the receiver as `Signal` and annotate the awaited value as needed, for example `var result: R = await pending`.
+Started operations can also be received one after another. If `second` finishes while `first` is awaited, `second` keeps its result.
 
-`spawn()` does not move CPU work to another thread. Long GDScript yields to other work automatically, but
-the inside of a native method is not interrupted, so use the `_async` variant when passing large input to a standard module.
-A waiting method may be called only from a function that GDScript itself called. Native callbacks such as `Array.map()`, `_init()`, member initializers, and `_to_string()` cannot wait for it. Adding `await` inside such a callback does not make the native caller await the result. Move asynchronous initialization into `main()`; replace asynchronous `map()` callbacks with a `for` loop in an asynchronous function or the Callables passed to `GD.async.all()` above.
+```gdscript
+func main():
+	var first := GD.http.fetch_async("https://example.com/a")
+	var second := GD.http.fetch_async("https://example.com/b")
+	var a, a_err := await first
+	var b, b_err := await second
+	if a_err or b_err:
+		return 1
+	print(a.status, " ", b.status)
+	return 0
+```
+
+Keep three points in mind.
+
+- Pass `all()` the GDTasks returned by `_async()`, or Callables made with `.bind()` as in the example above. Either way, a result that finishes early is not lost.
+- `spawn()` does not move work to another thread. Use the `_async` variant when a standard module processes large data.
+- Call waiting methods from `main()` or a function you wrote. A function passed to `Array.map()`, `_init()`, and member initializers cannot wait, so write a `for` loop or use `GD.async.all()`.
 
 ## Tutorial: a notes API on SQLite
 
@@ -407,23 +385,27 @@ var db := GD.database.client()
 
 
 # Return notes as JSON, newest first.
-func list_notes(_req):
-	var got := db.query("SELECT id, title FROM notes ORDER BY id DESC")?
+func list_notes(req: GDWebRequest) -> GDWebResponse, Err:
+	var got, query_err := await GD.async.with_context_pair(req.context, db.query_async("SELECT id, title FROM notes ORDER BY id DESC"))
+	if query_err:
+		return query_err
 	return GD.web.json(got.rows)
 
 
 # Store a validated title and return the created row.
-func add_note(req):
+func add_note(req: GDWebRequest) -> GDWebResponse, Err:
 	var body := req.valid("body")
-	var made := db.query(
+	var made, query_err := await GD.async.with_context_pair(req.context, db.query_async(
 		"INSERT INTO notes(title) VALUES($1) RETURNING id, title",
 		[body.title]
-	)?
+	))
+	if query_err:
+		return query_err
 	return GD.web.json(made.rows[0], 201)
 
 
 # Prepare the database and routes, then listen on loopback.
-func main():
+func main() -> int, Err:
 	db.open({"driver": "sqlite", "path": DB_PATH})?
 	db.query("CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, title TEXT NOT NULL)")?
 	app.route("GET", "/notes", list_notes)
@@ -432,7 +414,7 @@ func main():
 	}))])
 	app.listen(PORT, "127.0.0.1")?
 	print("listening on http://127.0.0.1:%d" % PORT)
-	return 0, null
+	return 0
 ```
 
 Read it from the top.
@@ -478,8 +460,6 @@ Start with normal execution. `--strict` is an advanced mode for explicitly desig
 | Normal execution | Running trusted source during development | Neither files nor the network are restricted |
 | `--strict` | Unverified scripts, public servers | The startup directory is read-only; absolute paths outside it are denied. Network, environment variables, child processes, native extensions, and system information are denied by default |
 
-On macOS/Linux, v0.7.3 `--strict` still permitted absolute reads outside the startup directory.
-
 Under `--strict`, start by listing what the script uses.
 
 ```sh
@@ -501,6 +481,8 @@ gd --strict \
 | `--deny-*` | A denial that wins over the matching allow |
 | `-A` | Allow everything except files. For temporary use during development |
 
+`--strict` applies to the commands that run a script: `run`, `serve`, `test`, `task`, `eval`, and `repl`. Commands that do not run a script, such as `check`, `fmt`, and package operations, are unaffected.
+
 ### File locations
 
 A script sees files through four kinds of location. Write the name of the location at the start of the path, or write an absolute path as it is.
@@ -508,14 +490,15 @@ A script sees files through four kinds of location. Write the name of the locati
 | Spelling | Location | Under strict |
 |---|---|---|
 | `res://a.txt` | The directory the script was started from | Read-only |
-| `user://a.txt` | Per-user writable area provided by gd | Read/write |
+| `user://a.txt` | Writable area gd keeps for each script in the user's data folder. It survives restarts | Read/write |
 | `store://a.txt` | The name given by `--mount store=/srv/app:rw` | As specified |
 | `/etc/hosts` | That location on the machine | Denied unless it is inside the startup directory |
 
-- A relative path that climbs above `res://` is refused in either mode.
-- Under `--strict`, the startup working directory is the implicit read boundary, even when the entry script is in a subdirectory. Absolute paths inside it use the same read-only checks as `res://`; parent and sibling directories are denied. Links cannot bypass this boundary. To access an outside directory, explicitly mount it and use its named scheme, such as `store://`. `-A` does not expand file access.
-- `--mount` and absolute paths are for Linux and macOS. Windows rejects them, so put files under `res://` or `user://` there.
-- A mount name uses lowercase letters, digits, and `-`. `res`, `user`, `uid`, `pipe`, `local`, `libgodot`, `tcp`, `unix`, `http`, `https`, `file`, `data`, and `cache` are reserved and cannot be chosen.
+When in doubt, put files you only read under `res://` and files you save under `user://`.
+
+- Under strict, name a directory outside the startup directory with `--mount`. `-A` does not widen file access.
+- Name a mount with lowercase letters, digits, and `-`, such as `store` or `uploads`. These names are used by gd and cannot be chosen: `res`, `user`, `uid`, `pipe`, `local`, `libgodot`, `tcp`, `unix`, `http`, `https`, `file`, `data`, `cache`, `pkg`, and `global`.
+- Windows does not support `--mount` or absolute paths. Put files under `res://` or `user://` there.
 
 ### Network and extension permissions
 
@@ -538,25 +521,24 @@ and `queue_free()` on nodes outside a tree all work. With no work to do, it slee
 
 Under `serve`, a script that only extends `Node` is not added to a tree.
 `--no-scene-tree` reports a diagnostic as soon as a SceneTree is created and exits with code 1. It is inherited by `--watch` and `--workers` children.
-Normal execution creates an implicit SceneTree, so it fails with this flag.
 
 ## TCP and UDP
 
 Use `GD.net` for low-level networking. Godot's low-level types remain for compatibility, but new code should use `GD.net`.
 
 ```gdscript
-func echo():
+func echo() -> int, Err:
 	var listener := GD.net.listen_tcp("127.0.0.1", 8080)?
 	var conn := listener.accept()?
 	var data := conn.read(65536)?
 	conn.write(data)?
 	conn.close()
-	return 0, null
+	return 0
 ```
 
 - `GDTCPConn` keeps reads and writes in separate queues, so several GDScripts may call it concurrently.
 - Deadline methods set durations from now; zero clears them.
-- `close()` releases pending reads and writes with `Err.INTERRUPTED`. Listener accepts behave the same way.
+- After `close()`, waiting reads and writes end with `Err.INTERRUPTED`. A listener waiting to accept does the same.
 - A connection tries the IPv4 and IPv6 candidates from name resolution in order and keeps only the one that succeeds. The overall `timeout` is never extended.
 
 ### TLS
@@ -592,13 +574,38 @@ A missing `client_ca` uses the system trust settings.
 
 ### UDP and name resolution
 
-`GD.net.listen_udp()` returns a `GDUDPPacketConn`. `read_from()` returns a dictionary containing `data`, `host`, `port`, and `truncated`.
-Pass an IP address resolved by `GD.net.resolve()` as the host of `write_to()`. Packets are never merged.
-The default `buffer=0` keeps the OS receive buffer as it is; only a positive value requests a change.
+Open UDP with `GD.net.listen_udp()`. A received packet carries the sender's `host` and `port`, so you can reply to it directly.
 
-`GD.net.resolve()` returns the first address selected by the OS. It keeps no name cache.
-`GD.net.local_addresses()` returns the machine's address list and distinguishes an empty list from an OS failure.
-The failure's `e.info` carries `syscall`, `source`, and `source_code`.
+```gdscript
+func echo_udp() -> int, Err:
+	var conn := GD.net.listen_udp("127.0.0.1", 9000)?
+	var packet := conn.read_from()?
+	conn.write_to(packet.data, packet.host, packet.port)?
+	conn.close()
+	return 0
+```
+
+- Pass `write_to()` an IP address. Turn a host name into one first with `GD.net.resolve(name)?`.
+- One `read_from()` returns one packet. Bytes beyond the requested size are dropped and `packet.truncated` becomes `true`.
+- `GD.net.local_addresses()` lists this machine's addresses.
+
+## Mail
+
+`GD.mail` parses addresses and headers and sends mail through an SMTP server.
+
+- Pass `send_mail` the whole message, headers and body, as bytes.
+- Success means the SMTP server accepted the message. It does not guarantee delivery to the recipient.
+- Under `--strict`, the server needs `--allow-net`.
+
+```gdscript
+func main() -> int, Err:
+	var message := "From: me@example.com\r\nTo: you@example.com\r\nSubject: Hello\r\n\r\nHello\r\n".to_utf8_buffer()
+	GD.mail.send_mail("smtp.example.com", 587, "me@example.com", PackedStringArray(["you@example.com"]), message, {
+		"tls": "starttls", "timeout": 10.0,
+		"auth": GD.mail.plain_auth("me@example.com", "secret"),
+	})?
+	return 0
+```
 
 ## Files and data
 
@@ -606,21 +613,21 @@ The failure's `e.info` carries `syscall`, `source`, and `source_code`.
 To write to an outside directory under strict, write the name given by `--mount store=/srv/app:rw` as in `store://users.csv`.
 
 ```gdscript
-func main():
+func main() -> int, Err:
 	var rows := GD.data.csv_objects(GD.file.read_text("store://users.csv")?)?
 	GD.file.write_text("store://users.json", JSON.stringify(rows))?
-	return 0, null
+	return 0
 ```
 
 File operations suspend only the calling GDScript, even under their regular names. Other requests proceed while a Web server handler reads a file.
 Use the variants ending in `_async` only to start several operations together.
 
 ```gdscript
-func handler(_req):
-	var body := GD.file.read_text("store://big.json")
-	if not body.ok:
+func handler(_req) -> GDWebResponse:
+	var body, read_err := GD.file.read_text("store://big.json")
+	if read_err:
 		return GD.web.text("cannot read", 500)
-	return GD.web.text(body.v)
+	return GD.web.text(body)
 ```
 
 Files embedded by `compile` can be read, listed, and served statically through the same API.
@@ -633,10 +640,10 @@ Modes are `read`, `write`, `append`, and `read_write`. Call `close()` when done.
 | Method | Behavior |
 |---|---|
 | `read(max)` | Returns up to `max` bytes. It may return fewer. An empty successful value is EOF |
-| `write(bytes)` | Writes all bytes and returns the count. On a failure partway, `R.v` retains the number already written |
+| `write(bytes)` | Writes all bytes and returns the count. On a failure partway, the first result retains the number already written |
 
 Operations on one stream run in arrival order, and separate streams proceed in parallel. Append always writes at the end, even after a seek.
-`read_bytes()` also retains the bytes already read in `R.v` when it fails partway.
+`read_bytes()` also retains the bytes already read in the first result when it fails partway.
 `read_text()` rejects input too large for a String instead of truncating it, so handle large files as bytes or a stream.
 
 ### Files updated concurrently
@@ -673,29 +680,30 @@ In-memory conversions compute in place under their regular names, and their `_as
 Run `gd doc GD.file` and `gd doc GD.data` for the exact lists. Checks and limits per format are in the description of each entry in the API reference.
 
 `GD.collection` operations that take a Callable yield to other work about every 1 ms.
-Each `GD.log` call waits until the write completes and never truncates the message. Check failures through the returned `R`; `GD.log.flush()` waits for all earlier output.
+Each `GD.log` call waits until the write completes and never truncates the message. Check failures through the second `Err` result; `GD.log.flush()` waits for all earlier output.
 
 ### JSON rules
 
-Use `GD.data.json_encode(value)` to produce JSON bytes and `GD.data.json_decode(bytes)` to read bytes received from outside.
-Both return a success value and an `Err`. `GDWebRequest.json()`, `GDHTTPResponse.json()`, and each JSONL line follow the same rules.
+Use `GD.data.json_encode(value)` to produce JSON bytes and `GD.data.json_decode(bytes)` to read received bytes.
+`GDWebRequest.json()`, `GDHTTPResponse.json()`, and each JSONL line follow the same rules.
 
-- Invalid UTF-8, duplicate names, non-finite numbers, unsupported types, and cycles fail instead of being turned into ambiguous values.
-- An integer within the signed 64-bit range returns as `int`; only fractions, exponents, and out-of-range values become `float`. Strings and keys preserve `\u0000`.
-- Pass `{"deterministic": true}` when the same value must give the same bytes, as for signatures or cache keys.
-- The options `deterministic` and `escape_html` are `bool`; `max_bytes` and `max_depth` are `int`. An invalid type returns `Err.INVALID_DATA`, and exceeding a limit returns `Err.LIMITED`.
-- Keep the input Arrays, Dictionaries, and their children unchanged until `json_encode_async()` finishes. The options dictionary is copied at the start.
+```gdscript
+func main() -> int, Err:
+	var bytes := GD.data.json_encode({"id": 1, "tags": ["a", "b"]})?
+	var value := GD.data.json_decode(bytes)?
+	print(value.id)
+	return 0
+```
+
+- Integers come back as `int`. Fractions and exponents become `float`.
+- Ambiguous JSON, such as broken text encoding or a repeated name, fails instead of being read.
+- Pass `{"deterministic": true}` when the same value must always give the same bytes, as for signatures or cache keys.
 
 ### Hashes and key derivation
 
 `GD.data` returns SHA-1, SHA-224/256/384/512, and SHA3-224/256/384/512 digests. HMAC, PBKDF2, and HKDF accept
 `sha1`, `sha224`, `sha256`, `sha384`, `sha512`, `sha3-224`, `sha3-256`, `sha3-384`, or `sha3-512` as the hash name.
-PBKDF2 and HKDF accept an output length and return an `R` failure for an invalid hash or settings outside the supported range. PBKDF2 iteration counts of one or less perform one iteration.
-
-### Thread limit
-
-`GD.async.set_max_threads(max)` sets the limit on OS threads managed by gd and returns the previous value. The default is 10000.
-Exceeding the limit terminates the process. Lowering it below the current count also terminates it. Threads created directly by external libraries are not counted.
+PBKDF2 and HKDF accept an output length and return an `Err` for an invalid hash or settings outside the supported range. PBKDF2 iteration counts of one or less perform one iteration.
 
 ## Web framework
 
@@ -708,18 +716,18 @@ Create `main.gd` and `index.html` in the same directory. One route renders a gre
 var app := GD.web.app()
 
 # Build the shared response data from the requested name.
-func greeting(req):
+func greeting(req: GDWebRequest) -> Dictionary, Err:
 	var name := req.query.get("name", "world")
 	if not name is String:
-		return null, Err.err("name must be text", Err.INVALID_DATA)
-	return {"name": name, "message": "Hello, " + name + "!"}, null
+		return {}, Err("name must be text", Err.INVALID_DATA)
+	return {"name": name, "message": "Hello, " + name + "!"}
 
 # Render the page with escaped template values.
-func home(req):
+func home(req: GDWebRequest) -> GDWebResponse, Err:
 	return GD.web.view("index.html", greeting(req)?)
 
 # Return the same data as JSON.
-func hello(req):
+func hello(req: GDWebRequest) -> GDWebResponse, Err:
 	return GD.web.json(greeting(req)?)
 
 # Listen locally, using an optional port argument.
@@ -771,14 +779,13 @@ Open `http://127.0.0.1:8080/?name=Alice` to insert “Hello, Alice!” into `{{m
 ### Routes and replies
 
 `route(method, pattern, handler)` binds an HTTP method and a path to a handler. `:name` in the pattern arrives in `req.params["name"]`.
+A HEAD request is answered by the GET route. A request whose path matches but whose method does not gets a 405.
 A handler receives a `GDWebRequest`. It reads only the needed body through `req.read()`, `bytes()`, `text()`, `json()`, or `save()`.
 A body sent by an HTML form becomes a dictionary with `GD.http.decode_query(req.text()?)`.
 
-`req` is the incoming request. Inspect fallible operations with `var value, e := call()` and return `null, e`, or propagate with `call()?`. Use `return response, null` only on a successful path after handling every possible failure.
+The value a handler returns becomes the reply. Return one of the values in the table below as it is, such as `return GD.web.json(data)`.
 
-`GD.web.view()` and `GD.web.json()` return `response, Err`. A handler can forward the result directly: `return GD.web.json(data)`. Template loading/rendering and JSON encoding preserve the original Err for `app.on_error(req, e)`. Middleware, postprocessors, and automatic JSON encoding share that boundary. If the error handler itself fails, the server returns 500 without invoking it again. Once streaming starts, the HTTP status is committed; handle errors returned by the writer.
-
-The value a handler returns becomes the reply.
+When a step fails, return its `Err` with `call()?`. The `Err` becomes the status code in the last row of the table. Register `app.on_error(handler)` to decide that reply yourself.
 
 | Returned value | Reply |
 |---|---|
@@ -789,25 +796,25 @@ The value a handler returns becomes the reply.
 | `GD.web.redirect(to)` | 302. `to` is limited to a path on the same site. Set `away` to `true` to send elsewhere |
 | `GD.web.not_found()` | 404 |
 | A string | 200 as text/plain |
+| A dictionary with `body` | A handwritten reply. `status`, `type`, and `headers` are optional |
 | A dictionary without `body` | 200 as JSON |
 | `null` | 204 |
-| A failed `R` or an `Err` | Status by kind. `INVALID_DATA` → 400, `UNAUTHENTICATED` → 401, `PERMISSION_DENIED` → 403, `NOT_FOUND` → 404, `LIMITED` → 429, `UNSUPPORTED` → 501, `TIMED_OUT` → 504; other kinds → 500 (all are `Err` constants) |
+| An `Err` | Status by kind. `INVALID_DATA` → 400, `UNAUTHENTICATED` → 401, `PERMISSION_DENIED` → 403, `NOT_FOUND` → 404, `LIMITED` → 429, `UNSUPPORTED` → 501, `TIMED_OUT` → 504; other kinds → 500 (all are `Err` constants) |
 
-Route handlers and middleware may return a Signal, including after `await`. Processing resumes when it completes: no arguments become `null`, one argument becomes that value, and multiple arguments become an Array. An unavailable Signal goes through the error handler. Pending subscriptions are removed when the request ends or the app stops.
+A reply can be adjusted as follows.
 
-- text and html take the status as the second argument; bytes takes it after the media type.
+- Change the status code with the second argument, as in `GD.web.text("Not found", 404)`. `bytes` takes it after the media type.
 - `GD.web.header(reply, name, value)` adds a header to a reply.
-- `GD.web.guard(reply)` adds the defensive headers such as `X-Content-Type-Options`, `X-Frame-Options`, and `Content-Security-Policy` at once.
-- The reason for a failure is not written to the body by default. It is shown only while `app.show_errors(true)` is set during development.
-- `req.path` is the path with each segment decoded once. `req.target` is the original text, keeping percent escapes and the query. `%2F` does not become a path separator.
-- A path whose percent-decoded segments contain invalid UTF-8 or control characters gets a 400. Query values preserve arbitrary bytes as `PackedByteArray`; validate their type before using them as text. `req.query` skips malformed pairs; use `GD.http.decode_query()` to receive both the valid pairs and an `Err`.
-- Do not modify values passed to `GD.web.json()` or `view()` until the reply has been sent.
+- `GD.web.guard(reply)` adds defensive headers such as `Content-Security-Policy` at once.
+- The reason for a failure is not written to the body by default. Show it during development with `app.show_errors(true)`.
+- A value in `req.query` is not always text. Check it with `is String` before use, as in the example above.
+- `req.path` is the path with escapes such as `%20` turned back into characters. `req.target` holds the text as it arrived.
 
 The router also accepts the following.
 
 | Registration | Purpose |
 |---|---|
-| `app.static("/assets", "res://public")` | Answer GET under the prefix with files from the directory. The media type comes from the extension, and nothing outside the directory is served. Write the index of `/` as a `route` |
+| `app.static("/assets", "res://public")` | Answer GET and HEAD under the prefix with files from the directory. The media type comes from the extension, and nothing outside the directory is served. Write the index of `/` as a `route` |
 | `app.group("/api", [middleware])` | A route group with a shared prefix and middleware. The result has `route()` and `use()` |
 | `app.fallback(handler)` | Requests matching no route. Return the 404 page here |
 | `app.on_error(handler)` | The reply when a handler returns a failure |
@@ -833,7 +840,7 @@ with `GD.web.optional()` and `GD.web.one_of()` for omission and choices. Query a
 ```gdscript
 var app := GD.web.app()
 
-func show(req):
+func show(req) -> GDWebResponse, Err:
 	var params := req.valid("params")
 	return GD.web.json({"id": params.id})
 
@@ -864,7 +871,7 @@ The template language is gdhtml, a micro template with Mustache syntax. It handl
 ```
 
 ```gdscript
-func page(_req):
+func page(_req) -> GDWebResponse, Err:
 	return GD.web.view("views/page.html", {"title": "Top"})
 ```
 
@@ -893,21 +900,22 @@ then call `execute(data)?` on the returned value from each request. The parsed v
 
 Login state is held by `GD.web.sessions()`. `issue(value)` creates a session ID, and the value of `cookie(id)` is returned as `Set-Cookie`.
 On routes that carry the same store as middleware, the value behind the cookie's ID arrives in `req.kept("user")`, and a missing session is a 401.
+An invalid middleware configuration returns null from its factory; passing it to `app.use()` or a route makes `app.listen()` report a configuration error.
 
 ```gdscript
 var app := GD.web.app()
 var sessions := GD.web.sessions()
 
-func login(req):
+func login(req: GDWebRequest) -> GDWebResponse, Err:
 	var form := GD.http.decode_query(req.text()?)?
 	var user := str(form.get("user", [""])[0])
 	if user.is_empty():
-		return GD.web.text("user is required", 400), null
+		return GD.web.text("user is required", 400)
 	var reply := GD.web.redirect("/me")
-	return GD.web.header(reply, "Set-Cookie", sessions.cookie(sessions.issue(user)?)), null
+	return GD.web.header(reply, "Set-Cookie", sessions.cookie(sessions.issue(user)?))
 
-func me(req):
-	return GD.web.text("hello, " + str(req.kept("user"))), null
+func me(req) -> GDWebResponse, Err:
+	return GD.web.text("hello, " + str(req.kept("user")))
 
 func main():
 	app.route("POST", "/login", login)
@@ -957,6 +965,8 @@ IPv4 and IPv4-mapped IPv6 are matched as different things, so use an IPv6 CIDR t
 var per_ip := GD.web.rate({"limit": 60, "trusted_proxies": ["127.0.0.1", "172.18.0.0/16"]})
 ```
 
+Allowed and 429 responses include `X-RateLimit-Limit` and `X-RateLimit-Remaining`. A 429 response also includes `Retry-After` in seconds.
+
 ### Shutdown
 
 Wait for shutdown with `app.shutdown(context)`. It stops accepting new connections and keep-alive, then waits for in-flight requests.
@@ -964,22 +974,21 @@ Past the deadline it returns `Err.TIMED_OUT` but does not kill in-flight request
 Use `app.stop()` when every connection must close immediately.
 
 ```gdscript
-func close(app):
+func close(app: GDWebApp):
 	var context := GD.async.context().with_timeout(10.0)
-	var stopped := app.shutdown(context)
-	if not stopped.ok:
+	var _stopped, stop_err := app.shutdown(context)
+	if stop_err:
 		app.stop()
 ```
 
 A handler can observe request completion and disconnection through `req.context`.
 `with_cancel()` and `with_timeout()` return a child context without changing the parent, and the parent's cancellation reaches the child.
-To make HTTP, database, process, and other waits cancelable, wrap them with `with_context()`, passing the context first.
+To cancel HTTP, database, process, and other two-result waits, wrap them with `with_context_pair()`, passing the context first. Use `with_context()` for single-value operations.
 The operation result is returned when it finishes first; when the context finishes first, the operation is canceled.
 
 ```gdscript
-func load(req, db):
-	var result = await GD.async.with_context(req.context, db.query_async("SELECT * FROM posts"))
-	return result
+func load(req: GDWebRequest, db: GDDatabaseClient) -> Variant, Err:
+	return await GD.async.with_context_pair(req.context, db.query_async("SELECT * FROM posts"))
 ```
 
 ### Web operations and advanced features
@@ -1001,42 +1010,35 @@ To accept a 1 GB ZIP, put a per-request limit on it and stream it to a writable 
 func main():
 	var app := GD.web.app()
 	app.limits({"body_timeout": 600.0})
-	app.route("POST", "/upload", func(req):
+	app.route("POST", "/upload", func(req: GDWebRequest) -> GDWebResponse, Err:
 		req.limit(1000 * 1000 * 1000)?
 		req.save("uploads://package.zip")?
 		return GD.web.text("saved")
 	)
-	return 0 if app.listen(8080, "127.0.0.1").ok else 1
+	var _server, listen_err := app.listen(8080, "127.0.0.1")
+	return 0 if listen_err == null else 1
 ```
 
 ```sh
 gd --strict --allow-net=127.0.0.1:8080 --mount=uploads=/srv/uploads:rw serve main.gd
 ```
 
-Bodies and memory are handled as follows.
+How you read the body decides how much memory it uses.
 
-| Target | Handling |
+| Reading | Memory use |
 |---|---|
-| Request body | No default size limit. The handler starts right after the header, and the body is read from the connection only as the handler reads it |
-| `read()`, `save()` | Stream the body. An empty successful `read()` is EOF. `save()` never holds the complete body in memory |
-| `bytes()`, `text()`, `json()` | Read the whole remaining body into memory. Use `save()` for large bodies. `text()` is limited to what fits in a String |
-| `req.limit(bytes)` | Per-request body limit. Overflow is returned as a failure to the body-reading operation |
-| Request header | Default 1 MiB. The line count is limited only when `header_values` is set. Trailers 4096 bytes |
-| HTTP client response header | Up to 10 MiB |
-| Slow connections | Only that connection waits. Other connections are not affected |
-| Extra reply headers | No fixed count or aggregate limit. Only invalid names and values are dropped |
-| Sessions and rate limits | Shared within a process, not across `--workers`. Use an external store such as a DB when sharing is needed |
-| Session values | String and integer identifiers. Retention counts are set with `total` and `per_user` |
-| HS256 JWT | Key at least 32 bytes. JSON and signature validity are checked |
-| Rate limit key | Retention count is set with `keys` |
-| HTTP status | 100..999. Out of range is sent as 500 |
-| Port | 0 is allowed for listening and as the search start of `GD.net.free_port()`. Targets and `is_free()` take 1..65535 |
-| Query string | `GD.http.decode_query()` reports a bare semicolon and a broken percent escape as failures |
+| `read()`, `save()` | Read a little at a time. `save()` never holds the whole body in memory |
+| `bytes()`, `text()`, `json()` | Read the whole remaining body into memory. The body is kept after the first read, so every call returns the same content. Use `save()` for large bodies |
+| `req.limit(bytes)` | Body limit for that request. Past it, the reading operation fails |
+
+- The body has no default size limit. Set `req.limit()` on a public server.
+- The request header is limited to 1 MiB by default. Change it with `header_bytes` in `limits()`.
+- A slow connection makes only that connection wait.
 
 #### Streaming bodies
 
 `GD.web.stream(producer, length=-1, type="application/octet-stream", status=200)` sends only what `producer(writer)` writes to the `GDWebWriter`.
-It never joins the whole body in memory. The producer may `await`, and it finishes by returning void or an `R`.
+It never joins the whole body in memory. The producer may `await`, and it finishes by returning void or a value and `Err`.
 
 | `GDWebWriter` | Behavior |
 |---|---|
@@ -1052,7 +1054,7 @@ It never joins the whole body in memory. The producer may `await`, and it finish
 
 #### HTTPS and HTTP/2
 
-Start HTTPS with `app.listen_tls(8443, "cert://chain.pem", "cert://key.pem", "127.0.0.1")` and check the returned `R`.
+Start HTTPS with `app.listen_tls(8443, "cert://chain.pem", "cert://key.pem", "127.0.0.1")` and check the second `Err` result.
 Mount the certificate directory read-only with `--mount cert=/path/to/certs:r`. Pass a PEM chain and an unencrypted private key.
 When key validation fails, no port is opened.
 
@@ -1066,11 +1068,11 @@ The writer below can be a `GDFileStream`, a TCP connection, or a `GDWebWriter`. 
 
 | Item | Details |
 |---|---|
-| Methods | `write(bytes)`, `flush()`, `close()`, and `reset(writer)`. Each returns `R` |
+| Methods | `write(bytes)`, `flush()`, `close()`, and `reset(writer)`. Each returns a value and `Err` |
 | `level` | -2 (Huffman only), -1 (default), and 0..9 |
 | `close()` | Finishes the gzip trailer. It does not close the writer below |
 | `reset(writer)` | Clears errors and reuses the compressor at the same level |
-| `header` | `name` and `comment` (non-NUL Latin-1), `extra` (up to 65535 bytes), `mod_time` (Unix seconds), and `os` (default 255). Set it before the first write |
+| `header` | `name` and `comment` (non-NUL Latin-1), `extra` (up to 65535 bytes), `mod_time` (Unix seconds from 0 to 4294967295), and `os` (default 255). Set it before the first write |
 
 For HTTP, return `GD.web.header(GD.web.stream(producer), "Content-Encoding", "gzip")`; the producer creates the compressor, writes, and returns the result of `close()`.
 Checking `Accept-Encoding` and setting `Vary` are up to the caller. Do not compress secrets together with external input, and do not apply it to an already compressed body or a partial response.
@@ -1081,6 +1083,7 @@ For an IPv6-only localhost listener, use `app.listen(8080, "::1")!`. Under stric
 `::1` and `127.0.0.1` are separate listeners, and both differ from `::`, which means every interface.
 
 To let the OS pick a free port, read `app.port()` right after `app.listen(0)`. The number is obtained while holding the listener, so no other process can take it.
+Check `app.serve_error()` for a listener failure after startup. Temporary resource shortages cause a short retry; a permanent failure closes the listener.
 Under strict the chosen port cannot be limited ahead of time, so allow the whole host, as in `--allow-net=127.0.0.1`.
 `GD.net.free_port()` and `is_free()` are momentary diagnostics, not a way to reserve that number.
 
@@ -1098,10 +1101,9 @@ The settings passed as a dictionary to `GD.http.fetch()` and the `GD.web` functi
 | Entry | Setting and default | Meaning |
 |---|---|---|
 | `GD.http.fetch` | `method="GET"`, `headers={}`, `body=null` | HTTP method, request headers, request body |
-| same | `timeout=30.0`, `max_body=0` | Seconds for the whole request and bytes of the response body. 0 is unlimited |
+| same | `timeout=0.0`, `max_body=0` | Seconds for the whole request and bytes of the response body. 0 is unlimited. New TCP connections default to 30 seconds and TLS handshakes to 10 seconds |
 | same | `save=""`, `sha256=""` | Stream a 2xx body to `save`, returning an empty body. `sha256` requires `save`, is 64 hex digits, and only a matching completed file is placed |
 | same | `authority="host:port"` | Request target for CONNECT only |
-| `GD.cli.run` | `timeout=0.0`, `output=true` | Seconds before giving up on the child process, and whether to collect output |
 | `GDWebApp.limits` | `jobs=0`, `job_timeout=0.0` | Number of async handlers kept and seconds. 0 is unlimited |
 | same | `header_timeout=0.0`, `body_timeout=0.0` | Seconds to finish receiving request header/body. 0 is unlimited |
 | same | `header_bytes=1048576`, `header_values=2147483647` | Header bytes including the request line, and the header line count |
@@ -1112,8 +1114,9 @@ The settings passed as a dictionary to `GD.http.fetch()` and the `GD.web` functi
 | `GD.web.sessions` | `total=1024`, `per_user=3` | Sessions per process, and per user |
 | same | `idle=1800`, `life=43200` | Idle and maximum lifetime in seconds |
 | same | `cookie="sid"`, `keep="user"` | Cookie name and the name kept on the request. The cookie name uses ASCII token characters |
-| `GD.web.rate` | `limit=60`, `window=60.0` | Count per key and the fixed window in seconds |
-| same | `keys=10000`, `key=Callable()` | Keys kept per process and the key selector |
+| `GD.web.rate` | `limit=60`, `window=60.0` | Largest burst per key, and the seconds that refill that many requests |
+| same | `expires=180.0` | Seconds after the last request before a key is released |
+| same | `keys=0`, `key=Callable()` | Keys kept per process and the key selector. Zero is unlimited. A full explicit store evicts the earliest expiring key |
 | same | `trusted_proxies=PackedStringArray()` | IPs or CIDRs of proxies whose forwarded IP is trusted |
 | `GD.web.csrf` | `allow_missing=false` | Whether to allow state changes from clients without Fetch Metadata |
 | `GD.web.text_rule` | `min=0`, `max=4096` | Text length in characters |
@@ -1124,18 +1127,7 @@ The settings passed as a dictionary to `GD.http.fetch()` and the `GD.web` functi
 
 `GDWebApp.limits` accepts only the six listed setting names and rejects misspellings and `body_limit`.
 
-Numeric settings accept the following ranges. A value outside the range fails when set.
-
-| Setting | Accepted range |
-|---|---|
-| `jobs` | 0..2147483647. 0 is unlimited |
-| `header_values`, session `total/per_user`, rate `limit/keys` | 1..2147483647 |
-| `job_timeout`, `header_timeout`, `body_timeout` | Finite 0..9223372036.854776 seconds. 0 is unlimited |
-| session `idle/life` | 1..9223372036 seconds |
-| `header_bytes` | 1..2147479551 bytes. Separate from the body |
-| `req.limit`, `GD.http.fetch.max_body` | 0..9223372036854775807 bytes. 0 for `max_body` is unlimited |
-| `ttl` | 0 or more |
-| `leeway` | Finite, 0 or more |
+A value outside the accepted range fails when set. The ranges are listed with each function in the API reference.
 
 ## Database
 
@@ -1143,7 +1135,7 @@ The client returned by `GD.database.client()` handles SQLite and PostgreSQL with
 Switching from the embedded SQLite in local development to PostgreSQL in production is done through the `driver` passed to `open()`.
 
 ```gdscript
-func main():
+func main() -> int, Err:
 	var local := GD.cli.env("DB_DRIVER", "sqlite") == "sqlite"
 	var db := GD.database.client()
 	db.open({
@@ -1159,7 +1151,7 @@ func main():
 	var out := db.query("SELECT id, name FROM users WHERE id=$1", [1])?
 	print(out.rows[0].name)
 	db.close()
-	return 0, null
+	return 0
 ```
 
 Table creation, INSERT, and SELECT all go through the one `query()`. It yields a dictionary with `columns`, `rows`, and `tag`,
@@ -1177,49 +1169,65 @@ Advance `query_rows()` with `while rows.next()`. `scan()` returns a dictionary k
 After `next()` returns false, inspect `err()`. Call `close()` when stopping early.
 
 ```gdscript
-func list_users(db):
+func list_users(db: GDDatabaseClient) -> Variant, Err:
 	var rows := db.query_rows("SELECT id, name FROM users ORDER BY id")?
 	while rows.next():
 		var user := rows.scan()?
 		print(user.id, " ", user.name)
 	if rows.err() != null:
-		return R.err(rows.err())
-	return R.ok()
+		return null, rows.err()
+	return null
 ```
 
-On a constraint violation, `result.e.info` carries machine-readable details. `violation` is one of `duplicate`, `not_null`, or `foreign_key`,
+On a constraint violation, the second result `e.info` carries machine-readable details. `violation` is one of `duplicate`, `not_null`, or `foreign_key`,
 and `columns` lists the related column names. On PostgreSQL, `code`, `table`, and `constraint` are included when the server returns them.
 Values themselves are never kept in `info`. A failure reported by SQLite itself keeps `source="sqlite"` and its extended `source_code`.
 SQLite's foreign key message has no column names, so `columns` is empty there.
 
 ```gdscript
-func save(db):
-	var saved := db.query(
+func save(db: GDDatabaseClient) -> void:
+	var _saved, e := db.query(
 		"INSERT INTO users(id,name) VALUES($1,$2)",
 		[1, "ada"])
-	if not saved.ok and saved.e.info.get("violation") == "duplicate":
-		var columns := saved.e.info.get("columns", PackedStringArray())
+	if e and e.info.get("violation") == "duplicate":
+		var columns := e.info.get("columns", PackedStringArray())
 		print("duplicate columns: ", columns)
 ```
 
 ### Transactions and migrations
 
 To make several updates one success or failure, use `transaction()`. The callback receives a `GDDatabaseTx`
-pinned to one connection. Returning a successful `R` commits, returning a failed `R` rolls back.
+pinned to one connection. A null second result commits, while an `Err` rolls back.
 
 ```gdscript
-func save(db, id, title):
-	return db.transaction(func(tx):
+func save(db: GDDatabaseClient, id: int, title: String) -> Variant, Err:
+	return db.transaction(func(tx: GDDatabaseTx) -> int, Err:
 		tx.query("INSERT INTO posts(id,title) VALUES($1,$2)", [id, title])?
 		tx.query("UPDATE counters SET value=value+1 WHERE name='posts'")?
-		return R.ok(id)
+		return id
 	)
 ```
 
-- Use the given `tx` in the callback and always return an `R`. During a transaction, `query()` on the original client and a nested transaction are rejected.
+- Inside the callback, run SQL only through the given `tx`. The original `db.query()` is not part of this transaction.
 - A commit failure is returned as a failure.
 - Close or cancel before COMMIT begins rolls back; after it begins, the connection closes once the result is settled.
 - After the callback finishes, a retained `tx` no longer accepts new SQL.
+
+When a PostgreSQL transaction fails because it collided with another one running at the same time (SQLSTATE `40001`), `serialize()` retries it.
+
+- The function has the same shape as for `transaction()` and is called in a new transaction on every attempt.
+- It retries up to ten times. Another error or a cancellation stops it.
+- Keep effects that cannot be undone, such as sending mail, outside the function.
+
+```gdscript
+func increment(db: GDDatabaseClient, id: int) -> int, Err:
+	var saved, e := db.serialize(func(tx: GDDatabaseTx) -> int, Err:
+		tx.query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")?
+		tx.query("UPDATE counters SET value=value+1 WHERE id=$1", [id])?
+		return id
+	)
+	return saved, e
+```
 
 To apply a schema in order, pass an array of statements to `migrate()` instead of splitting SQL on semicolons.
 If one statement fails, everything rolls back. On success it returns the number of statements applied.
@@ -1240,9 +1248,9 @@ func migrate(db):
 | Item | SQLite | PostgreSQL |
 |---|---|---|
 | Suited to | Local development, a single process | Production, crash resilience, several workers |
-| Connection | One per client. Journal and temporary tables live in memory | A pool of up to `max(4, CPU count)` by default. Set a maximum as in `pool=25` |
+| Connection | One per client. Journal and temporary tables live in memory | A pool that opens only the connections it needs. Set a maximum as in `pool=25` |
 | Extra entries | `GD.database.sqlite.open()` for short work done in place | `GD.database.postgres` for batched sends, arrays, and JSONB |
-| Notes | A database with existing `-journal`, `-wal`, or `-shm` files must be recovered or checkpointed with regular SQLite before opening | Hosts other than loopback verify the TLS certificate and host name by default. Loopback defaults to no TLS |
+| Notes | Persistent databases recover unfinished writes with a rollback journal. Checkpoint existing `-wal` and `-shm` files with regular SQLite before opening | Hosts other than loopback verify the TLS certificate and host name by default. Loopback defaults to no TLS |
 
 `open()` on `GD.database.postgres.client()` and `GD.database.redis.client()` takes the target as arguments, in the form `open(host, port, opts)`.
 
@@ -1254,25 +1262,50 @@ Use them only for short work and never concurrently. Use `GDDatabaseClient` for 
 
 #### PostgreSQL connections and types
 
-- The pool creates no connection until the first query and grows only for demand up to the maximum. Queries after the maximum is reached wait in arrival order.
-- An ordinary `query()` is also sent onto a busy connection (pipelining). Results on one connection return in the order sent.
-- Transactions and `query_rows()` reserve one connection. For work that uses connection-local state, use the transaction API instead of sending a standalone `BEGIN`.
-- Use `query_many`, `fetch_many`, or `exec_many` to send several SQL operations together on one connection.
-- Cancellation and deadline expiry notify the caller at once, but do not guarantee that the SQL stopped on the server. Other queries are not interrupted.
-- `wait_count` in `stats()` counts waits to acquire a connection and excludes response waits inside a pipeline.
-- Authentication follows the server's request with SCRAM-SHA-256 or MD5. Pin the method with `auth="scram"` or `auth="md5"`. MD5 is for older servers. A cleartext password needs explicit permission.
-- JSON and JSONB columns are read by the same rules as JSON in "Files and data" and preserve 64-bit integers. Ambiguous values such as duplicate names return the original JSON string.
-- `bool[]`, `int[]`, `bigint[]`, and `text[]` preserve element types, nulls, and nested dimensions. Arrays with explicit lower bounds return the original text.
-- Connections request UTF8. A server-reported change to another client encoding closes the connection with an error. The SQL that made the change may already have executed.
+The pool opens connections as they are needed and takes them back after use. Normally you just call `query()` without thinking about connections. When none is free, queries wait in turn.
+
+| Goal | How |
+|---|---|
+| Run several SQL statements as one unit | Use `transaction()` instead of sending `BEGIN` yourself |
+| Send several SQL statements together | `query_many`, `fetch_many`, `exec_many` |
+| Detect a duplicate insert | `Err.ALREADY_EXISTS`. Read the SQLSTATE in `e.info.code` for the exact cause |
+| See whether there are enough connections | `wait_count` in `stats()` (times a query waited for a connection) |
+| Pin the authentication method | `auth="scram"`. `auth="md5"` is for older servers |
+
+Column values arrive as these types.
+
+| Column type | Received value |
+|---|---|
+| `real`, `double precision` | `float` |
+| `numeric` | Text, so no digits are lost |
+| `json`, `jsonb` | Dictionaries and arrays. Integers stay `int` |
+| Arrays such as `int[]` and `text[]` | An Array of the same element type. Nulls and nesting are kept |
+
+A query that is cancelled or times out closes its connection. The SQL on the server may not stop at once. The character encoding is UTF-8.
 
 #### Redis connections
 
-A missing `GET` returns `Err.NOT_FOUND` with `e.info.code == "nil"`; null items inside an `MGET` Array remain null. `pipeline()` always returns an Array, including a single command. On a transport failure, known replies remain available and unknown positions contain Err. A WATCH abort returns `Err.INTERRUPTED` with `e.info.code == "tx_failed"`.
+Use Redis through `GD.database.redis.client()`. Pass the command name and its arguments separately to `query()`.
 
-- The TLS choice is the same as PostgreSQL. `timeout` on `open()` sets the connect and response deadline in seconds.
-- Pool `open()` only configures the destination; network activity begins with the first `query()`.
-- A connection in use is held exclusively until it is returned, and callers wait in arrival order when none is free. Canceling a waiter does not affect other calls; canceling an active call closes its connection.
-- `size()` counts connections, including those connecting; `in_flight()` counts unfinished calls, including acquisition waiters.
+```gdscript
+func main() -> int, Err:
+	var redis := GD.database.redis.client()
+	redis.open("127.0.0.1", 6379)?
+	redis.query("SET", ["greeting", "hello"])?
+	print(redis.query("GET", ["greeting"])?)
+	redis.close()
+	return 0
+```
+
+| Goal | How |
+|---|---|
+| Tell that a value is missing | `GET` returns `Err.NOT_FOUND` |
+| Send several commands together | `pipeline(cmds)`. Results come back as an Array in the order sent |
+| Use it from many requests at once | `GD.database.redis.pool()`. Connections open on the first `query()` |
+| Use `MULTI`, `WATCH`, `SELECT`, or subscriptions | A dedicated `GDRedisClient`, not the pool |
+| Set a deadline | `timeout` in `open()` (seconds) |
+
+The TLS choice is the same as PostgreSQL.
 
 #### Database settings
 
@@ -1280,33 +1313,29 @@ The settings passed as a dictionary to `open()`, with their defaults.
 
 | Entry | Setting and default | Meaning |
 |---|---|---|
-| `GDDatabaseClient.open` | `driver="postgres"`, `path=""` | Driver and SQLite path. SQLite needs `user://...` or `:memory:` |
+| `GDDatabaseClient.open` | `driver="postgres"`, `path=""` | Driver and SQLite path: `user://`, a name mounted writable with `--mount`, or `:memory:`. `res://` also works without `--strict` |
 | same | `host="127.0.0.1"`, `port=5432` | PostgreSQL target |
-| same | `pool=0` | PostgreSQL maximum connections. 0 means `max(4, CPU count)`. Unused by SQLite |
+| same | `pool=0` | PostgreSQL maximum connections. 0 is unlimited. Unused by SQLite |
 | same | `max_rows=0`, `max_bytes=0` | Rows and bytes per result collected by `query()`. 0 is unlimited. Not applied to `query_rows()` |
 | `GDPostgresClient.open` | `user="postgres"`, `database="postgres"`, `password=""` | Credentials and database name |
-| same | `connect_timeout=15.0`, `timeout=0.0` | Connect and query seconds. Waiting for a pool connection counts toward the query time. 0 is unlimited |
+| same | `connect_timeout=0.0`, `timeout=0` | Connect and query seconds. Waiting for a pool connection counts toward the query time. Zero has no deadline; set either deadline when needed |
 | same | `auth="any"`, `allow_cleartext_password=false` | Pin the method with `auth="scram"`/`"md5"`. A cleartext password reply only when explicit |
 | same | `tls=<decided by host>`, `ca=""` | External hosts use `verify-full`, loopback `disable`. A CA file only when explicit |
-| `GD.database.sqlite.open` | `busy_ms=5000`, `max_ms=0` | Lock wait and execution deadline in milliseconds. 0 is unlimited |
+| `GD.database.sqlite.open` | `busy_ms=0`, `max_ms=0`, `foreign_keys=false` | Lock wait and execution deadline in milliseconds. `busy_ms=0` reports contention immediately; `max_ms=0` has no execution deadline. Enable foreign-key checks explicitly |
 | same | `max_rows=0`, `max_bytes=0` | Rows and bytes per result. 0 is unlimited |
-| `GDRedisClient.open` | `password=""`, `timeout=10.0` | Password, and connect and response deadline in seconds. 0 is unlimited |
+| `GDRedisClient.open` | `password=""`, `dial_timeout=5`, `read_timeout=5`, `write_timeout=5` | Password, and connect, read, and write deadlines in seconds. An explicit 0 is unlimited. `timeout` sets all three, and an individual setting wins |
 | same | `tls=<decided by host>`, `ca=""` | The same TLS choice as PostgreSQL |
-| `GD.database.postgres.pool` | size default 0; 0 or 1..2147483647 | 0 means `max(4, CPU count)` |
-| `GD.database.redis.pool` | size default 0; 0..2147483647 | Maximum connections. 0 is unlimited. Connections being opened at once are capped at ten times the CPU count, or at the maximum when one is set |
-| `GDRedisPool.open` | `pool_timeout=timeout+1.0` (30 seconds when timeout is 0) | Deadline for waiting for a free connection. An explicit 0 is unlimited |
+| `GD.database.postgres.pool` | size default 0; 0 or 1..2147483647 | 0 is unlimited. Connections open only as needed |
+| `GDPostgresPool.open` | `max_idle=2` | Connections kept after work ends. 0 keeps none. Never exceeds the maximum |
+| `GD.database.redis.pool` | size default 0; 0..2147483647 | Maximum connections. 0 selects ten times the CPU count. Simultaneous dials do not exceed the maximum |
+| `GDRedisPool.open` | `pool_timeout=read_timeout+1.0` (30 seconds when the read deadline is 0), `conn_max_idle_time=1800` | Deadline for waiting for a free connection, and how long a returned connection stays reusable. An explicit 0 is unlimited. An expired idle connection is closed at the next borrow |
+
+Set `read_timeout` explicitly to extend the deadline for a long Redis query.
 
 A `query()` over `max_rows` or `max_bytes` fails only that query.
 The whole connection is closed when ordering is lost through a deadline or a corrupt reply.
 
-| Setting | Accepted range |
-|---|---|
-| `max_rows`, `max_bytes`, `busy_ms`, `max_ms` | 0..2147483647 |
-| Bound values | 65535 for PostgreSQL, and the engine's variable limit for SQLite. `query_many` has no fixed item count |
-| One PostgreSQL send | SQL and bound strings are counted as UTF-8 bytes, up to roughly 1 GiB |
-| One Redis send | Server-configured limits apply |
-| PostgreSQL and Redis port | 1..65535 |
-| Seconds | Finite 0..9223372036.854776 seconds. 0 is unlimited |
+A value outside the accepted range fails when set. The ranges are listed with each function in the API reference.
 
 ## Scheduled jobs
 
@@ -1314,14 +1343,14 @@ A job that runs once at a fixed time is an ordinary script, called from the OS's
 gd needs no resident scheduler for it.
 
 ```gdscript
-func collect():
+func collect() -> int, Err:
 	var now := GD.time.to_iso(GD.time.now())
 	GD.file.append_text("store://log.txt", now + "\n")?
-	return 0, null
+	return 0
 
-func main():
+func main() -> int, Err:
 	collect()?
-	return 0, null
+	return 0
 ```
 
 ```sh
@@ -1355,54 +1384,87 @@ Stop it by ending the process. It is resident like a Web server, so `serve` is n
 
 The core stays small. Features specific to an external service are added as GDScript packages or GDExtensions only to projects that need them.
 
-| Entry | Purpose | API and setup |
+| Entry | Purpose | Setup |
 |---|---|---|
-| `Discord` | Pure-GDScript text bots on the Discord Gateway and REST | [Discord Bot](https://gd.progsha.com/pkg/) |
-| `GDMemcached` | Cache client reusing TCP connections | [Memcached](https://gd.progsha.com/pkg/) |
-| `GDSupabase` | Database and Auth client | [Supabase](https://gd.progsha.com/pkg/) |
+| `Discord` | Pure-GDScript text bots on the Discord Gateway and REST | `gd add @gd/discord` |
+| `GDSupabase` | Database and Auth client | `gd add ext:@gd/supabase` |
 
-Each document lists public classes, methods, return values, limits, and strict-mode examples. Because they are optional,
-they are not part of the API reference generated from the core alone.
+Browse published packages in the [package list](https://gd.progsha.com/pkg/). Because they are optional, they are not part of the API reference generated from the core.
 
-- Extensions added with `gd add` are trusted and loaded at startup, so no flag is needed. `--allow-net` for their target is still needed.
+- Extensions added with `gd add` are trusted and loaded at startup, so no flag is needed. Under `--strict`, their target needs `--allow-net`.
 - `--allow-ext` and `--deny-ext` apply when a script loads one while running with `GDExtensionManager.load_extension()`.
 - An added extension runs with the same privileges as the process, so pin the versions you trust in `gd.lock` and commit it.
 
 ## Packages and distribution
 
-When scripts multiply or you start using other packages, create `gd.json` with `gd init`. Dependencies are pinned with `gd.json` and `gd.lock`.
+To use a package someone else published, create `gd.json` with `gd init` and then add the package. Find published packages in the [package list](https://gd.progsha.com/pkg/) or with `gd search`.
 
 ```sh
 gd init
-gd search discord bot
-gd add gd:@scope/script-package@^1.0.0
-gd add ext:@scope/name@^1.0.0
-gd add short-name https://example.com/module.gd
-gd install --frozen
-gd task test
+gd add hello
 ```
+
+| Goal | Command |
+|---|---|
+| Search | `gd search discord` |
+| Add | `gd add hello` (`gd install hello` does the same) |
+| Choose the scope or a version range | `gd add @gd/hello@^0.8.0` |
+| Add under a name you choose | `gd add greet @gd/hello` |
+| Add a native extension | `gd add ext:@gd/supabase` |
+| Add from a URL or a local directory | `gd add util https://example.com/util.gd`, `gd add ../mylib` |
+| Restore the same versions elsewhere | `gd install --frozen` |
+| Check for and move to newer versions | `gd outdated`, `gd update` |
+| Remove | `gd uninstall hello` |
+| List what is installed | `gd info` |
+
+Dependencies are recorded in `gd.json` (what you use) and `gd.lock` (which versions). Commit both. `gd install` without arguments restores the dependencies in `gd.json`; `--frozen`, `--cached-only`, and `--sync` apply to that restore.
 
 ### Using packages
 
-An installed package is read from `pkg://<alias>/`, using the alias chosen by the consumer.
+Read an installed package by writing `@import alias` at the top of a script.
 
 ```gdscript
 @import hello
 ```
 
-- `pkg://` points into the per-user shared cache and copies nothing into the project.
+- The package itself lives in the per-user shared cache (`pkg://<alias>/`); nothing is copied into the project.
 - A dependency named in `gd.json` but absent from the cache is fetched on the first run. Under `--strict` the registry needs `--allow-net`.
+- A short name such as `gd add hello` is looked up in the registry. When two or more packages share the name, gd asks which one to use.
 - The default alias of `gd add` is the package name with `-` and `.` turned into `_`, so it is an identifier. Aliases that are engine classes or keywords are refused.
 - Commit `gd.json` and `gd.lock`. `gd init` writes `pkg/` into `.gitignore`.
 - `--frozen` does not change the lock. For an offline target, fetch first where a network is available, and add `--cached-only`.
 - When install, add, or update fails partway, project files and the lock are restored.
 - The lock is bound to its registry. Switching to another registry requires explicit lock migration.
 
+### Installing as a command
+
+`gd install -g` installs a package or script as a command such as `my-tool`. It leaves the `gd.json` and `gd.lock` of the project you are in untouched.
+
+```sh
+gd install -g tool                      # Install a published package by its short name.
+gd install -g @scope/tool@1.0.0         # Choose the scope and version.
+gd install -g --name my-tool ./tool.gd  # Install a local script.
+gd uninstall -g my-tool
+```
+
+| Flag | Meaning |
+|---|---|
+| `-n` / `--name` | Command name. Defaults to the package or script name (the parent directory name for `main.gd` or `mod.gd`) |
+| `--root <dir>` | Install location. Defaults to `GD_INSTALL_ROOT`, then the default cache. Add its `bin/` to PATH |
+| `-f` / `--force` | Update an installed command |
+| `-- args` | Fixed arguments passed first on every launch |
+
+- A short name such as `tool` is looked up in the registry. When two or more packages share the name, gd lists them and asks which one to use. Writing `@scope/tool` skips the question.
+- The entry is a script with `main(args)`. A published package uses `mod.gd`; a local directory uses `main` in its `gd.json`.
+- `--allow-*` and `--mount` given at install time apply on every launch.
+- A failed update leaves the installed command as it was.
+- Remove a command installed with `--root` by passing the same `--root`.
+
 ### Short import syntax
 
 `@import` is the short form of `const Name = preload(...)`.
 
-It is useful even without external dependencies: see [samples/packages](https://github.com/prog-sha/gd/tree/0.7/samples/packages) for a real registry dependency and its lockfile.
+It is useful even without external dependencies: see [samples/packages](https://github.com/prog-sha/gd/tree/master/samples/packages) for a real registry dependency and its lockfile.
 
 ```gdscript
 @import greet
@@ -1425,10 +1487,22 @@ A package is one project rooted at its `gd.json`. `gd init @scope/name` seeds `m
 {"name":"@scope/hello","version":"1.0.0","main":"src/mod.gd","include":["src"]}
 ```
 
+Package files are distributed from the author's GitHub Release. The registry keeps only where the files are and their fingerprints (SHA-256).
+
 ```sh
-gd publish
+gd publish                         # Write the release files to tmp/release/scope-hello-1.0.0/.
+gh release create 1.0.0 tmp/release/scope-hello-1.0.0/*
+gd publish https://github.com/OWNER/REPO/releases/download/1.0.0
 gd add hello gd:@scope/hello@^1.0.0
 ```
+
+1. `gd publish` without an argument writes the files to publish to `tmp/release/<scope>-<name>-<version>/`. Each file is named by the SHA-256 of its contents.
+2. Upload them as assets of a GitHub Release. Files of several packages or versions can share one release without name clashes.
+3. Run `gd publish` with the release's download URL. gd fetches each file from the URL, confirms it matches the local one, and then lists the version in the registry.
+
+Packages submitted to the public registry become searchable and installable after review. When `gd publish` prints a review ID, the version remains private until accepted. The registry checks the release files again just before acceptance.
+
+- Users' gd fetches the files straight from GitHub and checks them against the registry's fingerprints. Replacing a release file makes the check fail and the package uninstallable.
 
 - The entry is `mod.gd`. For multiple files, list files or directories in `include`.
 - The main file's directory becomes the package root, so relative preloads inside the package keep working.
@@ -1440,6 +1514,17 @@ A package under development is added from a local path with `gd add ../path`. It
 The checkout is copied under `pkg/<alias>/` and copied again on the next run whenever its content fingerprint changes.
 Files starting with `.`, `pkg/`, `tmp/`, subdirectories holding a `gd.json`, and `token` are not copied.
 `gd publish` turns a local import into its registry range when the target's `gd.json` has `name` and `version`, and refuses it otherwise.
+
+### Local development channel
+
+Start the real registry on loopback from the repository. It saves the registry's records under `tmp/dev-channel/data`.
+
+```sh
+export GD_TOKEN='development token'
+uv run --no-project python -B devtools/channel.py serve --scope dev --port 8787
+```
+
+In another terminal, set `GD_REGISTRY=http://127.0.0.1:8787` and the same `GD_TOKEN`. Run `gd publish --dry-run` and `gd publish` from an `@dev/name` package. Serve the written files from loopback, for example with `python3 -m http.server 8788 --bind 127.0.0.1 --directory tmp/release`, and list them with `gd publish http://127.0.0.1:8788/dev-name-1.0.0`. Only development registries accept loopback HTTP. Consumers using that `GD_REGISTRY` can run `gd search`, `gd add`, `gd install`, `gd install -g`, and `gd compile`. A project's `registry` in `gd.json` takes precedence over the environment.
 
 ### Dependency resolution
 
@@ -1454,7 +1539,7 @@ then the newest match in the registry.
 - There is no mechanism for plugins that share one host instance (peer dependencies).
 - The canonical path of a registry package is `pkg://@scope/name@version/`. `pkg://<alias>/` expands to it through the `imports` of the package the script belongs to. The same alias may name different versions in different packages, and one version is one script however it is reached.
 - `gd.lock` also records each package's resolved `imports`, and `gd info` lists them.
-- `gd remove` and `gd update` drop what no package uses any more from `gd.lock` and `pkg/`.
+- `gd uninstall` and `gd update` drop what no package uses any more from `gd.lock` and `pkg/`.
 - A change in search ranking does not affect installation or lock verification for a known package.
 
 ### Sharing a location with Godot
@@ -1463,6 +1548,7 @@ To share a project with tools that only read `res://`, such as upstream Godot, s
 Packages are copied under `pkg/<alias>/`, and both `pkg://` and `res://pkg/` point there.
 A package that only other packages use goes under `pkg/@scope/name@version/`.
 
+- `gd install --godot` copies packages under `addons/<alias>/`. Also pass `--godot` to `add`, `update`, `uninstall`, and `info`. An `addons/` directory inside a package does not cause the rest of the package to be excluded.
 - Where `project.godot` exists, `place` defaults to `project` and no `.gitignore` is written. Commit `pkg/` so teammates without gd can open the project.
 - Installation rewrites `res://` references written in `preload`, `load`, and `extends` to the placement. Strings, comments, and paths built at run time are not rewritten.
 - `place` only selects where files live. It does not convert gd's own API or syntax for Godot. Shared source should use standard syntax and relative preloads.
@@ -1477,7 +1563,7 @@ A package that only other packages use goes under `pkg/@scope/name@version/`.
 
 ### Settings and environment variables
 
-`gd.json` has these ten settings.
+`gd.json` has these eleven settings.
 
 | Name | Written by `gd init` / when omitted | Meaning |
 |---|---|---|
@@ -1491,20 +1577,24 @@ A package that only other packages use goes under `pkg/@scope/name@version/`.
 | `place` | omitted / `cache`, or `project` beside `project.godot` | Where packages live. `project` copies them under `pkg/` |
 | `godot` | omitted / `false` | Declares a package that runs on upstream Godot without gd's own API |
 | `description` | omitted / empty | Description shown in the registry |
+| `assets` | omitted / none | Godot asset management alias and `channel:publisher/slug[@version]`; installed into `addons/` |
 
 gd reads these environment variables. A script that reads the environment needs the names allowed with `--allow-env`.
 
 | Variable | Purpose |
 |---|---|
 | `GD_CACHE_HOME` | Package cache root. Defaults to `gd` in Windows LocalAppData. On macOS/Linux, uses an absolute `XDG_CACHE_HOME` plus `/gd`, or `.gd` under the home directory. The OS account directory is used when `HOME` is unset |
+| `GD_INSTALL_ROOT` | Where `gd install -g` places commands. `--root` wins |
+| `GD_USER_HOME` | Absolute path for `user://`. By default it is created per script directory in the OS user data folder (`~/Library/Application Support/gd/user` on macOS, `~/.local/share/gd/user` on Linux, `%APPDATA%/gd/user` on Windows) |
 | `GD_REGISTRY` | Registry. Defaults to `https://gd.progsha.com/pkg`. `registry` in `gd.json` wins |
+| `GD_RELEASES` | Release source read by `gd upgrade`. Defaults to `https://github.com/prog-sha/gd/releases` |
 | `GD_TOKEN` | Publish token. Keep it out of config files and pass it only to the publishing process |
 | `LC_ALL`, `LANG` | Language of the manual shown by `gd doc` |
 | `GD_WORKER` | Internal mark set by `--workers`. Not a user setting |
 
 Remote packages and registries use HTTPS. A development registry on loopback may also use HTTP.
 Fetched packages and native libraries are checked against the SHA-256 in the registry index.
-A `.gdextension` manifest is limited to 16 MiB, and all files in a package to 500 MiB in total.
+All files in a package are limited to 500 MiB in total.
 
 ### Distributing a single executable
 
@@ -1520,11 +1610,71 @@ gd compile -o app main.gd
 - From a local path package, files starting with `.` such as `.env` and the `token` in `gd.json` are left out.
 - Do not embed secrets in source. compile excludes `.env`, but values written in source remain in the executable.
 
+## Asset channels
+
+`gd search` includes packages, the public Godot asset catalog, and the reviewed gd catalog. A project using a custom registry searches only that registry.
+
+| Channel | Source |
+|---|---|
+| `official` | [Godot Asset Store](https://store.godotengine.org/) |
+| `gd` | Reviewed gd assets |
+
+Copy an `asset:channel:publisher/name` result directly into `gd add`.
+
+```sh
+gd search dialog
+gd add asset:official:publisher/dialog
+gd add ui asset:gd:publisher/dialog@1.2.0
+gd install --frozen --cached-only
+gd update ui
+gd uninstall ui
+```
+
+- Duplicate version labels require a release ID, such as `asset:official:publisher/dialog@#123`. Quote the complete argument when a label contains spaces.
+- Omitting the channel selects `official`. Failure never redirects resolution to another catalog.
+- `gd.json` records requests under `assets`; `gd.lock` pins the origin, version and SHA-256. Commit both files.
+- Godot assets specified with `asset:` copy the ZIP's `addons/` tree into the project's `addons/`. Asset aliases are management names. Ordinary packages are recorded under `imports` and loaded with `@import`.
+- Initial selection checks engine compatibility and prefers stable releases. Later installs reuse the lock; update selects again. An explicit version such as `@1.2.0` remains fixed during update.
+- `--frozen` preserves the lock; `--cached-only` performs no network requests. Fetch archives before moving offline.
+- Unmanaged or locally edited addon directories are not overwritten. A failed operation restores packages, addons, configuration and the lock together.
+- The gd catalog reviews descriptions, download URLs and SHA-256 values. Archives remain hosted by their authors; gd verifies their digests. The Godot editor does not use this additional digest field and does not provide the same verification.
+
+The source distribution also includes a catalog inspection client:
+
+```sh
+gd tools/store.gd channels
+gd tools/store.gd search official 4.7 dialog
+gd tools/store.gd show gd publisher dialog
+gd tools/store.gd releases gd publisher dialog
+```
+
 ## Scope and reporting
 
 gd is a public release before the API has settled. Do not assume backward compatibility. Changes and the Godot version used as the base
-are recorded in the [CHANGELOG](https://github.com/prog-sha/gd/blob/0.7/CHANGELOG.md).
+are recorded in the [CHANGELOG](https://github.com/prog-sha/gd/blob/master/CHANGELOG.md).
 gd is not an official product of the Godot Foundation or the Godot Engine project.
 
 Report bugs in [Issues](https://github.com/prog-sha/gd/issues). Report vulnerabilities that should not be public through
 [GitHub private reporting](https://github.com/prog-sha/gd/security/advisories/new).
+
+## Features in development (for reference)
+
+The features below are still in development. Their usage and behavior may change without notice. Treat this section as a preview.
+
+### Editor (gd-godot)
+
+`gd editor` opens the editor. The first run installs `gd-godot`, the executable that provides the window.
+
+| Goal | Command |
+|---|---|
+| Open the editor | `gd editor` |
+| Open a chosen project | `gd editor <project directory>` |
+| Run a project in a window | `gd run-game <project directory>` |
+
+See the [gd-godot manual](gd-godot.en.md) for details.
+
+### Online games
+
+`GD.online.match()` creates a server that finds opponents for online games. Rooms announce their address and player count,
+and joining players receive one room with free seats. State lives in process memory, or in a key-value server shared by several processes.
+Marking variables with `@online` to synchronize state between server and clients is also in preparation.

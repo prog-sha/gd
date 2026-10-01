@@ -56,13 +56,13 @@ class GDSQLiteDB : public RefCounted {
 	friend class GDSQLiteStatement;
 
 	// Execute SQL using a cached or newly prepared program.
-	Ref<R> run(const String &p_sql, const Array &p_params, RunMode p_mode, const SafeFlag *p_stop = nullptr);
+	VariantPair run(const String &p_sql, const Array &p_params, RunMode p_mode, const SafeFlag *p_stop = nullptr);
 	// Bind and execute a prepared program.
-	Ref<R> execute(sqlite3_stmt *p_stmt, const Array &p_params, RunMode p_mode);
+	VariantPair execute(sqlite3_stmt *p_stmt, const Array &p_params, RunMode p_mode);
 	// Execute an explicit prepared statement under the connection lock.
-	Ref<R> run_prepared(GDSQLiteStatement *p_owner, const Array &p_params, RunMode p_mode);
+	VariantPair run_prepared(GDSQLiteStatement *p_owner, const Array &p_params, RunMode p_mode);
 	// Bind multiple argument sets to the same prepared statement sequentially.
-	Ref<R> run_many_prepared(GDSQLiteStatement *p_owner, const Array &p_rows);
+	VariantPair run_many_prepared(GDSQLiteStatement *p_owner, const Array &p_rows);
 	// Detach and release an explicit prepared statement.
 	void drop_prepared(GDSQLiteStatement *p_stmt);
 	// Check whether an explicit prepared statement is usable on this connection.
@@ -74,7 +74,7 @@ class GDSQLiteDB : public RefCounted {
 	// Interrupt an operation on another thread for closure.
 	void interrupt();
 	// Prepare and retain a statement for shared Rows.
-	Ref<R> open_rows(GDDatabaseRows *p_rows, const String &p_sql, const Array &p_params, const SafeFlag *p_stop);
+	Ref<Err> open_rows(GDDatabaseRows *p_rows, const String &p_sql, const Array &p_params, const SafeFlag *p_stop);
 	// Advance shared Rows by one row; return true at termination.
 	bool step_rows(GDDatabaseRows *p_rows);
 	// Release a shared Rows statement on its worker.
@@ -88,17 +88,17 @@ public:
 	// Clean up an unclosed connection on destruction.
 	~GDSQLiteDB();
 	// Open an embedded SQL file through mount and permission checks.
-	static Ref<R> open(const String &p_path, const Dictionary &p_opts);
+	static VariantPair open(const String &p_path, const Dictionary &p_opts);
 	// Bind values and execute one SQL statement.
-	Ref<R> exec(const String &p_sql, const Array &p_params) { return run(p_sql, p_params, RUN_EXEC); }
+	VariantPair exec(const String &p_sql, const Array &p_params) { return run(p_sql, p_params, RUN_EXEC); }
 	// Bind values and return read-only SQL rows.
-	Ref<R> query(const String &p_sql, const Array &p_params) { return run(p_sql, p_params, RUN_QUERY); }
+	VariantPair query(const String &p_sql, const Array &p_params) { return run(p_sql, p_params, RUN_QUERY); }
 	// Create a prepared statement that parses SQL once.
-	Ref<R> prepare(const String &p_sql);
+	VariantPair prepare(const String &p_sql);
 	// Bind $N parameters and return the shared database result shape.
-	Ref<R> portable_query(const String &p_sql, const Array &p_params, const SafeFlag *p_stop = nullptr) { return run(p_sql, p_params, RUN_PORTABLE, p_stop); }
+	VariantPair portable_query(const String &p_sql, const Array &p_params, const SafeFlag *p_stop = nullptr) { return run(p_sql, p_params, RUN_PORTABLE, p_stop); }
 	// Bind $N parameters and return only the first shared-query row.
-	Ref<R> portable_row(const String &p_sql, const Array &p_params, const SafeFlag *p_stop = nullptr) { return run(p_sql, p_params, RUN_PORTABLE_ONE, p_stop); }
+	VariantPair portable_row(const String &p_sql, const Array &p_params, const SafeFlag *p_stop = nullptr) { return run(p_sql, p_params, RUN_PORTABLE_ONE, p_stop); }
 	// Close the connection.
 	void close();
 	// Check whether the connection is usable.
@@ -122,13 +122,13 @@ public:
 	// Release the embedded SQL execution program on destruction.
 	~GDSQLiteStatement();
 	// Execute a write statement and return affected rows.
-	Ref<R> run(const Array &p_params);
+	VariantPair run(const Array &p_params);
 	// Execute a write statement for multiple argument sets.
-	Ref<R> run_many(const Array &p_rows);
+	VariantPair run_many(const Array &p_rows);
 	// Return the first read-only query row.
-	Ref<R> one(const Array &p_params);
+	VariantPair one(const Array &p_params);
 	// Return all read-only query rows.
-	Ref<R> all(const Array &p_params);
+	VariantPair all(const Array &p_params);
 	// Release the prepared statement explicitly.
 	void close();
 	// Check whether both statement and connection are usable.

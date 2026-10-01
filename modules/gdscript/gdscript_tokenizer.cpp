@@ -33,7 +33,8 @@
 #include "core/error/error_macros.h"
 #include "core/string/char_utils.h"
 
-#ifdef DEBUG_ENABLED
+#if defined(DEBUG_ENABLED) && defined(GD_VIEW)
+#include "servers/text/text_server.h"
 #endif
 
 static const char *token_names[] = {
@@ -582,6 +583,16 @@ GDScriptTokenizer::Token GDScriptTokenizerText::potential_identifier() {
 	if (!only_ascii) {
 		// Kept here in case the order with push_error matters.
 		Token id = make_identifier(name);
+
+#if defined(DEBUG_ENABLED) && defined(GD_VIEW)
+		// Reject identifiers that look like keywords when the text server can compare them.
+		if (TS->has_feature(TextServer::FEATURE_UNICODE_SECURITY)) {
+			int64_t confusable = TS->is_confusable(name, keyword_list);
+			if (confusable >= 0) {
+				push_error(vformat(R"(Identifier "%s" is visually similar to the GDScript keyword "%s" and thus not allowed.)", name, keyword_list[confusable]));
+			}
+		}
+#endif // DEBUG_ENABLED && GD_VIEW
 
 		// Cannot be a keyword, as keywords are ASCII only.
 		return id;

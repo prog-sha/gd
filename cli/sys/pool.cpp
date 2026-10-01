@@ -77,7 +77,7 @@ void TextCall::dispatch() {
 		Callable::CallError error;
 		GDScriptFunction::SuspendableCall suspendable;
 		const Variant result = script->callp(SNAME("_to_string"), nullptr, 0, error);
-		if (error.error == Callable::CallError::CALL_OK) {
+		if (error.error == Callable::CallError::CALL_OK && !error.runtime_failed) {
 			continuation = result;
 			if (continuation.is_valid()) {
 				continuation->connect(SNAME("completed"), callable_mp(this, &TextCall::complete), Object::CONNECT_ONE_SHOT);

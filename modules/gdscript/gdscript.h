@@ -36,6 +36,7 @@
 #include "core/debugger/script_debugger.h"
 #include "core/doc_data.h"
 #include "core/object/script_language.h"
+#include "core/templates/hash_set.h"
 #include "core/templates/rb_set.h"
 
 class GDScriptNativeClass : public RefCounted {
@@ -187,6 +188,9 @@ private:
 	Vector<uint8_t> binary_tokens;
 	String path;
 	bool path_valid = false; // False if using default path.
+	bool online_client = false; // Whether this is a Client copy; cached so assignments don't check the path.
+	bool online_authority = false; // Whether this is the Online-side copy; @online_input is writable only on the owner's client.
+	bool online_dynamic = true; // Whether the path marks an unsaved or generated script; cached so calls don't check the path.
 	StringName local_name; // Inner class identifier or `class_name`.
 	StringName global_name; // `class_name`.
 	String fully_qualified_name;
@@ -291,6 +295,8 @@ public:
 
 	virtual StringName get_instance_base_type() const override; // this may not work in all scripts, will return empty if so
 	virtual ScriptInstance *instance_create(Object *p_this) override;
+	// Attach script state for a copy without invoking a constructor again.
+	ScriptInstance *instance_create_without_constructor(Object *p_this);
 	virtual PlaceHolderScriptInstance *placeholder_instance_create(Object *p_this) override;
 
 	virtual bool has_source_code() const override;
@@ -311,6 +317,9 @@ public:
 	virtual void set_path_cache(const String &p_path) override;
 	virtual void set_path(const String &p_path, bool p_take_over = false) override;
 	String get_script_path() const;
+	_FORCE_INLINE_ bool is_online_client() const { return online_client; }
+	_FORCE_INLINE_ bool is_online_guarded() const { return online_client || online_authority; }
+	_FORCE_INLINE_ bool is_online_dynamic() const { return online_dynamic; }
 	Error load_source_code(const String &p_path);
 
 	void set_binary_tokens_source(const Vector<uint8_t> &p_binary_tokens);
@@ -379,6 +388,10 @@ class GDScriptInstance : public ScriptInstance {
 
 public:
 	virtual Object *get_owner() { return owner; }
+	static HashSet<String> told_read_only; // Names already reported, so the same script and name is reported only once.
+	void online_refuse(const StringName &p_name) const; // Report once why a write from the Client is refused.
+	bool online_read_only_member(int p_index) const; // Decide by member index whether a Client-side assignment hits a synced variable.
+	mutable Vector<int8_t> online_guard; // Cached answer per index: 0 unseen, 1 writable, 2 refused (Online value), 3 input (owner only), 4 broadcast Online value (report writes to the collector).
 
 	virtual bool set(const StringName &p_name, const Variant &p_value);
 	virtual bool get(const StringName &p_name, Variant &r_ret) const;

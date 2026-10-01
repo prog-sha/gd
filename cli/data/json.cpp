@@ -587,19 +587,19 @@ public:
 	}
 
 	// Validate options and retain the root for incremental traversal.
-	Ref<R> prepare(const Variant &p_value, const Dictionary &p_opts) {
+	Ref<Err> prepare(const Variant &p_value, const Dictionary &p_opts) {
 		static const char *known[] = { "deterministic", "escape_html", "max_bytes", "max_depth", nullptr }; // Accepted configuration names.
 		for (const KeyValue<Variant, Variant> &kv : p_opts) {
 			if (kv.key.get_type() != Variant::STRING && kv.key.get_type() != Variant::STRING_NAME) {
-				return R::err("JSON option name must be a string", Err::INVALID_DATA);
+				return Err::make("JSON option name must be a string", Err::INVALID_DATA);
 			}
 			const String name = kv.key;
 			int at = 0;
 			while (known[at] && name != known[at]) at++;
-			if (!known[at]) return R::err("unknown JSON option: " + name, Err::INVALID_DATA);
+			if (!known[at]) return Err::make("unknown JSON option: " + name, Err::INVALID_DATA);
 			const Variant::Type type = at < 2 ? Variant::BOOL : Variant::INT;
 			if (kv.value.get_type() != type) {
-				return R::err(vformat("JSON option %s must be %s", name, Variant::get_type_name(type)), Err::INVALID_DATA);
+				return Err::make(vformat("JSON option %s must be %s", name, Variant::get_type_name(type)), Err::INVALID_DATA);
 			}
 		}
 		deterministic = p_opts.get("deterministic", false);
@@ -607,12 +607,12 @@ public:
 		const int64_t bytes = p_opts.get("max_bytes", 0);
 		const int64_t depth = p_opts.get("max_depth", 0);
 		if (bytes < 0 || depth < 0 || depth > INT32_MAX) {
-			return R::err("JSON limits are out of range", Err::INVALID_DATA);
+			return Err::make("JSON limits are out of range", Err::INVALID_DATA);
 		}
 		max_bytes = bytes;
 		max_depth = depth;
 		push(VALUE, p_value);
-		return Ref<R>();
+		return Ref<Err>();
 	}
 
 	// Resume traversal, returning false when the current time slice ends.
@@ -711,20 +711,20 @@ public:
 		return true;
 	}
 
-	// Materialize the public success-or-error object only when the caller needs it.
-	Ref<R> result() const {
-		return why.is_empty() ? R::ok(out) : R::err(why, kind);
+	// Return separate result slots after the traversal completes.
+	VariantPair result() const {
+		return { out, why.is_empty() ? Variant() : Variant(Err::make(why, kind)) };
 	}
 
 	// Transfer successful response bytes without allocating an intermediate result object.
 	Variant reply() const {
-		return why.is_empty() ? Variant(out) : Variant(result());
+		return why.is_empty() ? Variant(out) : Variant(Err::make(why, kind));
 	}
 
 	// Complete the same encoder synchronously on its owning worker.
-	Ref<R> encode(const Variant &p_value, const Dictionary &p_opts) {
-		const Ref<R> error = prepare(p_value, p_opts);
-		if (error.is_valid()) return error;
+	VariantPair encode(const Variant &p_value, const Dictionary &p_opts) {
+		const Ref<Err> error = prepare(p_value, p_opts);
+		if (error.is_valid()) return { Variant(), error };
 		advance();
 		return result();
 	}
@@ -744,10 +744,12 @@ void keep_encoder(const std::shared_ptr<StrictJSONOut> &p_encoder) {
 }
 
 // Keep the outgoing bytes or error alive before returning idle traversal storage.
-Variant encoded_reply(const std::shared_ptr<StrictJSONOut> &p_encoder, const std::function<Variant(const Variant &)> &p_finish) {
+VariantPair encoded_reply(const std::shared_ptr<StrictJSONOut> &p_encoder, const std::function<VariantPair(const VariantPair &)> &p_finish) {
 	const Variant result = p_encoder->reply();
 	keep_encoder(p_encoder);
-	return p_finish ? p_finish(result) : result;
+	const Ref<Err> error = result;
+	const VariantPair pair = error.is_valid() ? VariantPair{ Variant(), error } : VariantPair{ result, Variant() };
+	return p_finish ? p_finish(pair) : pair;
 }
 
 // Decode four hexadecimal digits in a JSON string.
@@ -1286,15 +1288,15 @@ public:
 
 	// Distinguish unfinished work from a completed value or parsing failure.
 	bool failed() const { return !why.is_empty(); }
-	Ref<R> result() const { return failed() ? R::err(why, Err::INVALID_DATA) : R::ok(root); }
+	VariantPair result() const { return { root, failed() ? Variant(Err::make(why, Err::INVALID_DATA)) : Variant() }; }
 };
 
 } // namespace
 
 // Validate a value and encode it as UTF-8 JSON bytes.
-Ref<R> JsonData::encode(const Variant &p_value, const Dictionary &p_opts) {
+VariantPair JsonData::encode(const Variant &p_value, const Dictionary &p_opts) {
 	auto encoder = take_encoder();
-	const Ref<R> result = encoder->encode(p_value, p_opts);
+	const VariantPair result = encoder->encode(p_value, p_opts);
 	keep_encoder(encoder);
 	return result;
 }
@@ -1303,19 +1305,19 @@ Ref<R> JsonData::encode(const Variant &p_value, const Dictionary &p_opts) {
 // Immediate replies avoid allocating a worker job and suspending the handler for an
 // already-complete value. The shared deadline protects other requests; its expiry
 // moves the same encoder state to a worker, without truncating or serializing twice.
-// The native-callback probe in tests/net/encode detects unnecessary suspension here.
-Variant JsonData::encode_reply(const Variant &p_value, uint64_t p_until, std::function<Variant(const Variant &)> p_finish) {
+// A native-callback probe detects unnecessary suspension here.
+VariantPair JsonData::encode_reply(const Variant &p_value, uint64_t p_until, std::function<VariantPair(const VariantPair &)> p_finish) {
 	auto encoder = take_encoder();
 	encoder->start_reply(p_value);
 	if (encoder->advance(p_until)) return encoded_reply(encoder, p_finish);
-	return GDValueCall::start([encoder, finish = std::move(p_finish)]() -> Variant {
+	return { GDPairCall::start([encoder, finish = std::move(p_finish)]() -> VariantPair {
 		encoder->advance();
 		return encoded_reply(encoder, finish);
-	});
+	}), Variant() };
 }
 
 // Validate JSON bytes and convert them to runtime values.
-Ref<R> JsonData::decode(const PackedByteArray &p_src) {
+VariantPair JsonData::decode(const PackedByteArray &p_src) {
 	StrictJSON scan;
 	scan.parse(p_src);
 	return scan.result();
@@ -1327,14 +1329,16 @@ Ref<R> JsonData::decode(const PackedByteArray &p_src) {
 // The work quantum is a handoff threshold, not a JSON size limit. Move the scanner's
 // position, partial strings and container stack intact; restarting would duplicate
 // work, while a separate fast parser could disagree on UTF-8, duplicate keys or errors.
-Variant JsonData::decode_reply(const PackedByteArray &p_src, uint64_t p_until) {
+VariantPair JsonData::decode_reply(const PackedByteArray &p_src, uint64_t p_until) {
 	StrictJSON scan;
-	if (scan.parse(p_src, p_until) || scan.failed()) return scan.result();
+	if (scan.parse(p_src, p_until) || scan.failed()) {
+		return scan.result();
+	}
 	auto pending = std::make_shared<StrictJSON>(std::move(scan));
-	return GDValueCall::start([pending = std::move(pending), bytes = p_src]() mutable -> Variant {
+	return { GDPairCall::start([pending = std::move(pending), bytes = p_src]() mutable -> VariantPair {
 		pending->parse(bytes);
-		const Ref<R> result = pending->result();
+		const VariantPair result = pending->result();
 		pending.reset(); // Destroy rejected partial containers on the worker that parsed them.
 		return result;
-	});
+	}), Variant() };
 }

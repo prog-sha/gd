@@ -64,12 +64,14 @@ Error ZIPReader::close() {
 }
 
 PackedStringArray ZIPReader::get_files() {
+	last_error = ERR_FILE_CORRUPT;
 	ERR_FAIL_COND_V_MSG(fa.is_null(), PackedStringArray(), "ZIPReader must be opened before use.");
 
-	unz_global_info gi;
-	int err = unzGetGlobalInfo(uzf, &gi);
+	unz_global_info64 gi;
+	int err = unzGetGlobalInfo64(uzf, &gi);
 	ERR_FAIL_COND_V(err != UNZ_OK, PackedStringArray());
 	if (gi.number_entry == 0) {
+		last_error = OK;
 		return PackedStringArray();
 	}
 
@@ -82,10 +84,11 @@ PackedStringArray ZIPReader::get_files() {
 		String filepath;
 
 		err = godot_unzip_get_current_file_info(uzf, file_info, filepath);
-		if (err == UNZ_OK) {
-			s.push_back(filepath);
-		}
-	} while (unzGoToNextFile(uzf) == UNZ_OK);
+		ERR_FAIL_COND_V(err != UNZ_OK, PackedStringArray());
+		s.push_back(filepath);
+		err = unzGoToNextFile(uzf);
+	} while (err == UNZ_OK);
+	ERR_FAIL_COND_V(err != UNZ_END_OF_LIST_OF_FILE || uint64_t(s.size()) != gi.number_entry, PackedStringArray());
 
 	PackedStringArray arr;
 	arr.resize(s.size());
@@ -93,11 +96,13 @@ PackedStringArray ZIPReader::get_files() {
 	for (const List<String>::Element *E = s.front(); E; E = E->next()) {
 		arr.set(idx++, E->get());
 	}
+	last_error = OK;
 	return arr;
 }
 
 // Validate the selected file's 64-bit declared length and return it only after CRC verification.
 PackedByteArray ZIPReader::read_file(const String &p_path, bool p_case_sensitive) {
+	last_error = ERR_FILE_CORRUPT;
 	ERR_FAIL_COND_V_MSG(fa.is_null(), PackedByteArray(), "ZIPReader must be opened before use.");
 
 	int err = UNZ_OK;
@@ -139,6 +144,7 @@ PackedByteArray ZIPReader::read_file(const String &p_path, bool p_case_sensitive
 	// Verify the data and return.
 	err = unzCloseCurrentFile(uzf);
 	ERR_FAIL_COND_V_MSG(err != UNZ_OK, PackedByteArray(), "CRC error reading file from zip archive.");
+	last_error = OK;
 	return data;
 }
 
@@ -185,6 +191,7 @@ ZIPReader::~ZIPReader() {
 }
 
 void ZIPReader::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("get_last_error"), &ZIPReader::get_last_error);
 	ClassDB::bind_method(D_METHOD("open", "path"), &ZIPReader::open);
 	ClassDB::bind_method(D_METHOD("close"), &ZIPReader::close);
 	ClassDB::bind_method(D_METHOD("get_files"), &ZIPReader::get_files);

@@ -23,6 +23,7 @@
 
 class GDDatabaseClient;
 class GDDatabaseTxCall;
+class GDDatabaseRetryCall;
 
 // Create remote SQL connections and pools through one entry point.
 class GDPostgresAPI : public Object {
@@ -64,7 +65,7 @@ protected:
 
 public:
 	// Open a mounted embedded database.
-	Ref<R> open(const String &p_path, const Dictionary &p_opts) const { return GDSQLiteDB::open(p_path, p_opts); }
+	VariantPair open(const String &p_path, const Dictionary &p_opts) const { return GDSQLiteDB::open(p_path, p_opts); }
 };
 
 // Query the same connection only within its transaction.
@@ -108,12 +109,18 @@ class GDDatabaseTxCall : public RefCounted {
 
 	Ref<GDDatabaseTxCall> self_hold; // Keep this operation alive until completion is delivered.
 	Ref<GDDatabaseClient> owner; // Client owning the transaction's physical connection.
+	Ref<GDPostgresClient> postgres; // Connection leased only for this transaction.
+	Ref<GDPostgresPoolCall> acquire_call; // Pending pool acquisition canceled independently of its owner.
+	Ref<GDPostgresPoolCall> lease; // Lease returned after this transaction ends.
+	HashSet<GDDatabaseRows *> rows; // Sequential results closed before transaction termination.
 	Ref<GDDatabaseTx> tx; // Dedicated client passed to the callback.
 	Callable action; // Callback executed inside the transaction.
 	Array statements; // SQL statements applied sequentially by a migration.
-	Ref<R> outcome; // Callback result or failed-statement result.
-	Ref<R> pending; // Closure or cancellation result delivered on the next runtime turn.
+	VariantPair outcome; // Callback value and error or failed-statement result.
+	VariantPair pending; // Closure or cancellation delivered on the next runtime turn.
+	bool pending_set = false; // Distinguish a scheduled result from an empty success.
 	uint64_t generation = 0; // Generation distinguishing this transaction from others.
+	uint64_t scope = 0; // Logical coroutine scope for callback reentry checks.
 	int at = 0; // Index of the next statement.
 	Mode mode = ACTION;
 	bool finished = false; // Prevent duplicate completion.
@@ -122,23 +129,23 @@ class GDDatabaseTxCall : public RefCounted {
 	bool close_after_end = false; // Close the connection after receiving the COMMIT result.
 
 	// Proceed from BEGIN to the callback or migration.
-	void on_begin(const Ref<R> &p_result);
+	void on_begin(const Variant &p_value, const Variant &p_error);
 	// Acquire a dedicated pool connection and proceed to BEGIN.
-	void on_acquire(const Ref<R> &p_result);
+	void on_acquire(const Variant &p_value, const Variant &p_error);
 	// Pass the dedicated transaction client as the callback's ordinary argument.
-	Variant call_action();
+	VariantPair call_action();
 	// Choose COMMIT or ROLLBACK from the callback result.
-	void on_action(const Variant &p_result);
+	void on_action(const Variant &p_value, const Variant &p_error);
 	// Send the next migration statement.
 	void next_statement();
 	// Proceed to the next statement or ROLLBACK from the statement result.
-	void on_statement(const Ref<R> &p_result);
+	void on_statement(const Variant &p_value, const Variant &p_error);
 	// Send COMMIT or ROLLBACK.
 	void end(bool p_commit);
 	// Convert transaction termination into the final outcome.
-	void on_end(const Ref<R> &p_result);
+	void on_end(const Variant &p_value, const Variant &p_error);
 	// Deliver the final result exactly once.
-	void done(const Ref<R> &p_result, bool p_close);
+	void done(const VariantPair &p_result, bool p_close);
 	// Report rollback caused by owner closure as completion.
 	void owner_closed();
 	// Defer closure until the result is known after sending COMMIT.
@@ -166,11 +173,38 @@ public:
 	bool is_active() const;
 };
 
+// Retry the complete transaction after a serialization conflict.
+class GDDatabaseRetryCall : public RefCounted {
+	GDCLASS(GDDatabaseRetryCall, RefCounted);
+
+	Ref<GDDatabaseRetryCall> self_hold; // Keep the retry operation alive through its final result.
+	Ref<GDDatabaseClient> owner; // Client creating each fresh transaction.
+	Ref<GDDatabaseTxCall> active; // Current transaction canceled with the outer operation.
+	Callable action; // Transaction body invoked once for every attempt.
+	int tries = 0; // Number of transactions already started.
+	bool canceled = false; // Prevent another attempt after caller cancellation.
+	bool finished = false; // Deliver only one result.
+
+	void run(); // Start one complete transaction.
+	void on_result(const Variant &p_value, const Variant &p_error); // Decide whether the result can be retried.
+	void on_delay(const Variant &p_value); // Resume after a nonblocking retry delay.
+	void done(const Variant &p_value, const Variant &p_error); // Publish the final pair.
+
+	friend class GDDatabaseClient;
+
+protected:
+	static void _bind_methods();
+
+public:
+	void cancel(); // Stop the active transaction or pending retry.
+};
+
 // Return embedded SQL worker results through main-thread signals.
 class GDDatabaseCall : public RefCounted {
 	GDCLASS(GDDatabaseCall, RefCounted);
 
 	Ref<GDDatabaseCall> self_hold; // Keep this operation alive until its result is delivered.
+	Ref<GDDatabaseCall> forward_hold; // Keep a deferred wrapper alive until its worker reply arrives.
 	Ref<GDDatabaseClient> owner; // Retain the client used by the worker.
 	Ref<GDSQLiteDB> sqlite; // embedded SQL connection used by the worker.
 	String sql; // SQL passed to the worker.
@@ -181,14 +215,17 @@ class GDDatabaseCall : public RefCounted {
 	bool wait_recorded = false; // Whether the wait duration has been accumulated.
 	bool one = false; // Whether the query returns only the first row.
 	bool rows_open = false; // Whether the query prepares sequential embedded SQL Rows.
+	bool deferred = false; // Whether a transaction must finish before this operation starts.
 	Ref<GDDatabaseRows> rows; // Sequential Rows attached to a statement on the worker.
-	Ref<R> result; // Result transferred from worker to main thread.
+	VariantPair result; // Native value and error transferred from worker to main thread.
 	SafeFlag ready; // Whether the main thread can read result.
 	SafeFlag completed; // Accept only the first completion.
 	SafeFlag canceled; // Notify the worker of per-operation cancellation.
 
 	// Publish embedded SQL worker results safely.
-	void complete(const Ref<R> &p_result);
+	void complete(const VariantPair &p_result);
+	// Retain or close a forwarded Rows result when the caller has canceled.
+	void forward(const Variant &p_value, const Variant &p_error);
 	// Emit completed results on the main thread.
 	void step();
 	// Release the self-reference without awaiting a signal at process shutdown.
@@ -220,6 +257,7 @@ class GDDatabaseClient : public RefCounted {
 	Semaphore sqlite_consumed; // Notify the worker that the main thread delivered a result.
 	List<Ref<GDDatabaseCall>> sqlite_jobs; // embedded SQL operations in arrival order.
 	Ref<GDDatabaseCall> sqlite_active; // embedded SQL operation currently executing on the worker.
+	List<Ref<GDDatabaseCall>> sqlite_deferred; // Shared calls waiting for transaction ownership.
 	Ref<GDDatabaseRows> sqlite_rows; // Rows retaining the embedded SQL connection until closed.
 	Ref<GDDatabaseRows> sqlite_rows_job; // Rows advanced next by the worker.
 	bool sqlite_rows_close = false; // Whether the next Rows job closes its statement.
@@ -231,8 +269,10 @@ class GDDatabaseClient : public RefCounted {
 	int max_rows = 0; // Explicit result-row limit; zero is unlimited.
 	int max_bytes = 0; // Explicit result-byte limit; zero is unlimited.
 	bool opening = false; // Whether a remote SQL open result is pending.
+	bool closing = false; // Await a sent pooled COMMIT before closing its connection.
 	uint64_t open_generation = 0; // Generation used to ignore stale remote SQL open results.
 	Ref<GDDatabaseTxCall> tx_call; // Transaction occupying the connection.
+	HashSet<GDDatabaseTxCall *> pool_txs; // Independent transactions on pooled connections.
 	HashSet<GDDatabaseRows *> tx_rows; // Sequential Rows closed before transaction termination.
 	uint64_t tx_generation = 0; // Generation used to validate transaction clients.
 	bool tx_active = false; // Exclude ordinary queries while a transaction is active.
@@ -246,25 +286,29 @@ class GDDatabaseClient : public RefCounted {
 	// Enter the embedded SQL worker through the thread's C callback.
 	static void sqlite_entry(void *p_self);
 	// Receive remote SQL open results and restore reusability on failure.
-	void postgres_opened(const Ref<R> &p_result, const Ref<GDDatabaseCall> &p_call,
+	void postgres_opened(const Variant &p_value, const Variant &p_error, const Ref<GDDatabaseCall> &p_call,
 			const Ref<GDPostgresClient> &p_expected, uint64_t p_generation);
 	// Forward remote SQL pool configuration results to the shared open operation.
-	void postgres_pool_opened(const Ref<R> &p_result, const Ref<GDDatabaseCall> &p_call,
+	void postgres_pool_opened(const Variant &p_value, const Variant &p_error, const Ref<GDDatabaseCall> &p_call,
 			const Ref<GDPostgresPool> &p_expected, uint64_t p_generation);
 	// Adopt a worker-opened embedded SQL connection and start its query worker.
-	void sqlite_opened(const Ref<R> &p_result, const Ref<GDDatabaseCall> &p_call, uint64_t p_generation);
+	void sqlite_opened(const Variant &p_value, const Variant &p_error, const Ref<GDDatabaseCall> &p_call, uint64_t p_generation);
 	// Close the embedded SQL worker and connection safely.
 	void close_sqlite();
+	// Start shared calls in arrival order after the transaction releases its connection.
+	void dispatch_deferred();
+	// Hold one shared query until the active transaction releases its connection.
+	Signal defer_sqlite(const String &p_sql, const Array &p_args, bool p_one, bool p_rows);
 	// Receive completion of the I/O worker's embedded SQL shutdown wait.
-	void sqlite_closed(const Ref<R> &p_result);
+	void sqlite_closed(const Variant &p_value, const Variant &p_error);
 	// Deliver embedded SQL results on the main thread and let the worker proceed.
 	void sqlite_finished(GDDatabaseCall *p_call, const Ref<GDSQLiteDB> &p_sqlite, int64_t p_queued_bytes);
 	// Stop opening or embedded SQL operations whose contexts ended.
 	void cancel_call(GDDatabaseCall *p_call);
 	// Execute shared SQL without checking transaction occupancy.
-	Signal query_inner(const String &p_sql, const Array &p_args, bool p_one = false);
+	Signal query_inner(const String &p_sql, const Array &p_args, bool p_one = false, bool p_tx = false);
 	// Open sequential Rows without checking transaction occupancy.
-	Signal query_rows_inner(const String &p_sql, const Array &p_args);
+	Signal query_rows_inner(const String &p_sql, const Array &p_args, bool p_tx = false);
 	// Send SQL through the transaction's dedicated connection.
 	Signal query_tx(uint64_t p_generation, const String &p_sql, const Array &p_args, bool p_one = false);
 	// Open sequential Rows through the transaction's dedicated connection.
@@ -272,7 +316,7 @@ class GDDatabaseClient : public RefCounted {
 	// Dispatch embedded SQL Rows Next or Close to the dedicated worker.
 	bool request_sqlite_rows(GDDatabaseRows *p_rows, bool p_close);
 	// Track transaction Rows for cleanup at transaction end.
-	void track_tx_rows(const Ref<GDDatabaseRows> &p_rows);
+	void track_tx_rows(const Ref<GDDatabaseRows> &p_rows, uint64_t p_generation = 0);
 	// Remove closed Rows from transaction cleanup tracking.
 	void untrack_tx_rows(GDDatabaseRows *p_rows, uint64_t p_generation);
 	// Close Rows from the same generation before COMMIT or ROLLBACK.
@@ -316,6 +360,10 @@ public:
 	Signal transaction(const Callable &p_action);
 	// Return transaction's completion signal without waiting, for composition.
 	Signal transaction_async(const Callable &p_action) { return transaction(p_action); }
+	// Retry the complete transaction only after serialization error code 40001.
+	Signal serialize(const Callable &p_action);
+	// Return serialize's completion signal without waiting.
+	Signal serialize_async(const Callable &p_action) { return serialize(p_action); }
 	// Apply SQL statements sequentially in one transaction.
 	Signal migrate(const Array &p_statements);
 	// Return migration's completion signal without waiting, for composition.

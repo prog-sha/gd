@@ -14,3 +14,7 @@ if env.editor_build:
 
 env.modules_sources += module_obj
 
+if env["tests"]:
+    # Compile the session tests into this module.
+    env_mp.add_source_files(env.modules_sources, "./tests/*.cpp")
+

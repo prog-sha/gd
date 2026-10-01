@@ -266,6 +266,9 @@ public:
 	}
 
 	virtual void validated_call(Object *p_object, const Variant **p_args, Variant *r_ret) const override {
+		if constexpr (std::is_same_v<R, VariantPair>) {
+			ERR_FAIL_MSG("A paired method requires two result destinations.");
+		} else {
 #ifdef TOOLS_ENABLED
 		ERR_FAIL_COND_MSG(p_object && p_object->is_extension_placeholder() && p_object->get_class_name() == get_instance_class(), vformat("Cannot call method bind '%s' on placeholder instance.", MethodBind::get_name()));
 #endif
@@ -274,9 +277,13 @@ public:
 #else
 		call_with_validated_object_instance_args_ret(reinterpret_cast<MB_T *>(p_object), method, p_args, r_ret);
 #endif
+		}
 	}
 
 	virtual void ptrcall(Object *p_object, const void **p_args, void *r_ret) const override {
+		if constexpr (std::is_same_v<R, VariantPair>) {
+			ERR_FAIL_MSG("A paired method requires two result destinations.");
+		} else {
 #ifdef TOOLS_ENABLED
 		ERR_FAIL_COND_MSG(p_object && p_object->is_extension_placeholder() && p_object->get_class_name() == get_instance_class(), vformat("Cannot call method bind '%s' on placeholder instance.", MethodBind::get_name()));
 #endif
@@ -285,6 +292,7 @@ public:
 #else
 		call_with_ptr_args_ret<MB_T, R, P...>(reinterpret_cast<MB_T *>(p_object), method, p_args, r_ret);
 #endif
+		}
 	}
 
 	MethodBindTR(R (MB_T::*p_method)(P...)) {
@@ -361,6 +369,9 @@ public:
 	}
 
 	virtual void validated_call(Object *p_object, const Variant **p_args, Variant *r_ret) const override {
+		if constexpr (std::is_same_v<R, VariantPair>) {
+			ERR_FAIL_MSG("A paired method requires two result destinations.");
+		} else {
 #ifdef TOOLS_ENABLED
 		ERR_FAIL_COND_MSG(p_object && p_object->is_extension_placeholder() && p_object->get_class_name() == get_instance_class(), vformat("Cannot call method bind '%s' on placeholder instance.", MethodBind::get_name()));
 #endif
@@ -369,9 +380,13 @@ public:
 #else
 		call_with_validated_object_instance_args_retc(reinterpret_cast<MB_T *>(p_object), method, p_args, r_ret);
 #endif
+		}
 	}
 
 	virtual void ptrcall(Object *p_object, const void **p_args, void *r_ret) const override {
+		if constexpr (std::is_same_v<R, VariantPair>) {
+			ERR_FAIL_MSG("A paired method requires two result destinations.");
+		} else {
 #ifdef TOOLS_ENABLED
 		ERR_FAIL_COND_MSG(p_object && p_object->is_extension_placeholder() && p_object->get_class_name() == get_instance_class(), vformat("Cannot call method bind '%s' on placeholder instance.", MethodBind::get_name()));
 #endif
@@ -380,6 +395,7 @@ public:
 #else
 		call_with_ptr_args_retc<MB_T, R, P...>(reinterpret_cast<MB_T *>(p_object), method, p_args, r_ret);
 #endif
+		}
 	}
 
 	MethodBindTRC(R (MB_T::*p_method)(P...) const) {
@@ -505,12 +521,20 @@ public:
 	}
 
 	virtual void validated_call(Object *p_object, const Variant **p_args, Variant *r_ret) const override {
-		call_with_validated_variant_args_static_method_ret(function, p_args, r_ret);
+		if constexpr (std::is_same_v<R, VariantPair>) {
+			ERR_FAIL_MSG("A paired method requires two result destinations.");
+		} else {
+			call_with_validated_variant_args_static_method_ret(function, p_args, r_ret);
+		}
 	}
 
 	virtual void ptrcall(Object *p_object, const void **p_args, void *r_ret) const override {
-		(void)p_object;
-		call_with_ptr_args_static_method_ret(function, p_args, r_ret);
+		if constexpr (std::is_same_v<R, VariantPair>) {
+			ERR_FAIL_MSG("A paired method requires two result destinations.");
+		} else {
+			(void)p_object;
+			call_with_ptr_args_static_method_ret(function, p_args, r_ret);
+		}
 	}
 
 	MethodBindTRS(R (*p_function)(P...)) {

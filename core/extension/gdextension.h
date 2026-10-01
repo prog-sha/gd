@@ -122,7 +122,6 @@ class GDExtension : public Resource {
 	GDExtensionMainLoopShutdownCallback shutdown_callback = nullptr;
 	GDExtensionMainLoopFrameCallback frame_callback = nullptr;
 	HashMap<String, String> await_classes; // Types obtained after awaiting signals.
-	HashMap<String, String> result_classes; // Successful value types carried by R.
 
 	// Apply manifest type metadata to registered classes.
 	void apply_type_metadata();
@@ -137,7 +136,7 @@ public:
 	HashMap<String, String> class_icon_paths;
 
 	// Store manifest type metadata for use after class initialization.
-	void set_type_metadata(const HashMap<String, String> &p_await, const HashMap<String, String> &p_result);
+	void set_type_metadata(const HashMap<String, String> &p_await);
 
 	virtual bool editor_can_reload_from_file() override { return false; } // Reloading is handled in a special way.
 

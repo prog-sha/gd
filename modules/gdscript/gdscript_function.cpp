@@ -31,6 +31,7 @@
 #include "gdscript_function.h"
 
 #include "cli/sys/sched.h"
+#include "cli/sys/std.h"
 #include "cli/sys/task.h"
 
 #include "gdscript.h"
@@ -266,6 +267,7 @@ uint32_t GDScriptFunctionState::run_at = 0;
 // Append a continuation to the runtime's shared FIFO.
 Error GDScriptFunctionState::schedule() {
 	Ref<GDScriptFunctionState> self(this);
+	Async::preempted(true);
 	run_queue.push_back(self);
 	IdleWait::wake();
 	return OK;
@@ -282,6 +284,7 @@ void GDScriptFunctionState::clear_scheduler() {
 
 // Advance a runtime-selected continuation for one time slice.
 void GDScriptFunctionState::_scheduler_run() {
+	Async::preempted(false);
 	resume();
 }
 
@@ -306,7 +309,30 @@ Variant GDScriptFunctionState::_signal_callback(const Variant **p_args, int p_ar
 		r_error.error = Callable::CallError::CALL_ERROR_TOO_FEW_ARGUMENTS;
 		r_error.expected = 1;
 		return Variant();
-	} else if (p_argcount == 1) {
+	}
+	Ref<GDScriptFunctionState> self = *p_args[p_argcount - 1];
+	if (self.is_null()) {
+		r_error.error = Callable::CallError::CALL_ERROR_INVALID_ARGUMENT;
+		r_error.argument = p_argcount - 1;
+		r_error.expected = Variant::OBJECT;
+		return Variant();
+	}
+	if (self->state.awaited_child.is_valid() && self->state.awaited_child->runtime_faulted) {
+		self->state.runtime_fault = true;
+	}
+	self->state.awaited_child.unref();
+	if (self->state.result_pair_signal) {
+		if (p_argcount == 3) {
+			const Variant &error = *p_args[1];
+			const Ref<Err> failure = error;
+			const bool empty_error = error.get_type() == Variant::NIL || (error.get_type() == Variant::OBJECT && error.get_validated_object() == nullptr);
+			self->state.result_error = empty_error || failure.is_valid() ? error : Variant(Err::make("completion error must be Err", Err::INVALID_DATA));
+			return self->resume(*p_args[0]);
+		}
+		self->state.result_error = Err::make("completion signal needs a value and Err", Err::INVALID_DATA);
+		return self->resume(Variant());
+	}
+	if (p_argcount == 1) {
 		//noooneee
 	} else if (p_argcount == 2) {
 		arg = *p_args[0];
@@ -316,15 +342,6 @@ Variant GDScriptFunctionState::_signal_callback(const Variant **p_args, int p_ar
 			extra_args.push_back(*p_args[i]);
 		}
 		arg = extra_args;
-	}
-
-	Ref<GDScriptFunctionState> self = *p_args[p_argcount - 1];
-
-	if (self.is_null()) {
-		r_error.error = Callable::CallError::CALL_ERROR_INVALID_ARGUMENT;
-		r_error.argument = p_argcount - 1;
-		r_error.expected = Variant::OBJECT;
-		return Variant();
 	}
 
 	return resume(arg);
@@ -371,14 +388,20 @@ Variant GDScriptFunctionState::resume(const Variant &p_arg) {
 
 	state.result = p_arg;
 	Callable::CallError err;
+	Variant pair_error;
+	err.result_error = state.pair_return ? &pair_error : nullptr;
+	const uint64_t previous_scope = Async::scope();
+	Async::set_scope(async_scope);
 	const bool sliced = state.preemptible && GDScriptFunction::begin_time_slice();
 	Variant ret = function->call(nullptr, nullptr, 0, err, &state);
 	if (sliced) {
 		GDScriptFunction::end_time_slice();
 	}
+	Async::set_scope(previous_scope);
 
 	function = nullptr; // Cleaned up.
 	state.result = Variant();
+	state.result_error = Variant();
 
 	return ret;
 }
@@ -395,7 +418,7 @@ void GDScriptFunctionState::_clear_stack() {
 	}
 }
 
-// Complete a frame whose script or instance is gone with a null result, once, so awaiting callers resume.
+// Complete a frame whose script or instance is gone with its declared result slots.
 void GDScriptFunctionState::_finish_gone() {
 	if (state.completed.is_null()) {
 		return;
@@ -403,6 +426,12 @@ void GDScriptFunctionState::_finish_gone() {
 	const Signal done = state.completed;
 	state.completed = Signal();
 	const Variant nothing;
+	if (state.pair_return) {
+		const Variant error = Err::make("script instance is gone", Err::INTERRUPTED);
+		const Variant *args[2] = { &nothing, &error };
+		done.emit(args, 2);
+		return;
+	}
 	const Variant *args[1] = { &nothing };
 	done.emit(args, 1);
 }
@@ -423,6 +452,28 @@ void GDScriptFunctionState::_clear_connections() {
 
 	for (Object::Connection &c : conns) {
 		c.signal.disconnect(c.callable);
+	}
+}
+
+// Cancel the native operation awaited by a discarded script continuation.
+void GDScriptFunctionState::cancel_awaited() {
+	if (canceling_awaited) return;
+	canceling_awaited = true;
+	Ref<GDScriptFunctionState> keep(this);
+	LocalVector<Ref<RefCounted>> sources;
+	List<Object::Connection> conns;
+	get_signals_connected_to_this(&conns);
+	for (const Object::Connection &conn : conns) {
+		if (conn.callable.get_method() != SNAME("_signal_callback")) continue;
+		RefCounted *source = Object::cast_to<RefCounted>(conn.signal.get_object());
+		if (source && source != this) sources.push_back(Ref<RefCounted>(source));
+	}
+	_clear_connections();
+	for (const Ref<RefCounted> &source : sources) {
+		GDScriptFunctionState *child = Object::cast_to<GDScriptFunctionState>(source.ptr());
+		if (child) child->cancel_awaited();
+		else if (source->has_method(SNAME("abort"))) source->call(SNAME("abort"));
+		else if (source->has_method(SNAME("cancel"))) source->call(SNAME("cancel"));
 	}
 }
 

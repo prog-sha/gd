@@ -128,9 +128,11 @@ public:
 		bool is_meta_type = false;
 		bool is_pseudo_type = false; // For global names that can't be used standalone.
 		bool is_coroutine = false; // For function calls.
+		bool result_pair = false; // Whether a call returns value and Err in separate slots.
 
 		Variant::Type builtin_type = Variant::NIL;
 		StringName native_type;
+		StringName await_type; // Completion type of a started operation held in a GDTask.
 		StringName enum_type; // Enum name or the value name in an enum.
 		Ref<Script> script_type;
 		String script_path;
@@ -150,6 +152,11 @@ public:
 
 		String to_property_info_hint_string() const;
 		PropertyInfo to_property_info(const String &p_name) const;
+		// Identify the language error class used by the second result slot.
+		static const StringName &err_name();
+		static DataType err_type();
+		bool is_err_type() const;
+		bool is_err_slot() const;
 
 		_FORCE_INLINE_ static DataType get_variant_type() { // Default DataType for container elements.
 			DataType datatype;
@@ -197,6 +204,9 @@ public:
 		bool can_reference(const DataType &p_other) const;
 
 		bool operator==(const DataType &p_other) const {
+			if (result_pair != p_other.result_pair) {
+				return false;
+			}
 			if (type_source == UNDETECTED || p_other.type_source == UNDETECTED) {
 				return true; // Can be considered equal for parsing purposes.
 			}
@@ -241,8 +251,10 @@ public:
 			is_meta_type = p_other.is_meta_type;
 			is_pseudo_type = p_other.is_pseudo_type;
 			is_coroutine = p_other.is_coroutine;
+			result_pair = p_other.result_pair;
 			builtin_type = p_other.builtin_type;
 			native_type = p_other.native_type;
+			await_type = p_other.await_type;
 			enum_type = p_other.enum_type;
 			script_type = p_other.script_type;
 			script_path = p_other.script_path;
@@ -446,6 +458,10 @@ public:
 		Variant::Operator variant_op = Variant::OP_MAX;
 		ExpressionNode *assignee = nullptr;
 		ExpressionNode *assigned_value = nullptr;
+		Vector<ExpressionNode *> extra_assignees; // Other targets of a parallel assignment.
+		Vector<ExpressionNode *> extra_values; // Other independent source expressions.
+		Vector<uint8_t> extra_conversions; // Runtime checks for typed targets.
+		bool pair_assign = false; // One call supplies a value and Err.
 		bool use_conversion_assign = false;
 
 		AssignmentNode() {
@@ -868,10 +884,14 @@ public:
 		bool is_abstract = false;
 		bool is_static = false; // For lambdas it's determined in the analyzer.
 		bool is_coroutine = false;
-		bool r_return = false; // Whether the function wraps return values in R.
+		bool pair_return = false; // Whether the function returns a value and Err.
+		bool bare_error_return = false; // Whether a single Err expression appears as a return.
+		bool lambda_expression_context = false; // Whether an inline lambda is inside another expression's comma list.
 		bool uses_try = false; // Whether ? propagates failures to the caller.
-		DataType success_type; // First successful value type carried by R.
+		DataType success_type; // First value type of a paired return.
 		bool success_type_set = false; // Whether the successful type has been resolved.
+		DataType inferred_return_type; // Common value type across unannotated returns.
+		bool inferred_return_type_set = false; // Whether an unannotated return supplies a value type.
 		Variant rpc_config;
 		MethodInfo info;
 		LambdaNode *source_lambda = nullptr;
@@ -1058,6 +1078,7 @@ public:
 	struct ReturnNode : public Node {
 		ExpressionNode *return_value = nullptr;
 		ExpressionNode *error_value = nullptr; // Failure reason when the last comma value is error-like.
+		bool error_only = false; // Send a lone Err through the failure slot.
 		bool void_return = false;
 		bool use_conversion = false;
 
@@ -1066,7 +1087,7 @@ public:
 		}
 	};
 
-	// Extract an R value and propagate failure with ? or stop with !.
+	// Propagate the failure from two results or Err with ? or stop with !.
 	struct ResultOperatorNode : public ExpressionNode {
 		ExpressionNode *operand = nullptr;
 		bool force = false;
@@ -1293,10 +1314,10 @@ public:
 		PropertyInfo export_info;
 		int assignments = 0;
 		bool is_static = false;
-		VariableNode *error_variable = nullptr; // Second name when an R is split into its value and Err.
+		VariableNode *error_variable = nullptr; // Second name assigned the Err result.
 		Vector<VariableNode *> extra_variables; // Names after the first in a multi-name declaration.
 		Vector<ExpressionNode *> extra_values; // Expressions after the first when names and values match one-to-one.
-		bool r_pair = false;
+		bool pair_bind = false;
 		bool value_discard = false;
 		bool error_discard = false;
 		bool value_reuse = false;
@@ -1590,6 +1611,9 @@ private:
 	bool static_unload_annotation(AnnotationNode *p_annotation, Node *p_target, ClassNode *p_class);
 	bool abstract_annotation(AnnotationNode *p_annotation, Node *p_target, ClassNode *p_class);
 	bool onready_annotation(AnnotationNode *p_annotation, Node *p_target, ClassNode *p_class);
+	bool online_annotation(AnnotationNode *p_annotation, Node *p_target, ClassNode *p_class);
+	static bool online_syncable_type(const DataType &p_type);
+	static bool online_argument_type(const DataType &p_type); // Whether the type can be sent over the network.
 	template <PropertyHint t_hint, Variant::Type t_type>
 	bool export_annotations(AnnotationNode *p_annotation, Node *p_target, ClassNode *p_class);
 	bool export_storage_annotation(AnnotationNode *p_annotation, Node *p_target, ClassNode *p_class);

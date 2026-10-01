@@ -1,0 +1,28 @@
+; Minimal settings to open the co-op jump sample on its own.
+config_version=5
+
+[application]
+config/name="Shobon Jump Online"
+run/main_scene="res://main.tscn"
+config/features=PackedStringArray("4.7", "GL Compatibility")
+
+[display]
+window/size/viewport_width=1152
+window/size/viewport_height=648
+window/stretch/mode="canvas_items"
+
+[debug]
+; Let the dynamic world scripts run while keeping type diagnostics visible.
+gdscript/warnings/untyped_declaration=1
+gdscript/warnings/unsafe_property_access=1
+gdscript/warnings/unsafe_method_access=1
+gdscript/warnings/unsafe_call_argument=1
+
+[input]
+tackle={
+"deadzone": 0.5,
+"events": [Object(InputEventKey,"physical_keycode":4194325)]
+}
+
+[rendering]
+renderer/rendering_method="gl_compatibility"

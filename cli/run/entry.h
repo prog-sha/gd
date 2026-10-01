@@ -22,6 +22,9 @@
 #include "cli/run/loop.h"
 #include "scene/main/node.h"
 #include "scene/main/scene_tree.h"
+#ifdef GD_VIEW
+#include "scene/main/window.h" // Complete the root type before attaching a node.
+#endif
 #include "modules/gdscript/gdscript_function.h"
 
 #include <cstdio>
@@ -76,17 +79,14 @@ private:
 
 	// Convert the result into an exit code and stop the loop.
 	// Keep persistent serving alive after the entry function completes.
-	void _quit(const Variant &p_ret) {
+	void _quit(const Variant &p_ret, const Variant &p_error = Variant()) {
 		int code = 0;
-		Ref<R> result = p_ret;
-		if (result.is_valid()) {
-			if (result->get_e().is_valid()) {
-				print_error("error: " + result->get_e()->text());
-				GDFail::hit = true;
-				code = 1;
-			} else if (result->get_v().get_type() == Variant::INT) {
-				code = (int)result->get_v();
-			}
+		Ref<Err> error = p_error.get_type() == Variant::OBJECT ? Ref<Err>(p_error) : Ref<Err>();
+		if (error.is_null() && p_ret.get_type() == Variant::OBJECT) error = Ref<Err>(p_ret);
+		if (error.is_valid()) {
+			print_error("error: " + error->text());
+			GDFail::hit = true;
+			code = 1;
 		} else if (p_ret.get_type() == Variant::INT) {
 			code = (int)p_ret;
 		}
@@ -107,8 +107,18 @@ private:
 
 	// Receive completion of an asynchronous main().
 	void _on_completed(const Variant &p_ret) {
+		GDScriptFunctionState *state = Object::cast_to<GDScriptFunctionState>(pending.get_validated_object());
+		const bool faulted = state && state->is_runtime_faulted();
 		pending = Variant();
-		_quit(p_ret);
+		_quit(faulted ? Variant(1) : p_ret);
+	}
+
+	// Finish a suspended entry function with both declared return values.
+	void _on_completed_pair(const Variant &p_ret, const Variant &p_error) {
+		GDScriptFunctionState *state = Object::cast_to<GDScriptFunctionState>(pending.get_validated_object());
+		const bool faulted = state && state->is_runtime_faulted();
+		pending = Variant();
+		_quit(faulted ? Variant(1) : p_ret, faulted ? Variant() : p_error);
 	}
 
 public:
@@ -158,6 +168,8 @@ public:
 		}
 
 		Callable::CallError err;
+		Variant pair_error;
+		err.result_error = &pair_error;
 		Variant arg0 = args;
 		const Variant *argp[1] = { &arg0 };
 		const bool sliced = serve_mode && GDScriptFunction::begin_time_slice();
@@ -168,6 +180,10 @@ public:
 		}
 		if (sliced) {
 			GDScriptFunction::end_time_slice();
+		}
+		if (err.runtime_failed) {
+			_quit(1);
+			return;
 		}
 		if (err.error != Callable::CallError::CALL_OK) {
 			ERR_PRINT(vformat("Error calling main(): %s", Variant::get_call_error_text(obj, SNAME("main"), argp, argc > 0 ? 1 : 0, err)));
@@ -180,10 +196,11 @@ public:
 		if (state && state->has_signal(SNAME("completed"))) {
 			// Retain the state so its await continuation cannot be freed before resumption.
 			pending = ret;
-			state->connect(SNAME("completed"), callable_mp(this, &GDEntry::_on_completed), Object::CONNECT_ONE_SHOT);
+			GDScriptFunctionState *function_state = Object::cast_to<GDScriptFunctionState>(state);
+			state->connect(SNAME("completed"), function_state && function_state->is_pair_return() ? callable_mp(this, &GDEntry::_on_completed_pair) : callable_mp(this, &GDEntry::_on_completed), Object::CONNECT_ONE_SHOT);
 			return;
 		}
-		_quit(ret);
+		_quit(ret, pair_error);
 	}
 
 	~GDEntry() {

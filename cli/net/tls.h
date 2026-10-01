@@ -18,7 +18,7 @@ class GDTLSIdentity : public RefCounted {
 protected:
 	static void _bind_methods() {}
 public:
-	static Ref<R> load(const String &p_cert, const String &p_key, const Dictionary &p_opts = Dictionary()); // Read and validate credentials and optional client-auth policy on a worker.
+	static VariantPair load(const String &p_cert, const String &p_key, const Dictionary &p_opts = Dictionary()); // Read and validate credentials and optional client-auth policy on a worker.
 	~GDTLSIdentity(); // Release the shared configuration after its last connection.
 };
 
@@ -34,9 +34,9 @@ protected:
 public:
 	GDTrust(); // Initialize an empty trust store.
 	~GDTrust(); // Release native certificate storage.
-	static Ref<R> load(const String &p_path); // Prepare explicit CA certificates or system trust on a worker.
+	static VariantPair load(const String &p_path); // Prepare explicit CA certificates or system trust on a worker.
 	static void shutdown(); // Release shared trust after workers finish.
-	Ref<R> verify(const std::vector<std::shared_ptr<const GDCrypto::Cert>> &p_chain, const String &p_host, bool p_server = true) const; // Verify owned peer certificates for the endpoint purpose and any required server name.
+	Ref<Err> verify(const std::vector<std::shared_ptr<const GDCrypto::Cert>> &p_chain, const String &p_host, bool p_server = true) const; // Verify owned peer certificates for the endpoint purpose and any required server name.
 	std::vector<std::vector<uint8_t>> names() const; // Copy configured authority names for a client-certificate request.
 };
 
@@ -70,7 +70,7 @@ private:
 	void socket_ready(); // Replenish retry tokens only on actual kernel notification.
 	void dispatch(bool p_close = false); // Submit required operations with an exclusive context and descriptor lease.
 	void launch(); // Queue the selected job using an already-acquired descriptor lease.
-	void completed(const Ref<R> &p_result); // Publish worker results after releasing the descriptor lease.
+	void completed(const Variant &p_value, const Ref<Err> &p_error); // Publish worker results after releasing the descriptor lease.
 	Error fail(const String &p_reason, const Ref<Err> &p_error = Ref<Err>()); // Preserve failure and close logically before releasing pending ownership.
 public:
 	GDTLS(); // Allocate inert context storage without cryptographic work.

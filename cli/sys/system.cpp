@@ -1,6 +1,7 @@
 // Query environment, working directory, and processor availability through native OS interfaces.
 #include "cli/sys/system.h"
 #include "cli/data/hash_core.h"
+#include "core/os/os.h"
 #include <cerrno>
 #include <cstdlib>
 #include <string>
@@ -152,9 +153,20 @@ String GDSystem::cache_dir() {
 #endif
 }
 
-// Derive a working-directory-specific user path with a separate MD5 calculation.
+static String user_scope; // Absolute script or project path whose storage user:// selects.
+
+// Remember which script or project owns user://, so storage does not depend on the invocation directory.
+void GDSystem::set_user_scope(const String &p_path) {
+	user_scope = p_path;
+}
+
+// Select persistent private storage for the current script or project, honoring an explicit root.
 String GDSystem::user_dir() {
-	const CharString raw = cwd().utf8();
+	const String chosen = env("GD_USER_HOME");
+	if (!chosen.is_empty()) {
+		return chosen.is_absolute_path() ? chosen : String();
+	}
+	const CharString raw = (user_scope.is_empty() ? cwd() : user_scope).utf8();
 	unsigned char digest[16]; // Fixed MD5 width used for namespace separation, not authentication.
 	GDCrypto::Hash32 hash(GDCrypto::Hash32::MD5);
 	hash.write(raw.get_data(), raw.length());
@@ -162,7 +174,17 @@ String GDSystem::user_dir() {
 	char name[13] = {}; // Twelve-digit user-directory identifier and terminator.
 	const char *hex = "0123456789abcdef"; // lowercase hex
 	for (int i = 0; i < 6; i++) { name[i * 2] = hex[digest[i] >> 4]; name[i * 2 + 1] = hex[digest[i] & 15]; }
-	return temp().path_join(String("gd-") + name);
+	// Keep data in the platform's per-user data area so it survives restarts.
+#if defined(ANDROID_ENABLED) || defined(WEB_ENABLED)
+	const String platform = OS::get_singleton()->get_user_data_dir("gd");
+#elif defined(IOS_ENABLED)
+	const String platform = env("HOME").path_join("Library/Application Support/gd");
+#else
+	const String platform = OS::get_singleton()->get_data_path().path_join("gd/user");
+#endif
+	// Fall back to temporary storage where the data area cannot exist, such as a container without a home.
+	const String root = platform.is_absolute_path() && make_dirs(platform) ? platform : temp();
+	return root.path_join(String("gd-") + name);
 }
 
 // Return the public name of the target OS.

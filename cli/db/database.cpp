@@ -7,6 +7,7 @@
 // Implement the shared remote SQL and embedded SQL CRUD client.
 
 #include "cli/db/database.h"
+#include "cli/db/options.h"
 #include "cli/sys/clock.h"
 #include "cli/data/utf8.h"
 #include "cli/sys/file_job.h"
@@ -15,72 +16,120 @@
 
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
+#include "core/math/math_funcs.h"
 #include "core/templates/hash_set.h"
+#include "cli/sys/task.h"
 
 namespace {
 
 HashSet<GDDatabaseClient *> database_clients; // Clients whose dedicated embedded SQL workers need shutdown.
+uint64_t next_tx_scope = 0; // Unique identity for a transaction callback's coroutine tree.
 
 constexpr int ROW_DEFAULT = 0; // Apply result row limits only when explicitly requested.
 constexpr int BYTES_DEFAULT = 0; // Apply result byte limits only when explicitly requested.
 
-// Validate embedded SQL values and estimate their queued byte footprint.
+// Estimate queued bind storage for types accepted by at least one database driver.
 int64_t args_bytes(const Array &p_args) {
 	int64_t total = 0;
 	for (int i = 0; i < p_args.size(); i++) {
 		const Variant &value = p_args[i];
+		int64_t bytes = sizeof(Variant);
 		switch (value.get_type()) {
 			case Variant::NIL:
 			case Variant::BOOL:
 			case Variant::INT:
 			case Variant::FLOAT:
-				total += 8;
 				break;
 			case Variant::STRING:
-				total += utf8_bytes(String(value));
+				bytes += utf8_bytes(String(value));
 				break;
 			case Variant::PACKED_BYTE_ARRAY:
-				total += PackedByteArray(value).size();
+				bytes += PackedByteArray(value).size();
 				break;
 			default:
-				return -1;
+				break;
 		}
+		total = bytes > INT64_MAX - total ? INT64_MAX : total + bytes;
 	}
 	return total;
 }
 
 // Validate shared SQL and bind values, returning bytes used for queue accounting.
-Ref<R> query_bytes(const String &p_sql, const Array &p_args, int &r_sql, int64_t &r_args) {
+Ref<Err> query_bytes(const String &p_sql, const Array &p_args, int &r_sql, int64_t &r_args) {
 	const int64_t bytes = utf8_bytes(p_sql);
 	if (bytes >= INT_MAX) {
-		return R::err("database SQL exceeds the native string capacity", Err::LIMITED);
+		return Err::make("database SQL exceeds the native string capacity", Err::LIMITED);
 	}
 	r_sql = int(bytes);
 	if (r_sql == 0) {
-		return R::err("database SQL is empty", Err::INVALID_DATA);
+		return Err::make("database SQL is empty", Err::INVALID_DATA);
+	}
+	for (const Variant &arg : p_args) {
+		switch (arg.get_type()) {
+			case Variant::NIL:
+			case Variant::BOOL:
+			case Variant::INT:
+			case Variant::FLOAT:
+			case Variant::STRING:
+			case Variant::STRING_NAME:
+			case Variant::PACKED_BYTE_ARRAY:
+			case Variant::PACKED_INT32_ARRAY:
+			case Variant::PACKED_INT64_ARRAY:
+			case Variant::ARRAY:
+			case Variant::DICTIONARY:
+			case Variant::OBJECT:
+				break;
+			default:
+				return Err::make("database parameter has an unsupported type", Err::INVALID_DATA);
+		}
 	}
 	r_args = args_bytes(p_args);
-	if (r_args < 0) {
-		return R::err("database parameter has an unsupported type", Err::INVALID_DATA);
+	return Ref<Err>();
+}
+
+// Publish an immediate query failure without allocating a result object.
+Signal query_fail(const String &p_message, Err::Kind p_kind) {
+	return Async::ready_pair({ Variant(), Err::make(p_message, p_kind) });
+}
+
+// Find a server-reported serialization failure within a wrapped or joined error.
+bool serialization_failure(const Ref<Err> &p_error) {
+	if (p_error.is_null()) return false;
+	Vector<Ref<Err>> pending;
+	HashSet<Err *> seen;
+	pending.push_back(p_error);
+	while (!pending.is_empty()) {
+		const Ref<Err> error = pending[pending.size() - 1];
+		pending.resize(pending.size() - 1);
+		if (error.is_null() || seen.has(error.ptr())) continue;
+		seen.insert(error.ptr());
+		const Dictionary info = error->get_info();
+		if (info.get("source", "") == "postgres" && info.get("code", "") == "40001") return true;
+		const Ref<Err> cause = error->get_cause();
+		if (cause.is_valid()) pending.push_back(cause);
+		for (const Variant &item : error->get_causes()) {
+			const Ref<Err> child = item;
+			if (child.is_valid()) pending.push_back(child);
+		}
 	}
-	return Ref<R>();
+	return false;
 }
 
 } // namespace
 
 // Send SQL through the transaction's dedicated connection.
 Signal GDDatabaseTx::query(const String &p_sql, const Array &p_args) {
-	return call.is_valid() ? call->query(p_sql, p_args) : Async::ready(R::err("database transaction is closed", Err::INTERRUPTED));
+	return call.is_valid() ? call->query(p_sql, p_args) : query_fail("database transaction is closed", Err::INTERRUPTED);
 }
 
 // Read only the first row through the transaction client.
 Signal GDDatabaseTx::query_row(const String &p_sql, const Array &p_args) {
-	return call.is_valid() ? call->query_row(p_sql, p_args) : Async::ready(R::err("database transaction is closed", Err::INTERRUPTED));
+	return call.is_valid() ? call->query_row(p_sql, p_args) : query_fail("database transaction is closed", Err::INTERRUPTED);
 }
 
 // Return sequential Rows within a transaction.
 Signal GDDatabaseTx::query_rows(const String &p_sql, const Array &p_args) {
-	return call.is_valid() ? call->query_rows(p_sql, p_args) : Async::ready(R::err("database transaction is closed", Err::INTERRUPTED));
+	return call.is_valid() ? call->query_rows(p_sql, p_args) : query_fail("database transaction is closed", Err::INTERRUPTED);
 }
 
 // Check whether the transaction remains usable.
@@ -97,12 +146,12 @@ void GDDatabaseTx::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("query_rows", "sql", "args"), &GDDatabaseTx::query_rows, DEFVAL(Array()));
 	ClassDB::bind_method(D_METHOD("query_rows_async", "sql", "args"), &GDDatabaseTx::query_rows_async, DEFVAL(Array()));
 	ClassDB::bind_method(D_METHOD("is_active"), &GDDatabaseTx::is_active);
-	ADD_AWAIT("query", "R:Dictionary");
-	ADD_AWAIT("query_async", "R:Dictionary");
-	ADD_AWAIT("query_row", "R:Dictionary");
-	ADD_AWAIT("query_row_async", "R:Dictionary");
-	ADD_AWAIT("query_rows", "R:GDDatabaseRows");
-	ADD_AWAIT("query_rows_async", "R:GDDatabaseRows");
+	ADD_AWAIT("query", "Pair:Dictionary");
+	ADD_AWAIT("query_async", "Pair:Dictionary");
+	ADD_AWAIT("query_row", "Pair:Dictionary");
+	ADD_AWAIT("query_row_async", "Pair:Dictionary");
+	ADD_AWAIT("query_rows", "Pair:GDDatabaseRows");
+	ADD_AWAIT("query_rows_async", "Pair:GDDatabaseRows");
 	ADD_AUTO_WAIT("query");
 	ADD_AUTO_WAIT("query_row");
 	ADD_AUTO_WAIT("query_rows");
@@ -110,96 +159,131 @@ void GDDatabaseTx::_bind_methods() {
 
 // Check whether the transaction remains usable.
 bool GDDatabaseTxCall::is_active() const {
-	return !finished && !ending && owner.is_valid() && owner->tx_active && owner->tx_generation == generation;
+	return !finished && !ending && owner.is_valid() &&
+			(postgres.is_valid() ? owner->pool_txs.has(const_cast<GDDatabaseTxCall *>(this)) : owner->tx_active && owner->tx_generation == generation);
 }
 
 // Deliver closure or cancellation after the waiter connects.
 void GDDatabaseTxCall::step() {
-	if (pending.is_valid()) {
-		const Ref<R> result = pending;
-		pending.unref();
+	if (pending_set) {
+		const VariantPair result = pending;
+		pending = VariantPair();
+		pending_set = false;
 		done(result, false);
 	}
 }
 
 // Accept SQL from the transaction client.
 Signal GDDatabaseTxCall::query(const String &p_sql, const Array &p_args) {
-	return is_active() ? owner->query_tx(generation, p_sql, p_args) : Async::ready(R::err("database transaction is closed", Err::INTERRUPTED));
+	if (!is_active()) return query_fail("database transaction is closed", Err::INTERRUPTED);
+	int sql_bytes = 0;
+	int64_t values_bytes = 0;
+	const Ref<Err> invalid = query_bytes(p_sql, p_args, sql_bytes, values_bytes);
+	if (invalid.is_valid()) return Async::ready_pair({ Variant(), invalid });
+	return postgres.is_valid() ? postgres->query_limited(p_sql, p_args, owner->max_rows, owner->max_bytes) : owner->query_tx(generation, p_sql, p_args);
 }
 
 // Read only the first row from the transaction's physical connection.
 Signal GDDatabaseTxCall::query_row(const String &p_sql, const Array &p_args) {
-	return is_active() ? owner->query_tx(generation, p_sql, p_args, true) : Async::ready(R::err("database transaction is closed", Err::INTERRUPTED));
+	if (!is_active()) return query_fail("database transaction is closed", Err::INTERRUPTED);
+	int sql_bytes = 0;
+	int64_t values_bytes = 0;
+	const Ref<Err> invalid = query_bytes(p_sql, p_args, sql_bytes, values_bytes);
+	if (invalid.is_valid()) return Async::ready_pair({ Variant(), invalid });
+	return postgres.is_valid() ? postgres->query_row(p_sql, p_args, owner->max_bytes) : owner->query_tx(generation, p_sql, p_args, true);
 }
 
 // Open sequential Rows on the transaction's physical connection.
 Signal GDDatabaseTxCall::query_rows(const String &p_sql, const Array &p_args) {
-	return is_active() ? owner->query_tx_rows(generation, p_sql, p_args) : Async::ready(R::err("database transaction is closed", Err::INTERRUPTED));
+	if (!is_active()) return query_fail("database transaction is closed", Err::INTERRUPTED);
+	int sql_bytes = 0;
+	int64_t values_bytes = 0;
+	const Ref<Err> invalid = query_bytes(p_sql, p_args, sql_bytes, values_bytes);
+	if (invalid.is_valid()) return Async::ready_pair({ Variant(), invalid });
+	if (postgres.is_valid()) {
+		Ref<GDDatabaseRows> result = postgres->start_rows(p_sql, p_args);
+		owner->track_tx_rows(result, generation);
+		return Async::ready_pair({ result, Variant() });
+	}
+	return owner->query_tx_rows(generation, p_sql, p_args);
 }
 
 // Proceed from BEGIN to the callback or migration.
-void GDDatabaseTxCall::on_begin(const Ref<R> &p_result) {
+void GDDatabaseTxCall::on_begin(const Variant &p_value, const Variant &p_error) {
 	if (finished) {
 		return;
 	}
-	if (p_result->get_e().is_valid()) {
-		done(p_result->note("begin transaction"), false);
+	if (p_error.get_type() != Variant::NIL) {
+		const Ref<Err> error = p_error;
+		done({ p_value, error->note("begin transaction")->with_partial(p_value) }, false);
 		return;
 	}
 	if (mode == MIGRATION) {
 		next_statement();
 		return;
 	}
-	Async::spawn(callable_mp(this, &GDDatabaseTxCall::call_action)).connect(callable_mp(this, &GDDatabaseTxCall::on_action), Object::CONNECT_ONE_SHOT);
+	Async::spawn_pair(callable_mp(this, &GDDatabaseTxCall::call_action)).connect(callable_mp(this, &GDDatabaseTxCall::on_action), Object::CONNECT_ONE_SHOT);
 }
 
 // Acquire a connection from the pool's FIFO queue and begin a transaction on it.
-void GDDatabaseTxCall::on_acquire(const Ref<R> &p_result) {
-	if (finished) {
+void GDDatabaseTxCall::on_acquire(const Variant &p_value, const Variant &p_error) {
+	acquire_call.unref();
+	if (finished || pending_set) {
 		return;
 	}
-	if (p_result->get_e().is_valid()) {
-		done(p_result->note("acquire transaction connection"), false);
+	if (p_error.get_type() != Variant::NIL) {
+		const Ref<Err> error = p_error;
+		done({ p_value, error->note("acquire transaction connection")->with_partial(p_value) }, false);
 		return;
 	}
-	Ref<GDPostgresPoolCall> lease = p_result->get_v();
+	Ref<GDPostgresPoolCall> lease = p_value;
 	if (lease.is_null() || lease->connection().is_null()) {
-		done(R::err("database transaction did not acquire a connection", Err::INTERRUPTED), false);
+		done({ Variant(), Err::make("database transaction did not acquire a connection", Err::INTERRUPTED) }, false);
 		return;
 	}
-	owner->tx_lease = lease;
-	owner->tx_postgres = lease->connection();
-	const uint64_t full_wait = owner->tx_postgres->wait_ms;
+	this->lease = lease;
+	postgres = lease->connection();
+	const uint64_t full_wait = postgres->wait_ms;
 	if (lease->due > 0) {
 		const uint64_t now = GDClock::msec();
-		owner->tx_postgres->wait_ms = MAX(uint64_t(1), lease->due > now ? lease->due - now : uint64_t(1));
+		postgres->wait_ms = MAX(uint64_t(1), lease->due > now ? lease->due - now : uint64_t(1));
 	}
 	lease->due = 0;
-	Signal begun = owner->query_tx(generation, "BEGIN", Array());
-	owner->tx_postgres->wait_ms = full_wait;
+	Signal begun = query("BEGIN", Array());
+	postgres->wait_ms = full_wait;
 	begun.connect(callable_mp(this, &GDDatabaseTxCall::on_begin), Object::CONNECT_ONE_SHOT);
 }
 
 // Pass the dedicated transaction client as the callback's ordinary argument.
-Variant GDDatabaseTxCall::call_action() {
+VariantPair GDDatabaseTxCall::call_action() {
 	const Variant tx_arg = tx;
 	const Variant *args[] = { &tx_arg };
 	Variant result;
+	Variant result_error;
 	Callable::CallError error;
+	error.result_error = &result_error;
+	const uint64_t previous_scope = Async::scope();
+	Async::set_scope(scope);
 	action.callp(args, 1, result, error);
-	return error.error == Callable::CallError::CALL_OK ? result : Variant(R::err("cannot call database transaction callback", Err::INVALID_DATA));
+	Async::set_scope(previous_scope);
+	return error.error == Callable::CallError::CALL_OK && !error.runtime_failed ? VariantPair{ result, result_error } : VariantPair{ Variant(), Err::make("cannot call database transaction callback", Err::INVALID_DATA) };
 }
 
 // Choose COMMIT or ROLLBACK from the callback result.
-void GDDatabaseTxCall::on_action(const Variant &p_result) {
+void GDDatabaseTxCall::on_action(const Variant &p_value, const Variant &p_error) {
 	if (finished) {
 		return;
 	}
-	outcome = p_result;
-	if (outcome.is_null()) {
-		outcome = R::err("database transaction callback must return R", Err::INVALID_DATA);
+	if (p_error.get_type() == Variant::NIL && p_value.get_type() == Variant::OBJECT) {
+		const Ref<Err> failure = p_value;
+		if (failure.is_valid()) {
+			outcome = { Variant(), failure };
+			end(false);
+			return;
+		}
 	}
-	end(outcome->get_ok());
+	outcome = { p_value, p_error };
+	end(p_error.get_type() == Variant::NIL);
 }
 
 // Send the next migration statement.
@@ -208,20 +292,21 @@ void GDDatabaseTxCall::next_statement() {
 		return;
 	}
 	if (at >= statements.size()) {
-		outcome = R::ok(at);
+		outcome = { at, Variant() };
 		end(true);
 		return;
 	}
-	owner->query_tx(generation, statements[at], Array()).connect(callable_mp(this, &GDDatabaseTxCall::on_statement), Object::CONNECT_ONE_SHOT);
+	query(statements[at], Array()).connect(callable_mp(this, &GDDatabaseTxCall::on_statement), Object::CONNECT_ONE_SHOT);
 }
 
 // Proceed to the next statement or ROLLBACK from the statement result.
-void GDDatabaseTxCall::on_statement(const Ref<R> &p_result) {
+void GDDatabaseTxCall::on_statement(const Variant &p_value, const Variant &p_error) {
 	if (finished) {
 		return;
 	}
-	if (p_result->get_e().is_valid()) {
-		outcome = p_result->note(vformat("migration statement %d", at + 1));
+	if (p_error.get_type() != Variant::NIL) {
+		const Ref<Err> error = p_error;
+		outcome = { at, error->note(vformat("migration statement %d", at + 1))->with_partial(at) };
 		end(false);
 		return;
 	}
@@ -234,22 +319,30 @@ void GDDatabaseTxCall::end(bool p_commit) {
 	ending = true;
 	committing = p_commit;
 	owner->close_tx_rows(generation);
-	owner->query_tx(generation, p_commit ? "COMMIT" : "ROLLBACK", Array()).connect(callable_mp(this, &GDDatabaseTxCall::on_end), Object::CONNECT_ONE_SHOT);
+	Signal sent = postgres.is_valid() ? postgres->query(p_commit ? "COMMIT" : "ROLLBACK", Array()) : owner->query_tx(generation, p_commit ? "COMMIT" : "ROLLBACK", Array());
+	sent.connect(callable_mp(this, &GDDatabaseTxCall::on_end), Object::CONNECT_ONE_SHOT);
 }
 
 // Convert transaction termination into the final outcome.
-void GDDatabaseTxCall::on_end(const Ref<R> &p_result) {
+void GDDatabaseTxCall::on_end(const Variant &p_value, const Variant &p_error) {
 	if (finished) {
 		return;
 	}
-	if (p_result->get_e().is_valid()) {
-		done(p_result->note(committing ? "commit transaction" : "rollback transaction"), true);
+	if (p_error.get_type() != Variant::NIL) {
+		const Ref<Err> error = p_error;
+		Ref<Err> ending = error->note(committing ? "commit transaction" : "rollback transaction")->with_partial(outcome.value);
+		const Ref<Err> original = outcome.error;
+		if (!committing && original.is_valid()) {
+			done({ outcome.value, Err::join(original, ending) }, true);
+		} else {
+			done({ outcome.value, ending }, true);
+		}
 		return;
 	}
-	if (committing && p_result->get_v().get_type() == Variant::DICTIONARY) {
-		const Dictionary result = p_result->get_v();
+	if (committing && p_value.get_type() == Variant::DICTIONARY) {
+		const Dictionary result = p_value;
 		if (String(result.get("tag", "")).to_upper() == "ROLLBACK") {
-			done(R::err("database transaction was rolled back during commit", Err::INVALID_DATA), close_after_end);
+			done({ Variant(), Err::make("database transaction was rolled back during commit", Err::INVALID_DATA) }, close_after_end);
 			return;
 		}
 	}
@@ -257,20 +350,29 @@ void GDDatabaseTxCall::on_end(const Ref<R> &p_result) {
 }
 
 // Deliver the final result exactly once.
-void GDDatabaseTxCall::done(const Ref<R> &p_result, bool p_close) {
+void GDDatabaseTxCall::done(const VariantPair &p_result, bool p_close) {
 	if (finished) {
 		return;
 	}
 	finished = true;
 	Ref<GDDatabaseTxCall> keep(this);
 	Ref<GDDatabaseClient> db = owner;
-	if (db.is_valid() && db->tx_generation == generation && db->tx_call.ptr() == this) {
+	if (db.is_valid() && db->pool_txs.has(this)) {
+		db->close_tx_rows(generation);
+		db->pool_txs.erase(this);
+		if (p_close && postgres.is_valid()) postgres->close();
+	} else if (db.is_valid() && db->tx_generation == generation && db->tx_call.ptr() == this) {
 		db->finish_tx(generation);
 		if (p_close) {
 			db->close();
 		}
 	}
-	emit_signal("finished", p_result);
+	postgres.unref();
+	acquire_call.unref();
+	if (lease.is_valid()) lease->release_lease();
+	lease.unref();
+	if (db.is_valid() && db->closing) db->close();
+	Async::finish(this, SNAME("finished"), p_result.value, p_result.error);
 	if (tx.is_valid()) {
 		tx->call.unref();
 	}
@@ -278,15 +380,17 @@ void GDDatabaseTxCall::done(const Ref<R> &p_result, bool p_close) {
 	owner.unref();
 	action = Callable();
 	statements.clear();
-	outcome.unref();
-	pending.unref();
+	outcome = VariantPair();
+	pending = VariantPair();
+	pending_set = false;
 	self_hold.unref();
 }
 
 // Report rollback caused by owner closure as completion.
 void GDDatabaseTxCall::owner_closed() {
-	if (!finished && pending.is_null()) {
-		pending = R::err("database transaction was closed", Err::INTERRUPTED);
+	if (!finished && !pending_set) {
+		pending = { outcome.value, Err::join(Ref<Err>(outcome.error), Err::make("database transaction was closed", Err::INTERRUPTED)) };
+		pending_set = true;
 		Async::post(Ref<RefCounted>(this), callable_mp(this, &GDDatabaseTxCall::step));
 	}
 }
@@ -303,24 +407,110 @@ bool GDDatabaseTxCall::defer_close() {
 // Close the connection and roll back when the waiter cancels.
 void GDDatabaseTxCall::cancel() {
 	if (!finished && owner.is_valid()) {
-		owner->close();
+		if (postgres.is_valid()) {
+			postgres->close();
+			owner_closed();
+		} else if (owner->pool_txs.has(this)) {
+			if (acquire_call.is_valid()) acquire_call->cancel();
+			owner_closed();
+		} else {
+			owner->close();
+		}
 	}
 }
 
 // Expose cancellation and completion signals to script.
 void GDDatabaseTxCall::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDDatabaseTxCall::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value"), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
+}
+
+// Start a fresh transaction for this attempt.
+void GDDatabaseRetryCall::run() {
+	if (finished || canceled || owner.is_null()) return;
+	tries++;
+	Signal sent = owner->transaction(action);
+	active = Ref<GDDatabaseTxCall>(Object::cast_to<GDDatabaseTxCall>(sent.get_object()));
+	sent.connect(callable_mp(this, &GDDatabaseRetryCall::on_result), Object::CONNECT_ONE_SHOT);
+}
+
+// Retry only a server serialization conflict after the prior transaction has ended.
+void GDDatabaseRetryCall::on_result(const Variant &p_value, const Variant &p_error) {
+	active.unref();
+	if (finished) return;
+	if (canceled) {
+		done(Variant(), Err::interrupted("database serialization retry was canceled"));
+		return;
+	}
+	const Ref<Err> error = p_error;
+	if (tries < 10 && serialization_failure(error)) {
+		const double delay = double(Math::rand() % 20) / 1000.0;
+		const Ref<GDWait> timer = Async::start_sleep(delay);
+		Signal(timer.ptr(), "finished").connect(callable_mp(this, &GDDatabaseRetryCall::on_delay), Object::CONNECT_ONE_SHOT);
+		return;
+	}
+	done(p_value, p_error);
+}
+
+// Continue after a short asynchronous delay.
+void GDDatabaseRetryCall::on_delay(const Variant &p_value) {
+	if (!finished && !canceled) run();
+}
+
+// Deliver the last transaction outcome and release callback state.
+void GDDatabaseRetryCall::done(const Variant &p_value, const Variant &p_error) {
+	if (finished) return;
+	finished = true;
+	Ref<GDDatabaseRetryCall> keep(this);
+	Async::finish(this, SNAME("finished"), p_value, p_error);
+	active.unref();
+	owner.unref();
+	action = Callable();
+	self_hold.unref();
+}
+
+// Cancel the current transaction or a scheduled retry.
+void GDDatabaseRetryCall::cancel() {
+	if (finished) return;
+	canceled = true;
+	if (active.is_valid()) {
+		active->cancel();
+	} else {
+		done(Variant(), Err::interrupted("database serialization retry was canceled"));
+	}
+}
+
+// Expose completion and cancellation to asynchronous callers.
+void GDDatabaseRetryCall::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("cancel"), &GDDatabaseRetryCall::cancel);
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value"), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
 // Publish embedded SQL worker results safely.
-void GDDatabaseCall::complete(const Ref<R> &p_result) {
+void GDDatabaseCall::complete(const VariantPair &p_result) {
 	if (!completed.set_if_clear()) {
 		return;
 	}
 	result = p_result;
 	ready.set();
 	Async::post(Ref<RefCounted>(this), callable_mp(this, &GDDatabaseCall::step));
+}
+
+// Keep sequential results owned by the waiting caller or release them after cancellation.
+void GDDatabaseCall::forward(const Variant &p_value, const Variant &p_error) {
+	Ref<GDDatabaseCall> keep(this);
+	const Ref<Err> failure = p_error;
+	if (rows_open && failure.is_null()) {
+		Ref<GDDatabaseRows> opened = p_value;
+		if (completed.is_set()) {
+			if (opened.is_valid()) opened->close();
+			forward_hold.unref();
+			return;
+		}
+		rows = opened;
+	}
+	complete({ p_value, p_error });
+	forward_hold.unref();
 }
 
 // Deliver context cancellation promptly and interrupt active embedded SQL work.
@@ -333,7 +523,7 @@ void GDDatabaseCall::cancel() {
 	}
 	canceled.set();
 	// Commit cancellation first so a racing worker return cannot change the error category.
-	complete(R::err("database call was cancelled", Err::INTERRUPTED));
+	complete({ Variant(), Err::make("database call was cancelled", Err::INTERRUPTED) });
 	if (owner.is_valid()) {
 		owner->cancel_call(this);
 	}
@@ -345,16 +535,16 @@ void GDDatabaseCall::step() {
 		return;
 	}
 	Ref<GDDatabaseCall> keep(this);
-	Ref<R> out = result;
+	VariantPair out = result;
 	if (sqlite.is_valid() && (owner.is_null() || owner->sqlite.ptr() != sqlite.ptr())) {
 		// Treat even a prepared successful worker result as closed if closure precedes delivery.
-		out = R::err("database is closed", Err::INTERRUPTED);
+		out = { Variant(), Err::join(Ref<Err>(out.error), Err::make("database is closed", Err::INTERRUPTED)) };
 	}
-	emit_signal("finished", out);
+	Async::finish(this, SNAME("finished"), out.value, out.error);
 	if (sqlite.is_valid()) {
 		owner->sqlite_finished(this, sqlite, queued_bytes);
 	}
-	result.unref();
+	result = VariantPair();
 	rows.unref();
 	sqlite.unref();
 	args.clear();
@@ -366,19 +556,20 @@ void GDDatabaseCall::step() {
 // Dispose undelivered operations directly at process shutdown without a main loop.
 void GDDatabaseCall::finish_shutdown() {
 	Ref<GDDatabaseCall> keep(this);
-	result.unref();
+	result = VariantPair();
 	rows.unref();
 	sqlite.unref();
 	args.clear();
 	sql = String();
 	owner.unref();
 	self_hold.unref();
+	forward_hold.unref();
 }
 
 // Register the embedded SQL operation completion signal.
 void GDDatabaseCall::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDDatabaseCall::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value"), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
 // Enter the embedded SQL worker through the thread's C callback.
@@ -420,7 +611,7 @@ void GDDatabaseClient::sqlite_loop() {
 					queued->args.clear();
 					queued->sql = String();
 					queued->queued_bytes = 0;
-					queued->complete(R::err("database is closed", Err::INTERRUPTED));
+					queued->complete({ Variant(), Err::make("database is closed", Err::INTERRUPTED) });
 				}
 				sqlite_queue_bytes = 0;
 				stop_worker = true;
@@ -482,26 +673,27 @@ void GDDatabaseClient::sqlite_loop() {
 			continue;
 		}
 		if (call.is_valid() && !call->completed.is_set()) {
-			Ref<R> out;
+			VariantPair out;
 			if (sqlite_stop.is_set()) {
-				out = R::err("database is closed", Err::INTERRUPTED);
+				out = { Variant(), Err::make("database is closed", Err::INTERRUPTED) };
 			} else if (call->canceled.is_set()) {
-				out = R::err("database call was cancelled", Err::INTERRUPTED);
+				out = { Variant(), Err::make("database call was cancelled", Err::INTERRUPTED) };
 			} else if (call->rows_open) {
-				out = running->open_rows(call->rows.ptr(), sql, args, &call->canceled);
+				const Ref<Err> failure = running->open_rows(call->rows.ptr(), sql, args, &call->canceled);
+				out = { Variant(), failure.is_valid() ? Variant(failure) : Variant() };
 				bool adopted = false;
-				if (out->get_ok() && !call->canceled.is_set()) {
+				if (out.error.get_type() == Variant::NIL && !call->canceled.is_set()) {
 					MutexLock lock(sqlite_mutex);
 					if (!sqlite_stop.is_set() && sqlite_rows.is_null()) {
 						sqlite_rows = call->rows;
 						adopted = true;
-						out = R::ok(call->rows);
+						out = { call->rows, Variant() };
 					}
 				}
 				if (!adopted) {
 					running->close_rows(call->rows.ptr());
-					if (out->get_ok()) {
-						out = R::err("database is closed", Err::INTERRUPTED);
+					if (out.error.get_type() == Variant::NIL) {
+						out = { Variant(), Err::make("database is closed", Err::INTERRUPTED) };
 					}
 				}
 			} else {
@@ -537,16 +729,27 @@ bool GDDatabaseClient::request_sqlite_rows(GDDatabaseRows *p_rows, bool p_close)
 }
 
 // Track transaction Rows for cleanup at transaction end.
-void GDDatabaseClient::track_tx_rows(const Ref<GDDatabaseRows> &p_rows) {
-	if (!tx_active || p_rows.is_null()) {
+void GDDatabaseClient::track_tx_rows(const Ref<GDDatabaseRows> &p_rows, uint64_t p_generation) {
+	if (p_rows.is_null()) {
 		return;
 	}
+	if (p_generation == 0) p_generation = tx_active ? tx_generation : 0;
+	if (p_generation == 0) return;
 	{
 		MutexLock lock(p_rows->mutex);
 		p_rows->owner = Ref<GDDatabaseClient>(this);
-		p_rows->tx_generation = tx_generation;
+		p_rows->tx_generation = p_generation;
 	}
-	tx_rows.insert(p_rows.ptr());
+	if (p_generation == tx_generation && tx_active) {
+		tx_rows.insert(p_rows.ptr());
+	} else {
+		for (GDDatabaseTxCall *call : pool_txs) {
+			if (call->generation == p_generation) {
+				call->rows.insert(p_rows.ptr());
+				break;
+			}
+		}
+	}
 }
 
 // Remove closed Rows only from their current transaction.
@@ -554,25 +757,31 @@ void GDDatabaseClient::untrack_tx_rows(GDDatabaseRows *p_rows, uint64_t p_genera
 	if (p_rows && p_generation == tx_generation) {
 		tx_rows.erase(p_rows);
 	}
+	for (GDDatabaseTxCall *call : pool_txs) {
+		if (call->generation == p_generation) call->rows.erase(p_rows);
+	}
 }
 
 // Close Rows from the same generation before COMMIT or ROLLBACK.
 void GDDatabaseClient::close_tx_rows(uint64_t p_generation) {
-	if (p_generation != tx_generation || tx_rows.is_empty()) {
-		return;
+	HashSet<GDDatabaseRows *> *tracked = nullptr;
+	if (p_generation == tx_generation && tx_active) tracked = &tx_rows;
+	for (GDDatabaseTxCall *call : pool_txs) {
+		if (call->generation == p_generation) tracked = &call->rows;
 	}
+	if (!tracked || tracked->is_empty()) return;
 	LocalVector<Ref<GDDatabaseRows>> rows;
-	for (GDDatabaseRows *item : tx_rows) {
+	for (GDDatabaseRows *item : *tracked) {
 		rows.push_back(Ref<GDDatabaseRows>(item));
 	}
 	for (const Ref<GDDatabaseRows> &item : rows) {
 		item->close();
 	}
-	tx_rows.clear();
+	tracked->clear();
 }
 
 // Receive remote SQL open results and restore reusability on failure.
-void GDDatabaseClient::postgres_opened(const Ref<R> &p_result, const Ref<GDDatabaseCall> &p_call,
+void GDDatabaseClient::postgres_opened(const Variant &p_value, const Variant &p_error, const Ref<GDDatabaseCall> &p_call,
 		const Ref<GDPostgresClient> &p_expected, uint64_t p_generation) {
 	if (Pool::is_stopping()) {
 		opening = false;
@@ -583,12 +792,12 @@ void GDDatabaseClient::postgres_opened(const Ref<R> &p_result, const Ref<GDDatab
 		p_call->finish_shutdown();
 		return;
 	}
-	Ref<R> out = p_result;
+	VariantPair out{ p_value, p_error };
 	if (!opening || p_generation != open_generation || postgres.ptr() != p_expected.ptr()) {
-		out = R::err("database open was cancelled", Err::INTERRUPTED);
+		out = { Variant(), Err::make("database open was cancelled", Err::INTERRUPTED) };
 	} else {
 		opening = false;
-		if (!p_result->get_ok()) {
+		if (p_error.get_type() != Variant::NIL) {
 			postgres.unref();
 		}
 	}
@@ -596,7 +805,7 @@ void GDDatabaseClient::postgres_opened(const Ref<R> &p_result, const Ref<GDDatab
 }
 
 // Forward remote SQL pool configuration results to the shared open operation.
-void GDDatabaseClient::postgres_pool_opened(const Ref<R> &p_result, const Ref<GDDatabaseCall> &p_call,
+void GDDatabaseClient::postgres_pool_opened(const Variant &p_value, const Variant &p_error, const Ref<GDDatabaseCall> &p_call,
 		const Ref<GDPostgresPool> &p_expected, uint64_t p_generation) {
 	if (Pool::is_stopping()) {
 		opening = false;
@@ -607,12 +816,12 @@ void GDDatabaseClient::postgres_pool_opened(const Ref<R> &p_result, const Ref<GD
 		p_call->finish_shutdown();
 		return;
 	}
-	Ref<R> out = p_result.is_valid() ? p_result : R::err("postgres pool returned an invalid result", Err::INVALID_DATA);
+	VariantPair out{ p_value, p_error };
 	if (!opening || p_generation != open_generation || postgres_pool.ptr() != p_expected.ptr()) {
-		out = R::err("database open was cancelled", Err::INTERRUPTED);
+		out = { Variant(), Err::make("database open was cancelled", Err::INTERRUPTED) };
 	} else {
 		opening = false;
-		if (!out->get_ok()) {
+		if (out.error.get_type() != Variant::NIL) {
 			postgres_pool->close();
 			postgres_pool.unref();
 		}
@@ -621,11 +830,11 @@ void GDDatabaseClient::postgres_pool_opened(const Ref<R> &p_result, const Ref<GD
 }
 
 // Adopt a worker-opened embedded SQL connection and start its query thread.
-void GDDatabaseClient::sqlite_opened(const Ref<R> &p_result, const Ref<GDDatabaseCall> &p_call, uint64_t p_generation) {
-	Ref<R> out = p_result;
+void GDDatabaseClient::sqlite_opened(const Variant &p_value, const Variant &p_error, const Ref<GDDatabaseCall> &p_call, uint64_t p_generation) {
+	VariantPair out{ p_value, p_error };
 	Ref<GDSQLiteDB> made;
-	if (p_result.is_valid() && p_result->get_ok()) {
-		made = p_result->get_v();
+	if (p_error.get_type() == Variant::NIL) {
+		made = p_value;
 	}
 	if (Pool::is_stopping()) {
 		opening = false;
@@ -636,7 +845,7 @@ void GDDatabaseClient::sqlite_opened(const Ref<R> &p_result, const Ref<GDDatabas
 		return;
 	}
 	if (!opening || p_generation != open_generation) {
-		out = R::err("database open was cancelled", Err::INTERRUPTED);
+		out = { Variant(), Err::make("database open was cancelled", Err::INTERRUPTED) };
 	} else {
 		opening = false;
 		if (made.is_valid()) {
@@ -646,14 +855,14 @@ void GDDatabaseClient::sqlite_opened(const Ref<R> &p_result, const Ref<GDDatabas
 			if (!sqlite_thread.is_started()) {
 				sqlite->close();
 				sqlite.unref();
-				out = R::err("cannot start sqlite worker", Err::UNSUPPORTED);
+				out = { Variant(), Err::make("cannot start sqlite worker", Err::UNSUPPORTED) };
 			}
 		}
 	}
 	if (made.is_valid() && sqlite.ptr() != made.ptr()) {
-		GDFileCall::start([made]() {
+		GDPairCall::start([made]() -> VariantPair {
 			made->close();
-			return R::ok();
+			return { Variant(), Variant() };
 		});
 	}
 	p_call->complete(out);
@@ -701,18 +910,19 @@ void GDDatabaseClient::close_sqlite() {
 	}
 	sqlite_closing = true;
 	const Ref<GDDatabaseClient> keep(this);
-	GDFileCall::start([keep, closing]() {
+	GDPairCall::start([keep, closing]() -> VariantPair {
 		if (keep->sqlite_thread.is_started()) {
 			keep->sqlite_thread.wait_to_finish();
 		}
 		closing->close();
-		return R::ok();
+		return { Variant(), Variant() };
 	}).connect(callable_mp(this, &GDDatabaseClient::sqlite_closed), Object::CONNECT_ONE_SHOT);
 }
 
 // Restore the reopenable state after the embedded SQL worker exits.
-void GDDatabaseClient::sqlite_closed(const Ref<R> &p_result) {
-	(void)p_result;
+void GDDatabaseClient::sqlite_closed(const Variant &p_value, const Variant &p_error) {
+	(void)p_value;
+	(void)p_error;
 	sqlite_closing = false;
 }
 
@@ -736,6 +946,11 @@ void GDDatabaseClient::sqlite_finished(GDDatabaseCall *p_call, const Ref<GDSQLit
 void GDDatabaseClient::cancel_call(GDDatabaseCall *p_call) {
 	if (!p_call || p_call->sqlite.is_null()) {
 		close();
+		return;
+	}
+	if (p_call->deferred) {
+		MutexLock lock(sqlite_mutex);
+		record_sqlite_wait(p_call);
 		return;
 	}
 	Ref<GDSQLiteDB> running;
@@ -778,18 +993,20 @@ void GDDatabaseClient::shutdown_all() {
 // Select the driver and connection options, then open the required connections.
 Signal GDDatabaseClient::open(const Dictionary &p_opts) {
 	if (opening || sqlite_closing || postgres.is_valid() || postgres_pool.is_valid() || sqlite.is_valid()) {
-		return Async::ready(R::err("database is already open", Err::ALREADY_EXISTS));
+		return query_fail("database is already open", Err::ALREADY_EXISTS);
 	}
-	const int64_t rows_raw = p_opts.get("max_rows", ROW_DEFAULT);
-	const int64_t bytes_raw = p_opts.get("max_bytes", BYTES_DEFAULT);
-	if (rows_raw < 0 || rows_raw > INT_MAX || bytes_raw < 0 || bytes_raw > INT_MAX) {
-		return Async::ready(R::err("database result limits must be between 0 and 2147483647", Err::INVALID_DATA));
+	int64_t rows_raw = 0, bytes_raw = 0;
+	if (!DbOption::integer(p_opts, "max_rows", ROW_DEFAULT, rows_raw) || !DbOption::integer(p_opts, "max_bytes", BYTES_DEFAULT, bytes_raw) ||
+			rows_raw < 0 || rows_raw > INT_MAX || bytes_raw < 0 || bytes_raw > INT_MAX) {
+		return query_fail("database result limits must be between 0 and 2147483647", Err::INVALID_DATA);
 	}
 	max_rows = (int)rows_raw;
 	max_bytes = (int)bytes_raw;
-	const String driver = p_opts.get("driver", "postgres");
+	String driver;
+	if (!DbOption::text(p_opts, "driver", "postgres", driver)) return query_fail("database driver must be postgres or sqlite", Err::INVALID_DATA);
 	if (driver == "sqlite") {
-		const String path = p_opts.get("path", "");
+		String path;
+		if (!DbOption::text(p_opts, "path", "", path)) return query_fail("sqlite path must be text", Err::INVALID_DATA);
 		Dictionary opts = p_opts.duplicate();
 		opts.erase("driver");
 		opts.erase("path");
@@ -799,25 +1016,26 @@ Signal GDDatabaseClient::open(const Dictionary &p_opts) {
 		call->owner = Ref<GDDatabaseClient>(this);
 		const uint64_t generation = ++open_generation;
 		opening = true;
-		GDFileCall::start([path, opts]() { return GDSQLiteDB::open(path, opts); }).connect(
+		GDPairCall::start([path, opts]() { return GDSQLiteDB::open(path, opts); }, false).connect(
 				callable_mp(this, &GDDatabaseClient::sqlite_opened).bind(call, generation), Object::CONNECT_ONE_SHOT);
 		return Signal(call.ptr(), "finished");
 	}
 	if (driver != "postgres") {
-		return Async::ready(R::err("database driver must be postgres or sqlite", Err::INVALID_DATA));
+		return query_fail("database driver must be postgres or sqlite", Err::INVALID_DATA);
 	}
-	const String host = p_opts.get("host", "127.0.0.1");
-	const int64_t port = p_opts.get("port", 5432);
-	if (host.is_empty() || port < Limit::PORT_MIN || port > Limit::PORT_MAX) {
-		return Async::ready(R::err("postgres address is invalid", Err::INVALID_DATA));
+	String host;
+	int64_t port = 0;
+	if (!DbOption::text(p_opts, "host", "127.0.0.1", host) || !DbOption::integer(p_opts, "port", 5432, port) ||
+			host.is_empty() || port < Limit::PORT_MIN || port > Limit::PORT_MAX) {
+		return query_fail("postgres address is invalid", Err::INVALID_DATA);
 	}
 	Dictionary opts = p_opts.duplicate();
 	opts.erase("driver");
 	opts.erase("host");
 	opts.erase("port");
-	const int64_t pool_size = opts.get("pool", int64_t(0));
-	if (pool_size < 0 || pool_size > INT_MAX) {
-		return Async::ready(R::err("postgres pool size must be between 0 and 2147483647", Err::INVALID_DATA));
+	int64_t pool_size = 0;
+	if (!DbOption::integer(opts, "pool", 0, pool_size) || pool_size < 0 || pool_size > INT_MAX) {
+		return query_fail("postgres pool size must be between 0 and 2147483647", Err::INVALID_DATA);
 	}
 	opts.erase("pool");
 	Ref<GDDatabaseCall> call;
@@ -839,18 +1057,20 @@ Signal GDDatabaseClient::open(const Dictionary &p_opts) {
 }
 
 // Execute shared SQL without checking transaction occupancy.
-Signal GDDatabaseClient::query_inner(const String &p_sql, const Array &p_args, bool p_one) {
+Signal GDDatabaseClient::query_inner(const String &p_sql, const Array &p_args, bool p_one, bool p_tx) {
+	if (closing) return query_fail("database is closing", Err::INTERRUPTED);
 	int sql_bytes = 0;
 	int64_t values_bytes = 0;
-	const Ref<R> invalid = query_bytes(p_sql, p_args, sql_bytes, values_bytes);
+	const Ref<Err> invalid = query_bytes(p_sql, p_args, sql_bytes, values_bytes);
 	if (invalid.is_valid()) {
-		return Async::ready(invalid);
+		return Async::ready_pair({ Variant(), invalid });
+	}
+	// Keep leased transaction SQL on its connection while unrelated pool queries use other leases.
+	if (p_tx && tx_postgres.is_valid()) {
+		return p_one ? tx_postgres->query_row(p_sql, p_args, max_bytes) : tx_postgres->query_limited(p_sql, p_args, max_rows, max_bytes);
 	}
 	if (postgres.is_valid()) {
 		return p_one ? postgres->query_row(p_sql, p_args, max_bytes) : postgres->query_limited(p_sql, p_args, max_rows, max_bytes);
-	}
-	if (tx_postgres.is_valid()) {
-		return p_one ? tx_postgres->query_row(p_sql, p_args, max_bytes) : tx_postgres->query_limited(p_sql, p_args, max_rows, max_bytes);
 	}
 	if (postgres_pool.is_valid()) {
 		return p_one ? postgres_pool->query_row(p_sql, p_args, max_bytes) : postgres_pool->query_limited(p_sql, p_args, max_rows, max_bytes);
@@ -879,26 +1099,28 @@ Signal GDDatabaseClient::query_inner(const String &p_sql, const Array &p_args, b
 		sqlite_ready.post();
 		return Signal(call.ptr(), "finished");
 	}
-	return Async::ready(R::err("database is not open", Err::NOT_FOUND));
+	return query_fail("database is not open", Err::NOT_FOUND);
 }
 
 // Open sequential Rows without checking transaction occupancy.
-Signal GDDatabaseClient::query_rows_inner(const String &p_sql, const Array &p_args) {
+Signal GDDatabaseClient::query_rows_inner(const String &p_sql, const Array &p_args, bool p_tx) {
+	if (closing) return query_fail("database is closing", Err::INTERRUPTED);
 	int sql_bytes = 0;
 	int64_t values_bytes = 0;
-	const Ref<R> invalid = query_bytes(p_sql, p_args, sql_bytes, values_bytes);
+	const Ref<Err> invalid = query_bytes(p_sql, p_args, sql_bytes, values_bytes);
 	if (invalid.is_valid()) {
-		return Async::ready(invalid);
+		return Async::ready_pair({ Variant(), invalid });
+	}
+	// Rows from a transaction retain its lease; ordinary Rows acquire from the pool.
+	if (p_tx && tx_postgres.is_valid()) {
+		Ref<GDDatabaseRows> rows = tx_postgres->start_rows(p_sql, p_args);
+		track_tx_rows(rows);
+		return Async::ready_pair({ rows, Variant() });
 	}
 	if (postgres.is_valid()) {
 		Ref<GDDatabaseRows> rows = postgres->start_rows(p_sql, p_args);
 		track_tx_rows(rows);
-		return Async::ready(R::ok(rows));
-	}
-	if (tx_postgres.is_valid()) {
-		Ref<GDDatabaseRows> rows = tx_postgres->start_rows(p_sql, p_args);
-		track_tx_rows(rows);
-		return Async::ready(R::ok(rows));
+		return Async::ready_pair({ rows, Variant() });
 	}
 	if (postgres_pool.is_valid()) {
 		return postgres_pool->query_rows(p_sql, p_args);
@@ -933,47 +1155,76 @@ Signal GDDatabaseClient::query_rows_inner(const String &p_sql, const Array &p_ar
 		sqlite_ready.post();
 		return Signal(call.ptr(), "finished");
 	}
-	return Async::ready(R::err("database is not open", Err::NOT_FOUND));
+	return query_fail("database is not open", Err::NOT_FOUND);
 }
 
 // Execute shared SQL with bound parameters.
 Signal GDDatabaseClient::query(const String &p_sql, const Array &p_args) {
-	if (tx_active) {
-		return Async::ready(R::err("database connection is in a transaction", Err::ALREADY_EXISTS));
+	if (tx_active && postgres_pool.is_null()) {
+		if (sqlite.is_valid()) return Async::scope() == tx_call->scope ? query_fail("use the transaction client inside its callback", Err::ALREADY_EXISTS) : defer_sqlite(p_sql, p_args, false, false);
+		return query_fail("database connection is in a transaction", Err::ALREADY_EXISTS);
 	}
 	return query_inner(p_sql, p_args);
 }
 
 // Read only the first shared-query row without retaining the remainder.
 Signal GDDatabaseClient::query_row(const String &p_sql, const Array &p_args) {
-	if (tx_active) {
-		return Async::ready(R::err("database connection is in a transaction", Err::ALREADY_EXISTS));
+	if (tx_active && postgres_pool.is_null()) {
+		if (sqlite.is_valid()) return Async::scope() == tx_call->scope ? query_fail("use the transaction client inside its callback", Err::ALREADY_EXISTS) : defer_sqlite(p_sql, p_args, true, false);
+		return query_fail("database connection is in a transaction", Err::ALREADY_EXISTS);
 	}
 	return query_inner(p_sql, p_args, true);
 }
 
 // Read shared-query results one row at a time through Rows.
 Signal GDDatabaseClient::query_rows(const String &p_sql, const Array &p_args) {
-	if (tx_active) {
-		return Async::ready(R::err("database connection is in a transaction", Err::ALREADY_EXISTS));
+	if (tx_active && postgres_pool.is_null()) {
+		if (sqlite.is_valid()) return Async::scope() == tx_call->scope ? query_fail("use the transaction client inside its callback", Err::ALREADY_EXISTS) : defer_sqlite(p_sql, p_args, false, true);
+		return query_fail("database connection is in a transaction", Err::ALREADY_EXISTS);
 	}
 	return query_rows_inner(p_sql, p_args);
+}
+
+// Hold shared queries outside the active transaction until it completes.
+Signal GDDatabaseClient::defer_sqlite(const String &p_sql, const Array &p_args, bool p_one, bool p_rows) {
+	int sql_bytes = 0;
+	int64_t values_bytes = 0;
+	const Ref<Err> invalid = query_bytes(p_sql, p_args, sql_bytes, values_bytes);
+	if (invalid.is_valid()) return Async::ready_pair({ Variant(), invalid });
+	Ref<GDDatabaseCall> call;
+	call.instantiate();
+	call->self_hold = call;
+	call->owner = Ref<GDDatabaseClient>(this);
+	call->sqlite = sqlite;
+	call->sql = p_sql;
+	call->args = p_args.duplicate(true);
+	call->one = p_one;
+	call->rows_open = p_rows;
+	call->deferred = true;
+	call->queued_at = GDClock::msec();
+	call->counted_wait = true;
+	{
+		MutexLock lock(sqlite_mutex);
+		sqlite_wait_count++;
+	}
+	sqlite_deferred.push_back(call);
+	return Signal(call.ptr(), "finished");
 }
 
 // Send SQL through the transaction's dedicated connection.
 Signal GDDatabaseClient::query_tx(uint64_t p_generation, const String &p_sql, const Array &p_args, bool p_one) {
 	if (!tx_active || tx_generation != p_generation) {
-		return Async::ready(R::err("database transaction is closed", Err::INTERRUPTED));
+		return query_fail("database transaction is closed", Err::INTERRUPTED);
 	}
-	return query_inner(p_sql, p_args, p_one);
+	return query_inner(p_sql, p_args, p_one, true);
 }
 
 // Open sequential Rows through the transaction's dedicated connection.
 Signal GDDatabaseClient::query_tx_rows(uint64_t p_generation, const String &p_sql, const Array &p_args) {
 	if (!tx_active || tx_generation != p_generation) {
-		return Async::ready(R::err("database transaction is closed", Err::INTERRUPTED));
+		return query_fail("database transaction is closed", Err::INTERRUPTED);
 	}
-	return query_rows_inner(p_sql, p_args);
+	return query_rows_inner(p_sql, p_args, true);
 }
 
 // Release connection ownership only for the current transaction generation.
@@ -987,27 +1238,46 @@ void GDDatabaseClient::finish_tx(uint64_t p_generation) {
 			tx_lease.unref();
 		}
 		tx_call.unref();
+		dispatch_deferred();
+	}
+}
+
+// Resume shared calls only after the transaction's COMMIT or ROLLBACK result.
+void GDDatabaseClient::dispatch_deferred() {
+	while (!sqlite_deferred.is_empty()) {
+		Ref<GDDatabaseCall> call = sqlite_deferred.front()->get();
+		sqlite_deferred.pop_front();
+		{
+			MutexLock lock(sqlite_mutex);
+			record_sqlite_wait(call.ptr());
+		}
+		call->deferred = false;
+		if (call->canceled.is_set()) continue;
+		call->forward_hold = call;
+		Signal sent = call->rows_open ? query_rows_inner(call->sql, call->args) : query_inner(call->sql, call->args, call->one);
+		sent.connect(callable_mp(call.ptr(), &GDDatabaseCall::forward), Object::CONNECT_ONE_SHOT);
 	}
 }
 
 // Start a callback or statement sequence as a transaction.
 Signal GDDatabaseClient::start_tx(const Callable &p_action, const Array &p_statements, bool p_migration) {
+	if (closing) return query_fail("database is closing", Err::INTERRUPTED);
 	if (!is_open()) {
-		return Async::ready(R::err("database is not open", Err::NOT_FOUND));
+		return query_fail("database is not open", Err::NOT_FOUND);
 	}
 	if (tx_active) {
-		return Async::ready(R::err("database transaction is already active", Err::ALREADY_EXISTS));
+		return query_fail("database transaction is already active", Err::ALREADY_EXISTS);
 	}
 	if (!p_migration && !p_action.is_valid()) {
-		return Async::ready(R::err("database transaction needs a callable", Err::INVALID_DATA));
+		return query_fail("database transaction needs a callable", Err::INVALID_DATA);
 	}
 	if (p_migration) {
 		if (p_statements.is_empty()) {
-			return Async::ready(R::err("database migration needs statements", Err::INVALID_DATA));
+			return query_fail("database migration needs statements", Err::INVALID_DATA);
 		}
 		for (int i = 0; i < p_statements.size(); i++) {
 			if (p_statements[i].get_type() != Variant::STRING || String(p_statements[i]).strip_edges().is_empty()) {
-				return Async::ready(R::err(vformat("database migration statement %d is not SQL", i + 1), Err::INVALID_DATA));
+				return query_fail(vformat("database migration statement %d is not SQL", i + 1), Err::INVALID_DATA);
 			}
 		}
 	}
@@ -1016,16 +1286,20 @@ Signal GDDatabaseClient::start_tx(const Callable &p_action, const Array &p_state
 	call->self_hold = call;
 	call->owner = Ref<GDDatabaseClient>(this);
 	call->generation = ++tx_generation;
+	call->scope = ++next_tx_scope;
 	call->action = p_action;
 	call->statements = p_statements.duplicate();
 	call->mode = p_migration ? GDDatabaseTxCall::MIGRATION : GDDatabaseTxCall::ACTION;
 	call->tx.instantiate();
 	call->tx->call = call;
-	tx_active = true;
-	tx_call = call;
 	if (postgres_pool.is_valid()) {
-		postgres_pool->acquire().connect(callable_mp(call.ptr(), &GDDatabaseTxCall::on_acquire), Object::CONNECT_ONE_SHOT);
+		pool_txs.insert(call.ptr());
+		Signal acquired = postgres_pool->acquire();
+		call->acquire_call = Ref<GDPostgresPoolCall>(Object::cast_to<GDPostgresPoolCall>(acquired.get_object()));
+		acquired.connect(callable_mp(call.ptr(), &GDDatabaseTxCall::on_acquire), Object::CONNECT_ONE_SHOT);
 	} else {
+		tx_active = true;
+		tx_call = call;
 		query_tx(call->generation, "BEGIN", Array()).connect(callable_mp(call.ptr(), &GDDatabaseTxCall::on_begin), Object::CONNECT_ONE_SHOT);
 	}
 	return Signal(call.ptr(), "finished");
@@ -1034,6 +1308,19 @@ Signal GDDatabaseClient::start_tx(const Callable &p_action, const Array &p_state
 // Execute a callback inside a transaction on the same connection.
 Signal GDDatabaseClient::transaction(const Callable &p_action) {
 	return start_tx(p_action, Array(), false);
+}
+
+// Retry the complete transaction after a serialization conflict.
+Signal GDDatabaseClient::serialize(const Callable &p_action) {
+	if (postgres.is_null() && postgres_pool.is_null()) return query_fail("serialization retry needs PostgreSQL", Err::UNSUPPORTED);
+	if (!p_action.is_valid()) return query_fail("serialization retry needs a callable", Err::INVALID_DATA);
+	Ref<GDDatabaseRetryCall> call;
+	call.instantiate();
+	call->self_hold = call;
+	call->owner = Ref<GDDatabaseClient>(this);
+	call->action = p_action;
+	call->run();
+	return Signal(call.ptr(), "finished");
 }
 
 // Apply SQL statements sequentially in one transaction.
@@ -1046,7 +1333,29 @@ void GDDatabaseClient::close() {
 	if (tx_call.is_valid() && tx_call->defer_close()) {
 		return;
 	}
+	for (GDDatabaseTxCall *call : pool_txs) {
+		if (call->defer_close()) closing = true;
+	}
+	if (closing) {
+		bool committing = false;
+		for (GDDatabaseTxCall *call : pool_txs) committing = committing || call->committing;
+		if (committing) return;
+	}
+	closing = false;
 	Ref<GDDatabaseTxCall> active = tx_call;
+	LocalVector<Ref<GDDatabaseTxCall>> pooled;
+	for (GDDatabaseTxCall *call : pool_txs) pooled.push_back(Ref<GDDatabaseTxCall>(call));
+	for (const Ref<GDDatabaseTxCall> &call : pooled) close_tx_rows(call->generation);
+	pool_txs.clear();
+	while (!sqlite_deferred.is_empty()) {
+		Ref<GDDatabaseCall> call = sqlite_deferred.front()->get();
+		sqlite_deferred.pop_front();
+		{
+			MutexLock lock(sqlite_mutex);
+			record_sqlite_wait(call.ptr());
+		}
+		call->complete({ Variant(), Err::make("database is closed", Err::INTERRUPTED) });
+	}
 	tx_call.unref();
 	close_tx_rows(tx_generation);
 	tx_active = false;
@@ -1070,6 +1379,7 @@ void GDDatabaseClient::close() {
 	if (active.is_valid()) {
 		active->owner_closed();
 	}
+	for (const Ref<GDDatabaseTxCall> &call : pooled) call->owner_closed();
 }
 
 // Check whether the selected driver is connected.
@@ -1124,28 +1434,33 @@ void GDDatabaseClient::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("query_rows_async", "sql", "args"), &GDDatabaseClient::query_rows_async, DEFVAL(Array()));
 	ClassDB::bind_method(D_METHOD("transaction", "action"), &GDDatabaseClient::transaction);
 	ClassDB::bind_method(D_METHOD("transaction_async", "action"), &GDDatabaseClient::transaction_async);
+	ClassDB::bind_method(D_METHOD("serialize", "action"), &GDDatabaseClient::serialize);
+	ClassDB::bind_method(D_METHOD("serialize_async", "action"), &GDDatabaseClient::serialize_async);
 	ClassDB::bind_method(D_METHOD("migrate", "statements"), &GDDatabaseClient::migrate);
 	ClassDB::bind_method(D_METHOD("migrate_async", "statements"), &GDDatabaseClient::migrate_async);
 	ClassDB::bind_method(D_METHOD("stats"), &GDDatabaseClient::stats);
 	ClassDB::bind_method(D_METHOD("close"), &GDDatabaseClient::close);
 	ClassDB::bind_method(D_METHOD("is_open"), &GDDatabaseClient::is_open);
-	ADD_AWAIT("open", "R:Variant");
-	ADD_AWAIT("open_async", "R:Variant");
-	ADD_AWAIT("query", "R:Dictionary");
-	ADD_AWAIT("query_async", "R:Dictionary");
-	ADD_AWAIT("query_row", "R:Dictionary");
-	ADD_AWAIT("query_row_async", "R:Dictionary");
-	ADD_AWAIT("query_rows", "R:GDDatabaseRows");
-	ADD_AWAIT("query_rows_async", "R:GDDatabaseRows");
-	ADD_AWAIT("transaction", "R:Variant");
-	ADD_AWAIT("transaction_async", "R:Variant");
-	ADD_AWAIT("migrate", "R:int");
-	ADD_AWAIT("migrate_async", "R:int");
+	ADD_AWAIT("open", "Pair:Variant");
+	ADD_AWAIT("open_async", "Pair:Variant");
+	ADD_AWAIT("query", "Pair:Dictionary");
+	ADD_AWAIT("query_async", "Pair:Dictionary");
+	ADD_AWAIT("query_row", "Pair:Dictionary");
+	ADD_AWAIT("query_row_async", "Pair:Dictionary");
+	ADD_AWAIT("query_rows", "Pair:GDDatabaseRows");
+	ADD_AWAIT("query_rows_async", "Pair:GDDatabaseRows");
+	ADD_AWAIT("transaction", "Pair:Variant");
+	ADD_AWAIT("transaction_async", "Pair:Variant");
+	ADD_AWAIT("serialize", "Pair:Variant");
+	ADD_AWAIT("serialize_async", "Pair:Variant");
+	ADD_AWAIT("migrate", "Pair:int");
+	ADD_AWAIT("migrate_async", "Pair:int");
 	ADD_AUTO_WAIT("open");
 	ADD_AUTO_WAIT("query");
 	ADD_AUTO_WAIT("query_row");
 	ADD_AUTO_WAIT("query_rows");
 	ADD_AUTO_WAIT("transaction");
+	ADD_AUTO_WAIT("serialize");
 	ADD_AUTO_WAIT("migrate");
 }
 
@@ -1215,7 +1530,7 @@ void GDRedisAPI::_bind_methods() {
 // Expose embedded database creation to script.
 void GDSQLiteAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("open", "path", "opts"), &GDSQLiteAPI::open, DEFVAL(Dictionary()));
-	ADD_RESULT("open", "GDSQLiteDB");
+	ADD_PAIR_RESULT("open", "GDSQLiteDB");
 }
 
 // Expose the shared database entry point to script.

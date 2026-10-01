@@ -148,6 +148,7 @@ public:
 		HashMap<StringName, StringName> await_class_map;
 		HashSet<StringName> auto_wait_methods;
 		HashMap<StringName, StringName> result_class_map;
+		HashSet<StringName> pair_result_methods; // Methods that return value and error separately.
 		HashMap<StringName, StringName> method_group_map; // Purpose groups for organizing public method documentation.
 
 		AHashMap<StringName, PropertySetGet> property_setget;
@@ -514,8 +515,10 @@ public:
 	static void set_auto_wait(const StringName &p_class, const StringName &p_method);
 	static bool is_auto_wait(const StringName &p_class, const StringName &p_method);
 	// Attach the successful value type to methods returning R.
-	static void set_result_class(const StringName &p_class, const StringName &p_method, const StringName &p_result_class);
 	static StringName get_result_class(const StringName &p_class, const StringName &p_method);
+	// Mark a native method as returning a value and an error in separate slots.
+	static void set_pair_result(const StringName &p_class, const StringName &p_method, const StringName &p_result_class);
+	static bool is_pair_result(const StringName &p_class, const StringName &p_method);
 	// Register and retrieve purpose groups for public method documentation.
 	static void set_method_group(const StringName &p_class, const StringName &p_method, const StringName &p_group);
 	static StringName get_method_group(const StringName &p_class, const StringName &p_method);

@@ -16,6 +16,10 @@ def disabled_class_builder(target, source, env):
 
 # Generate version info
 def version_info_builder(target, source, env):
+    # Use one canonical product version in runtime output and package selection.
+    values = dict(source[0].read())
+    if values["cli_status"] != "stable":
+        values["cli_version"] += "-" + values["cli_status"]
     with methods.generated_wrapper(str(target[0])) as file:
         file.write(
             """\
@@ -32,7 +36,7 @@ def version_info_builder(target, source, env):
 #define GODOT_VERSION_DOCS_URL "https://docs.godotengine.org/en/" GODOT_VERSION_DOCS_BRANCH
 #define GD_DOCS_NEUTRAL_URL "https://docs.godotengine.org/en/stable"
 #define GD_CLI_VERSION "{cli_version}"
-""".format(**source[0].read())
+""".format(**values)
         )
 
 

@@ -14,15 +14,18 @@
 #include "cli/api/gen.h"
 #include "cli/api/math.h"
 #include "cli/api/text.h"
+#include "cli/sys/gdtask.h"
 #include "cli/data/codec.h"
 #include "cli/data/format.h"
 #include "cli/data/json.h"
+#include "cli/mail/mail.h"
 #include "cli/db/database.h"
 #include "cli/db/pg.h"
 #include "cli/db/redis.h"
 #include "cli/db/sqlite.h"
 #include "cli/net/serve.h"
 #include "cli/net/socket.h"
+#include "cli/online/match.h"
 #include "cli/sys/os.h"
 #include "cli/sys/file_stream.h"
 #include "cli/sys/perm.h"
@@ -46,14 +49,20 @@ public:
 	Signal sleep(double p_sec) { return Async::sleep(p_sec); }
 	// Start a callable and return its completion signal.
 	Signal spawn(const Callable &p_fn) { return Async::spawn(p_fn); }
+	// Start a callable with separate value and error completion slots.
+	Signal spawn_pair(const Callable &p_fn) { return Async::spawn_pair(p_fn); }
+	// Invoke a dynamically selected function with separate result slots.
+	VariantPair call_pair(const Callable &p_fn);
 	// Start supplied Callables and collect their results and supplied Signals in input order.
 	Signal all(const Array &p_signals) { return Async::all(p_signals); }
 	// Return the index of the first completed signal.
 	Signal race(const Array &p_signals) { return Async::race(p_signals); }
 	// Wait for an operation or its deadline, whichever comes first.
-	Signal with_timeout(const Signal &p_signal, double p_sec) { return Async::with_timeout(p_signal, p_sec); }
+	Signal with_timeout(const Variant &p_task, double p_sec) { return Async::with_timeout(GDTask::signal_of(p_task), p_sec); }
 	// Propagate context cancellation to an operation.
-	Signal with_context(const Ref<GDAsyncContext> &p_context, const Signal &p_signal) { return Async::with_context(p_context, p_signal); }
+	Signal with_context(const Ref<GDAsyncContext> &p_context, const Variant &p_task) { return Async::with_context(p_context, GDTask::signal_of(p_task)); }
+	// Propagate context cancellation while preserving both result slots.
+	Signal with_context_pair(const Ref<GDAsyncContext> &p_context, const Variant &p_task) { return Async::with_context(p_context, GDTask::signal_of(p_task, true), true); }
 	// Create a context that shares a cancellation reason.
 	Ref<GDAsyncContext> context() { return Async::ctx(); }
 };
@@ -87,8 +96,8 @@ public:
 	Signal warn(const String &p_msg, const Variant &p_extra = Variant()) { return log.warn(p_msg, p_extra); }
 	// Write an error-level line.
 	Signal error(const String &p_msg, const Variant &p_extra = Variant()) { return log.error(p_msg, p_extra); }
-	// Log the contents of a failed Result.
-	Signal result(const Ref<R> &p_r, const String &p_msg) { return log.result(p_r, p_msg); }
+	// Log a failed operation's error.
+	Signal result(const Ref<Err> &p_error, const String &p_msg) { return log.result(p_error, p_msg); }
 	// Format a log line without writing it.
 	String format(const String &p_level, const String &p_msg, const Variant &p_extra = Variant()) const;
 	// Return a signal after preceding file output completes.
@@ -108,7 +117,7 @@ public:
 	// Check whether a host port is available for listening.
 	bool is_free(int64_t p_port, const String &p_host) { return Net::is_free(p_port, p_host); }
 	// Let the kernel choose for zero, or search from the specified positive port.
-	Ref<R> free_port(int64_t p_from, const String &p_host) { return Net::free_port(p_from, p_host); }
+	VariantPair free_port(int64_t p_from, const String &p_host) { return Net::free_port(p_from, p_host); }
 	// Resolve a hostname outside the event loop.
 	Signal resolve(const String &p_host);
 	Signal resolve_async(const String &p_host) { return resolve(p_host); }
@@ -119,8 +128,9 @@ public:
 	Signal dial_tls(const String &p_host, int64_t p_port, const Dictionary &p_opts) { return GDTLSDialCall::start(p_host, p_port, p_opts); }
 	Signal dial_tls_async(const String &p_host, int64_t p_port, const Dictionary &p_opts) { return dial_tls(p_host, p_port, p_opts); }
 	// Open TCP listeners and UDP packet connections.
-	Ref<R> listen_tcp(const String &p_host, int64_t p_port) { return GDTCPListener::listen(p_host, p_port); }
-	Ref<R> listen_udp(const String &p_host, int64_t p_port, int64_t p_buffer) { return GDUDPPacketConn::listen(p_host, p_port, p_buffer); }
+	VariantPair listen_tcp(const String &p_host, int64_t p_port) { return GDTCPListener::listen(p_host, p_port); }
+	// Bind a UDP socket to the requested local host and port with the supplied receive-buffer size.
+	VariantPair listen_udp(const String &p_host, int64_t p_port, int64_t p_buffer) { return GDUDPPacketConn::listen(p_host, p_port, p_buffer); }
 	// Dispatch port checks and discovery to I/O workers.
 	Signal is_free_async(int64_t p_port, const String &p_host);
 	Signal free_port_async(int64_t p_from, const String &p_host);
@@ -149,7 +159,7 @@ public:
 	Signal fetch(const String &p_url, const Dictionary &p_opts) { return Http::fetch(p_url, p_opts, transport); }
 	Signal fetch_async(const String &p_url, const Dictionary &p_opts) { return fetch(p_url, p_opts); }
 	// Parse URL text into a component dictionary.
-	Ref<R> parse_url(const String &p_raw) { return Url::parse(p_raw); }
+	VariantPair parse_url(const String &p_raw) { return Url::parse(p_raw); }
 	Signal parse_url_async(const String &p_raw);
 	// Format URL components as text.
 	String build_url(const Dictionary &p_url) { return Url::build(p_url); }
@@ -160,7 +170,7 @@ public:
 	// Return a scheme's default port.
 	int default_port(const String &p_scheme) { return Url::default_port(p_scheme); }
 	// Parse query text into a dictionary.
-	Ref<R> decode_query(const String &p_raw) { return Url::decode_query(p_raw); }
+	VariantPair decode_query(const String &p_raw) { return Url::decode_query(p_raw); }
 	Signal decode_query_async(const String &p_raw);
 	// Encode a query dictionary as text.
 	String encode_query(const Dictionary &p_query) { return Url::encode_query(p_query); }
@@ -188,13 +198,19 @@ public:
 	Signal open(const String &p_path, const String &p_mode) { return GDFileStream::open(p_path, p_mode); }
 	Signal open_async(const String &p_path, const String &p_mode) { return open(p_path, p_mode); }
 	// Remove a text file only if its contents remain unchanged.
-	Ref<R> _remove_text(const String &p_path, const String &p_old) { return Os::remove_text(p_path, p_old); }
+	VariantPair _remove_text(const String &p_path, const String &p_old) { return Os::remove_text(p_path, p_old); }
 	// Get the internal lock serializing multi-operation file transactions.
-	Ref<R> _lock(const String &p_path) { return Os::lock_file(p_path); }
+	VariantPair _lock(const String &p_path) { return Os::lock_file(p_path); }
 	// Mount one package checkout as a private read-only source.
 	String _local(const String &p_path);
 	String _local_stamp(const String &p_path);
-	// Isolate regular-file operations on workers because they are not kernel-pollable.
+	Dictionary _global_info(); // Supply installer metadata without granting those reads to the installed entry.
+	// Type-check a staged global entry without granting runtime process permissions.
+	VariantPair _check_global(const String &p_root, const String &p_entry, const PackedStringArray &p_flags);
+	// Read the whole file as UTF-8 text without blocking the event loop.
+	// @param path File path relative to the execution directory or a mounted path.
+	// @returns Decoded text, including line endings.
+	// @errors File access and read failures are returned through Err.
 	Signal read_text_async(const String &p_path);
 	Signal read_bytes_async(const String &p_path, int64_t p_offset, int64_t p_max);
 	Signal write_text_async(const String &p_path, const String &p_body);
@@ -273,9 +289,9 @@ public:
 	Array unique_by(const Array &p_items, const Callable &p_key) { return Coll::unique_by(p_items, p_key); }
 	// Remove duplicate values.
 	Array unique(const Array &p_items) { return Coll::unique(p_items); }
-	// Sort by selected values.
+	// Sort by selected values while retaining source order for equal keys.
 	Array sort_by(const Array &p_items, const Callable &p_pick) { return Coll::sort_by(p_items, p_pick); }
-	// Sort by specified dictionary keys.
+	// Sort by specified dictionary keys while retaining source order for equal keys.
 	Array sort_key(const Array &p_items, const String &p_key) { return Coll::sort_key(p_items, p_key); }
 	// Pair elements at corresponding positions in two arrays.
 	Array zip(const Array &p_a, const Array &p_b) { return Coll::zip(p_a, p_b); }
@@ -324,56 +340,87 @@ protected:
 	static void _bind_methods();
 
 public:
-	Ref<R> gzip_writer(const Ref<RefCounted> &p_writer, int64_t p_level) { return GDGzipWriter::create(p_writer, p_level); } // Create a compressor writing to a byte destination.
+	VariantPair gzip_writer(const Ref<RefCounted> &p_writer, int64_t p_level) { return GDGzipWriter::create(p_writer, p_level); } // Create a compressor writing to a byte destination.
 	// Read and write in-memory document formats.
-	Ref<R> csv(const String &p_src, const String &p_sep) { return Csv::parse(p_src, p_sep); }
+	VariantPair csv(const String &p_src, const String &p_sep) { return Csv::parse(p_src, p_sep); }
+	// Encode rows as delimited text, quoting fields that contain separators, quotes, or line endings.
 	String to_csv(const Array &p_rows, const String &p_sep) { return Csv::stringify(p_rows, p_sep); }
-	Ref<R> csv_objects(const String &p_src, const String &p_sep) { return Csv::parse_objects(p_src, p_sep); }
+	// Parse delimited text using its first row as field names for the remaining object rows.
+	VariantPair csv_objects(const String &p_src, const String &p_sep) { return Csv::parse_objects(p_src, p_sep); }
+	// Encode object rows as delimited text with a header row naming their fields.
 	String to_csv_objects(const Array &p_items, const String &p_sep) { return Csv::stringify_objects(p_items, p_sep); }
-	Ref<R> ini(const String &p_src) { return Ini::parse(p_src); }
+	// Parse sectioned key-value text into a dictionary.
+	VariantPair ini(const String &p_src) { return Ini::parse(p_src); }
+	// Serialize a dictionary as sectioned key-value text.
 	String to_ini(const Dictionary &p_data) { return Ini::stringify(p_data); }
-	Ref<R> toml(const String &p_src) { return Toml::parse(p_src); }
-	Ref<R> to_toml(const Dictionary &p_data, const String &p_prefix) { return Toml::stringify(p_data, p_prefix); }
-	Ref<R> yaml(const String &p_src) { return Yaml::parse(p_src); }
-	Ref<R> to_yaml(const Variant &p_data, int p_depth) { return Yaml::stringify(p_data, p_depth); }
-	Ref<R> jsonc(const String &p_src) { return Jsonc::parse(p_src); }
+	// Parse configuration text into its structured values and report malformed input.
+	VariantPair toml(const String &p_src) { return Toml::parse(p_src); }
+	// Serialize configuration values with an optional table prefix; unsupported values return an error.
+	VariantPair to_toml(const Dictionary &p_data, const String &p_prefix) { return Toml::stringify(p_data, p_prefix); }
+	// Parse indentation-based document text into structured values and report malformed input.
+	VariantPair yaml(const String &p_src) { return Yaml::parse(p_src); }
+	// Serialize structured values using the requested initial indentation depth.
+	VariantPair to_yaml(const Variant &p_data, int p_depth) { return Yaml::stringify(p_data, p_depth); }
+	// Decode JSON text permitting comments and trailing commas.
+	VariantPair jsonc(const String &p_src) { return Jsonc::parse(p_src); }
+	// Remove comments and trailing commas from JSON-like text before strict decoding.
 	String strip_jsonc(const String &p_src) { return Jsonc::strip(p_src); }
-	Ref<R> jsonl(const String &p_src) { return Jsonl::parse(p_src); }
-	Ref<R> to_jsonl(const Array &p_items) { return Jsonl::stringify(p_items); }
+	// Decode newline-delimited JSON records into an array; malformed records return an error.
+	VariantPair jsonl(const String &p_src) { return Jsonl::parse(p_src); }
+	// Encode each supplied value as one JSON record terminated by a newline.
+	VariantPair to_jsonl(const Array &p_items) { return Jsonl::stringify(p_items); }
 	Ref<GDJSONLReader> jsonl_reader();
-	Ref<R> front_matter(const String &p_src) { return Front::parse(p_src); }
+	// Split document metadata from the body and parse its declared metadata format.
+	VariantPair front_matter(const String &p_src) { return Front::parse(p_src); }
+	// Return whether the document begins with a recognized metadata delimiter.
 	bool has_front_matter(const String &p_src) { return Front::has(p_src); }
-	Ref<R> to_front_matter(const Dictionary &p_attrs, const String &p_body, const String &p_kind) { return Front::stringify(p_attrs, p_body, p_kind); }
-	Ref<R> xml(const String &p_src) { return Xml::parse(p_src); }
-	Ref<R> to_xml(const Dictionary &p_data, int p_indent) { return Xml::stringify(p_data, p_indent); }
-	Ref<R> env(const String &p_src) { return Dotenv::parse(p_src); }
-	Ref<R> to_env(const Dictionary &p_data) { return Dotenv::stringify(p_data); }
-	Ref<R> tar(const Array &p_entries) { return Tar::pack(p_entries); }
-	Ref<R> untar(const PackedByteArray &p_data) { return Tar::unpack(p_data); }
+	// Encode attributes in the selected metadata format and prepend them to the document body.
+	VariantPair to_front_matter(const Dictionary &p_attrs, const String &p_body, const String &p_kind) { return Front::stringify(p_attrs, p_body, p_kind); }
+	// Parse markup text into a structured dictionary and report malformed input.
+	VariantPair xml(const String &p_src) { return Xml::parse(p_src); }
+	// Encode a document dictionary as markup using the supplied indentation width.
+	VariantPair to_xml(const Dictionary &p_data, int p_indent) { return Xml::stringify(p_data, p_indent); }
+	// Parse environment-assignment text into a dictionary without changing process variables.
+	VariantPair env(const String &p_src) { return Dotenv::parse(p_src); }
+	// Encode key-value pairs as environment assignments, quoting values when necessary.
+	VariantPair to_env(const Dictionary &p_data) { return Dotenv::stringify(p_data); }
+	// Pack named entries into an in-memory archive without writing files.
+	VariantPair tar(const Array &p_entries) { return Tar::pack(p_entries); }
+	// Decode an in-memory archive into entries without extracting them onto the filesystem.
+	VariantPair untar(const PackedByteArray &p_data) { return Tar::unpack(p_data); }
 	// Encode a value as strict JSON UTF-8 bytes.
-	Ref<R> json_encode(const Variant &p_value, const Dictionary &p_opts) { return JsonData::encode(p_value, p_opts); }
+	// @param value Value to serialize.
+	// @param opts Encoding options for formatting and validation.
+	// @returns UTF-8 encoded JSON bytes.
+	// @errors Unsupported or cyclic values and non-finite numbers return Err.
+	// @see GD.data.json_decode
+	VariantPair json_encode(const Variant &p_value, const Dictionary &p_opts) { return JsonData::encode(p_value, p_opts); }
 	// Decode bytes as strict JSON.
-	Ref<R> json_decode(const PackedByteArray &p_data) { return JsonData::decode(p_data); }
+	// @param data UTF-8 JSON input bytes.
+	// @returns Parsed value; a successful null is distinct from a parse failure.
+	// @errors Malformed JSON or invalid input encoding returns Err.
+	// @see GD.data.json_encode
+	VariantPair json_decode(const PackedByteArray &p_data) { return JsonData::decode(p_data); }
 	// Encode bytes as hexadecimal text.
 	String hex_encode(const PackedByteArray &p_data) { return Encoding::hex_encode(p_data); }
 	// Decode hexadecimal text into bytes.
-	Ref<R> hex_decode(const String &p_text) { return Encoding::hex_decode(p_text); }
+	VariantPair hex_decode(const String &p_text) { return Encoding::hex_decode(p_text); }
 	// Encode bytes as Base64 text.
 	String base64_encode(const PackedByteArray &p_data) { return Encoding::base64_encode(p_data); }
 	// Decode Base64 text into bytes.
-	Ref<R> base64_decode(const String &p_text, bool p_raw = false) { return Encoding::base64_decode(p_text, p_raw); }
+	VariantPair base64_decode(const String &p_text, bool p_raw = false) { return Encoding::base64_decode(p_text, p_raw); }
 	// Encode bytes as URL-safe Base64 text.
 	String base64url_encode(const PackedByteArray &p_data) { return Encoding::base64url_encode(p_data); }
 	// Decode URL-safe Base64 text into bytes.
-	Ref<R> base64url_decode(const String &p_text, bool p_raw = true) { return Encoding::base64url_decode(p_text, p_raw); }
+	VariantPair base64url_decode(const String &p_text, bool p_raw = true) { return Encoding::base64url_decode(p_text, p_raw); }
 	// Encode bytes as Base32 text.
 	String base32_encode(const PackedByteArray &p_data) { return Encoding::base32_encode(p_data); }
 	// Decode Base32 text into bytes.
-	Ref<R> base32_decode(const String &p_text, bool p_raw = false) { return Encoding::base32_decode(p_text, p_raw); }
+	VariantPair base32_decode(const String &p_text, bool p_raw = false) { return Encoding::base32_decode(p_text, p_raw); }
 	// Encode an integer as variable-length bytes.
 	PackedByteArray varint_encode(int64_t p_n) { return Encoding::varint_encode(p_n); }
 	// Read an integer from variable-length bytes.
-	Ref<R> varint_decode(const PackedByteArray &p_data, int p_at) { return Encoding::varint_decode(p_data, p_at); }
+	VariantPair varint_decode(const PackedByteArray &p_data, int p_at) { return Encoding::varint_decode(p_data, p_at); }
 	// Concatenate byte sequences.
 	PackedByteArray concat(const Array &p_parts) { return Bytes::concat(p_parts); }
 	// Check whether two byte sequences are equal.
@@ -395,13 +442,13 @@ public:
 	// Split bytes on a delimiter sequence.
 	Array split(const PackedByteArray &p_src, const PackedByteArray &p_sep) { return Bytes::split(p_src, p_sep); }
 	// Encode a value as MessagePack.
-	Ref<R> msgpack(const Variant &p_value) { return Msgpack::encode(p_value); }
+	VariantPair msgpack(const Variant &p_value) { return Msgpack::encode(p_value); }
 	// Decode MessagePack into a value.
-	Ref<R> unmsgpack(const PackedByteArray &p_data) { return Msgpack::decode(p_data); }
+	VariantPair unmsgpack(const PackedByteArray &p_data) { return Msgpack::decode(p_data); }
 	// Encode a value as CBOR.
-	Ref<R> cbor(const Variant &p_value) { return Cbor::encode(p_value); }
+	VariantPair cbor(const Variant &p_value) { return Cbor::encode(p_value); }
 	// Decode CBOR into a value.
-	Ref<R> uncbor(const PackedByteArray &p_data) { return Cbor::decode(p_data); }
+	VariantPair uncbor(const PackedByteArray &p_data) { return Cbor::decode(p_data); }
 	// Compute a SHA-224 digest.
 	PackedByteArray sha224(const PackedByteArray &p_msg) { return Hash::sha224(p_msg); }
 	// Compute a SHA-256 digest.
@@ -421,7 +468,7 @@ public:
 	// Compute a SHA-1 digest.
 	PackedByteArray sha1(const PackedByteArray &p_msg) { return Hash::sha1(p_msg); }
 	// Compute HMAC with the selected hash.
-	Ref<R> hmac(const String &p_hash, const PackedByteArray &p_key, const PackedByteArray &p_msg) { return Hash::hmac(p_hash, p_key, p_msg); }
+	VariantPair hmac(const String &p_hash, const PackedByteArray &p_key, const PackedByteArray &p_msg) { return Hash::hmac(p_hash, p_key, p_msg); }
 	// Compute HMAC-SHA-256.
 	PackedByteArray hmac_sha256(const PackedByteArray &p_key, const PackedByteArray &p_msg) { return Hash::hmac_sha256(p_key, p_msg); }
 	// Combine two byte sequences with exclusive OR.
@@ -429,15 +476,15 @@ public:
 	// Compare two byte sequences in constant time.
 	bool equal_ct(const PackedByteArray &p_a, const PackedByteArray &p_b) { return Hash::equal_ct(p_a, p_b); }
 	// Derive a key with PBKDF2-HMAC-SHA-256.
-	Ref<R> pbkdf2_sha256(const PackedByteArray &p_pass, const PackedByteArray &p_salt, int64_t p_rounds) { return Hash::pbkdf2_sha256(p_pass, p_salt, p_rounds); }
+	VariantPair pbkdf2_sha256(const PackedByteArray &p_pass, const PackedByteArray &p_salt, int64_t p_rounds) { return Hash::pbkdf2_sha256(p_pass, p_salt, p_rounds); }
 	// Derive a PBKDF2 key with the selected hash and output length.
-	Ref<R> pbkdf2(const String &p_hash, const PackedByteArray &p_pass, const PackedByteArray &p_salt, int64_t p_rounds, int64_t p_size) { return Hash::pbkdf2(p_hash, p_pass, p_salt, p_rounds, p_size); }
+	VariantPair pbkdf2(const String &p_hash, const PackedByteArray &p_pass, const PackedByteArray &p_salt, int64_t p_rounds, int64_t p_size) { return Hash::pbkdf2(p_hash, p_pass, p_salt, p_rounds, p_size); }
 	// Derive an HKDF key from a secret, salt, and context information.
-	Ref<R> hkdf(const String &p_hash, const PackedByteArray &p_secret, const PackedByteArray &p_salt, const PackedByteArray &p_info, int64_t p_size) { return Hash::hkdf(p_hash, p_secret, p_salt, p_info, p_size); }
+	VariantPair hkdf(const String &p_hash, const PackedByteArray &p_secret, const PackedByteArray &p_salt, const PackedByteArray &p_info, int64_t p_size) { return Hash::hkdf(p_hash, p_secret, p_salt, p_info, p_size); }
 	// Extract an HKDF pseudorandom key from a secret and salt.
-	Ref<R> hkdf_extract(const String &p_hash, const PackedByteArray &p_secret, const PackedByteArray &p_salt) { return Hash::hkdf_extract(p_hash, p_secret, p_salt); }
+	VariantPair hkdf_extract(const String &p_hash, const PackedByteArray &p_secret, const PackedByteArray &p_salt) { return Hash::hkdf_extract(p_hash, p_secret, p_salt); }
 	// Expand an HKDF key from a pseudorandom key and context information.
-	Ref<R> hkdf_expand(const String &p_hash, const PackedByteArray &p_key, const PackedByteArray &p_info, int64_t p_size) { return Hash::hkdf_expand(p_hash, p_key, p_info, p_size); }
+	VariantPair hkdf_expand(const String &p_hash, const PackedByteArray &p_key, const PackedByteArray &p_info, int64_t p_size) { return Hash::hkdf_expand(p_hash, p_key, p_info, p_size); }
 	// Run key derivation on CPU workers.
 	Signal pbkdf2_sha256_async(const PackedByteArray &p_pass, const PackedByteArray &p_salt, int64_t p_rounds);
 	Signal json_encode_async(const Variant &p_value, const Dictionary &p_opts);
@@ -521,17 +568,17 @@ public:
 	// Check whether text is a ULID.
 	bool is_ulid(const String &p_text) { return Ulid::is_valid(p_text); }
 	// Read the timestamp from a ULID.
-	Ref<R> ulid_time(const String &p_text) { return Ulid::time_of(p_text); }
+	VariantPair ulid_time(const String &p_text) { return Ulid::time_of(p_text); }
 	// Create a random version-4 UUID.
 	String uuid() { return Uuid::v4(); }
 	// Create a name-based version-5 UUID.
-	Ref<R> uuid_v5(const String &p_space, const String &p_name) { return Uuid::v5(p_space, p_name); }
+	VariantPair uuid_v5(const String &p_space, const String &p_name) { return Uuid::v5(p_space, p_name); }
 	// Dispatch UUID generation for long names to a CPU worker.
 	Signal uuid_v5_async(const String &p_space, const String &p_name);
 	// Check whether text is a UUID.
 	bool is_uuid(const String &p_text) { return Uuid::is_valid(p_text); }
 	// Convert a UUID to 16 bytes.
-	Ref<R> uuid_bytes(const String &p_text) { return Uuid::to_bytes(p_text); }
+	VariantPair uuid_bytes(const String &p_text) { return Uuid::to_bytes(p_text); }
 	// Return a UUID's version.
 	int uuid_version(const String &p_text) { return Uuid::version_of(p_text); }
 	// Return the nil UUID.
@@ -554,14 +601,28 @@ protected:
 
 public:
 	// Return the edit distance between two strings.
+	// @param a First string to compare.
+	// @param b Second string to compare.
+	// @returns Nonnegative edit count; zero means equal strings.
+	// @see GD.text.closest
 	int distance(const String &p_a, const String &p_b) { return Text::distance(p_a, p_b); }
 	// Return the nearest candidate string.
+	// @param word Input to compare against candidates.
+	// @param options Candidate strings in selection order.
+	// @returns The closest candidate, or an empty string when none meets the similarity threshold.
 	String closest(const String &p_word, const PackedStringArray &p_options) { return Text::closest(p_word, p_options); }
 	// Shorten text to fit a width and append an ellipsis.
+	// @param text Input string.
+	// @param width Maximum output length in characters.
+	// @returns The original text when it fits, otherwise a shortened form.
 	String ellipsis(const String &p_text, int p_width) { return Text::ellipsis(p_text, p_width); }
 	// Format a byte count with readable units.
+	// @param bytes Byte count to format.
+	// @returns A human-readable size string.
 	String size_of(int64_t p_bytes) { return Text::size_of(p_bytes); }
 	// Format milliseconds as a readable duration.
+	// @param ms Duration in milliseconds.
+	// @returns A human-readable duration string.
 	String duration(double p_ms) { return Text::duration(p_ms); }
 	// Convert text to snake_case.
 	String snake(const String &p_text) { return Text::snake(p_text); }
@@ -599,9 +660,9 @@ public:
 	// Build an HTML tag from its name, body, and attributes.
 	String tag(const String &p_name, const String &p_body, const Dictionary &p_attrs) { return Html::tag(p_name, p_body, p_attrs); }
 	// Fill template placeholders with dictionary values.
-	Ref<R> fill(const String &p_tpl, const Dictionary &p_data, const Dictionary &p_partials) { return Html::fill(p_tpl, p_data, p_partials); }
+	VariantPair fill(const String &p_tpl, const Dictionary &p_data, const Dictionary &p_partials) { return Html::fill(p_tpl, p_data, p_partials); }
 	// Analyze template HTML contexts into a shareable renderer.
-	Ref<R> template_of(const String &p_tpl, const Dictionary &p_partials) { return Html::template_of(p_tpl, p_partials); }
+	VariantPair template_of(const String &p_tpl, const Dictionary &p_partials) { return Html::template_of(p_tpl, p_partials); }
 	// Dispatch HTML processing to CPU workers.
 	Signal escape_async(const String &p_text);
 	Signal unescape_async(const String &p_text);
@@ -620,7 +681,7 @@ protected:
 
 public:
 	// Parse version text into a component dictionary.
-	Ref<R> parse(const String &p_raw) { return Semver::parse(p_raw); }
+	VariantPair parse(const String &p_raw) { return Semver::parse(p_raw); }
 	// Require a complete semantic version suitable for packages.
 	bool is_canonical(const String &p_raw) { return Semver::is_canonical(p_raw); }
 	// Compare two versions.
@@ -632,7 +693,7 @@ public:
 	// Format a version dictionary as text.
 	String text(const Dictionary &p_v) { return Semver::text(p_v); }
 	// Select the newest version within a range.
-	Ref<R> best(const PackedStringArray &p_list, const String &p_range) { return Semver::best(p_list, p_range); }
+	VariantPair best(const PackedStringArray &p_list, const String &p_range) { return Semver::best(p_list, p_range); }
 	// Dispatch selection from large version lists to a CPU worker.
 	Signal best_async(const PackedStringArray &p_list, const String &p_range);
 };
@@ -659,7 +720,7 @@ public:
 	// Format a Unix timestamp as an HTTP date.
 	String to_http(int64_t p_unix) { return Datetime::to_http(p_unix); }
 	// Parse ISO 8601 text into a Unix timestamp.
-	Ref<R> parse_iso(const String &p_text) { return Datetime::parse_iso(p_text); }
+	VariantPair parse_iso(const String &p_text) { return Datetime::parse_iso(p_text); }
 	// Add an amount in the specified unit to a Unix timestamp.
 	int64_t add(int64_t p_unix, int64_t p_amount, const String &p_unit) { return Datetime::add(p_unix, p_amount, p_unit); }
 	// Return the difference between timestamps in the specified unit.
@@ -694,7 +755,7 @@ public:
 	// Return a permitted environment value or its default.
 	Variant env(const String &p_name, const Variant &p_fallback) const;
 	// Return a required environment value or Err.
-	Ref<R> require_env(const String &p_name) const;
+	VariantPair require_env(const String &p_name) const;
 	// Return the current working directory.
 	String cwd() const;
 	// Return the operating-system name only when permitted.
@@ -748,6 +809,7 @@ class GDAPI : public Object {
 	GDAsyncAPI *async = nullptr;
 	GDLogAPI *log = nullptr;
 	GDNetAPI *net = nullptr;
+	GDMailAPI *mail = nullptr;
 	GDHTTPAPI *http = nullptr;
 	GDWebAPI *web = nullptr;
 	GDFSAPI *file = nullptr;
@@ -762,6 +824,7 @@ class GDAPI : public Object {
 	GDCLIAPI *cli = nullptr;
 	GDTestAPI *test = nullptr;
 	GDDatabaseAPI *database = nullptr;
+	GDOnlineAPI *online = nullptr;
 
 protected:
 	// Expose child APIs as GD properties.
@@ -778,6 +841,7 @@ public:
 	GDLogAPI *get_log() const { return log; }
 	// Return the network API.
 	GDNetAPI *get_net() const { return net; }
+	GDMailAPI *get_mail() const { return mail; }
 	// Return the HTTP client API.
 	GDHTTPAPI *get_http() const { return http; }
 	// Return the web application API.
@@ -806,6 +870,8 @@ public:
 	GDTestAPI *get_test() const { return test; }
 	// Return the shared database API.
 	GDDatabaseAPI *get_database() const { return database; }
+	// Return the online-game services API.
+	GDOnlineAPI *get_online() const { return online; }
 };
 
 // Run caller-provided JWT revocation checks on the main thread after CPU work completes.
@@ -817,7 +883,7 @@ class GDWebJwtCall : public RefCounted {
 	bool has_check = false; // Distinguish an omitted check from an invalid value.
 
 	// Apply main-thread revocation checks to worker verification results.
-	void verified(const Variant &p_result);
+	void verified(const Variant &p_result, const Variant &p_error);
 
 protected:
 	static void _bind_methods();
@@ -841,25 +907,25 @@ public:
 	// Create a raw HTTP server.
 	Ref<GDWebServer> server() const;
 	// Create a plain-text response.
-	Dictionary text(const String &p_body, int64_t p_status) const { return Http::text(p_body, p_status); }
+	Ref<GDWebResponse> text(const String &p_body, int64_t p_status) const { return Http::text(p_body, p_status); }
 	// Create an HTML response.
-	Dictionary html(const String &p_body, int64_t p_status) const { return Http::html(p_body, p_status); }
+	Ref<GDWebResponse> html(const String &p_body, int64_t p_status) const { return Http::html(p_body, p_status); }
 	// Encode locally and yield only unfinished traversal after the current time slice.
-	Variant json(const Variant &p_data, int64_t p_status) const;
+	VariantPair json(const Variant &p_data, int64_t p_status) const;
 	// Create a binary response.
-	Dictionary bytes(const PackedByteArray &p_body, const String &p_type, int64_t p_status) const { return Http::bytes_out(p_body, p_type, p_status); }
+	Ref<GDWebResponse> bytes(const PackedByteArray &p_body, const String &p_type, int64_t p_status) const { return Http::bytes_out(p_body, p_type, p_status); }
 	// Create a lazy response from a producer writing bytes into its response Writer.
-	Dictionary stream(const Callable &p_next, int64_t p_length, const String &p_type, int64_t p_status) const;
+	Ref<GDWebResponse> stream(const Callable &p_next, int64_t p_length, const String &p_type, int64_t p_status) const;
 	// Create a redirect response.
-	Dictionary redirect(const String &p_to, int64_t p_status, bool p_away) const { return Http::redirect(p_to, p_status, p_away); }
+	Ref<GDWebResponse> redirect(const String &p_to, int64_t p_status, bool p_away) const { return Http::redirect(p_to, p_status, p_away); }
 	// Add basic security headers to a response.
-	Dictionary guard(const Dictionary &p_reply) const { return Http::guard(p_reply); }
+	Ref<GDWebResponse> guard(const Ref<GDWebResponse> &p_reply) const { return Http::guard(p_reply); }
 	// Create a 404 response.
-	Dictionary not_found(const String &p_msg) const { return Http::not_found(p_msg); }
+	Ref<GDWebResponse> not_found(const String &p_msg) const { return Http::not_found(p_msg); }
 	// Replace a response header.
-	Dictionary header(const Dictionary &p_reply, const String &p_name, const Variant &p_value) const { return Http::head(p_reply, p_name, p_value); }
+	Ref<GDWebResponse> header(const Ref<GDWebResponse> &p_reply, const String &p_name, const Variant &p_value) const { return Http::head(p_reply, p_name, p_value); }
 	// Append another response header with the same name.
-	Dictionary add_header(const Dictionary &p_reply, const String &p_name, const Variant &p_value) const { return Http::add_head(p_reply, p_name, p_value); }
+	Ref<GDWebResponse> add_header(const Ref<GDWebResponse> &p_reply, const String &p_name, const Variant &p_value) const { return Http::add_head(p_reply, p_name, p_value); }
 	// Render an HTML response from a template file, yielding internal waits to the event loop.
 	Signal view(const String &p_path, const Dictionary &p_data, int64_t p_status, const Callable &p_renderer) const;
 	// Load a template on a worker and apply the optional renderer before returning a result.
@@ -869,9 +935,9 @@ public:
 	// Return the HTTP status corresponding to an Err.
 	int error_status(const Ref<Err> &p_err) const { return Http::status_of(p_err); }
 	// Sign claims into a JWT.
-	Ref<R> jwt_sign(const Dictionary &p_claims, const Variant &p_key, const Dictionary &p_opts) const { return GDWebApp::jwt_sign(p_claims, p_key, p_opts); }
+	VariantPair jwt_sign(const Dictionary &p_claims, const Variant &p_key, const Dictionary &p_opts) const { return GDWebApp::jwt_sign(p_claims, p_key, p_opts); }
 	// Verify a JWT and return its claims.
-	Ref<R> jwt_verify(const String &p_token, const Variant &p_key, const Dictionary &p_opts) const { return GDWebApp::jwt_verify(p_token, p_key, p_opts); }
+	VariantPair jwt_verify(const String &p_token, const Variant &p_key, const Dictionary &p_opts) const { return GDWebApp::jwt_verify(p_token, p_key, p_opts); }
 	Signal jwt_sign_async(const Dictionary &p_claims, const Variant &p_key, const Dictionary &p_opts) const;
 	Signal jwt_verify_async(const String &p_token, const Variant &p_key, const Dictionary &p_opts) const;
 	// Create middleware that verifies bearer JWTs.
@@ -899,7 +965,7 @@ public:
 	// Create a rule from an allowed-value list.
 	Dictionary one_of(const Array &p_values) const { return GDWebApp::rule_one_of(p_values); }
 	// Validate a value with a rule and return the safe value.
-	Ref<R> validate(const Variant &p_value, const Dictionary &p_rule) const { return GDWebApp::validate(p_value, p_rule); }
+	VariantPair validate(const Variant &p_value, const Dictionary &p_rule) const { return GDWebApp::validate(p_value, p_rule); }
 	Signal validate_async(const Variant &p_value, const Dictionary &p_rule) const;
 	// Create JSON-body validation middleware.
 	Ref<GDWebMiddleware> json_body(const Dictionary &p_rule, const String &p_name) const { return GDWebApp::valid_json(p_rule, p_name); }

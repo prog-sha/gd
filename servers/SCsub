@@ -5,10 +5,15 @@ Import("env")
 
 env.servers_sources = []
 
-env.add_source_files(env.servers_sources, "register_server_types.cpp")
+if env["view"]:
+    env.add_source_files(env.servers_sources, "#tmp/view-src/servers/register_server_types.cpp")
+else:
+    env.add_source_files(env.servers_sources, "register_server_types.cpp")
 
 SConscript("physics_2d/SCsub")
 SConscript("physics_3d/SCsub")
+if env["view"]:
+    SConscript("#game/servers/SCsub")
 
 lib = env.add_library("servers", env.servers_sources)
 

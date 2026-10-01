@@ -14,12 +14,15 @@ private:
 	State state = CLOSED; // State from connection setup through closure.
 	bool eof = false; // Receive-side EOF, independent of send-side closure.
 	int dial_error = 0; // OS connection error used to decide whether to select another ephemeral port.
+	int accept_os_error = 0; // Native cause of the most recent accept failure.
 	void defaults(); // Apply the default TCP settings to a connected socket.
 
 public:
 	Error dial(const String &p_host, int p_port); // Begin connecting to a numeric address.
 	Error listen(const String &p_host, int p_port, bool p_reuse = false); // Open a listener using the OS backlog setting.
 	Error accept(Ref<GDStream> &r_peer); // Accept only connections that have already arrived.
+	int get_accept_os_error() const { return accept_os_error; } // Preserve the native listener failure code.
+	int get_dial_os_error() const { return dial_error; } // Preserve the native connection failure code.
 	void poll(); // Confirm connection completion with SO_ERROR and getpeername.
 	void probe(); // Check for receive EOF without consuming data.
 	bool retryable() const; // Identify retryable self-connections and EADDRNOTAVAIL failures.

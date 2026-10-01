@@ -35,32 +35,22 @@
 
 //#define DEBUG_XML
 
+// Identify markup whitespace while scanning element names and attributes.
 static inline bool _is_white_space(char c) {
-	return (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
-//! sets the state that text was found. Returns true if set should be set
+// Report element text, including short whitespace-only content.
 bool XMLParser::_set_text(const char *start, const char *end) {
-	// check if text is more than 2 characters, and if not, check if there is
-	// only white space, so that this text won't be reported
-	if (end - start < 3) {
-		const char *p = start;
-		for (; p != end; ++p) {
-			if (!_is_white_space(*p)) {
-				break;
-			}
-		}
-
-		if (p == end) {
-			return false;
-		}
+	if (start == end) {
+		return false;
 	}
 
-	// set current text to the parsed text, and replace xml special characters
+	// Decode entity references before exposing the token.
 	String s = String::utf8(start, (int)(end - start));
 	node_name = s.xml_unescape();
 
-	// current XML node type is text
+	// Identify the text token for readers.
 	node_type = NODE_TEXT;
 
 	return true;

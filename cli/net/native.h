@@ -8,7 +8,7 @@ class GDNative : public RefCounted {
 	bool reading = false; // Read interest registered with the kernel.
 	bool writing = false; // Write interest registered with the kernel.
 	Callable ready; // Delivery target retained when only readiness directions change.
-	Ref<R> poll_error; // Kernel registration failure propagated to subsequent waits.
+	Ref<Err> poll_error; // Kernel registration failure propagated to subsequent waits.
 	size_t users = 0; // Descriptor leases acquired and released only by the owning runtime.
 	bool closing = false; // Logical closure while an already-dispatched operation still owns the descriptor.
 	void destroy(); // Close the OS handle after the final in-flight operation finishes.
@@ -20,7 +20,8 @@ protected:
 
 public:
 	static int last_error(); // Return the OS error immediately after a system call.
-	static Error failure(int p_error); // Distinguish EAGAIN as a readiness wait.
+	static Error failure(int p_error); // Classify socket failures without losing native causes.
+	static bool refused(int p_error); // Identify a target that explicitly rejected connection setup.
 	static bool interrupted(int p_error); // Identify EINTR as a reason to retry the same system call.
 	void watch(bool p_read, bool p_write, const Callable &p_call); // Register only the required readiness directions with the kernel.
 	void read_wait(bool p_on) { watch(p_on, writing, ready); } // Toggle read readiness only.
@@ -29,7 +30,7 @@ public:
 	bool is_open() const { return fd != -1 && !closing; } // Reject new operations immediately after logical closure.
 	bool retain_io(); // Pin the descriptor before dispatching a worker, preventing reuse during its system calls.
 	void release_io(); // Release a completed worker's descriptor lease on the owning runtime.
-	Ref<R> wait_error() const { return poll_error; } // Distinguish registration failure from an ordinary peer disconnect.
+	Ref<Err> wait_error() const { return poll_error; } // Distinguish registration failure from an ordinary peer disconnect.
 	void close(); // Unregister from the poller before closing the socket.
 	~GDNative(); // Release the owned socket.
 };

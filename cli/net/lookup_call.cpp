@@ -26,15 +26,15 @@ void GDLookupJob::finish() {
 		call->job.unref();
 		call->done(result);
 	}
-	result.unref();
+	result = VariantPair();
 }
 
 // Check each caller's permissions before joining an in-flight lookup for the same host.
 Signal GDLookupCall::start(const String &p_host, bool p_single, int p_port) {
 	const String host = p_host.contains(":") && !p_host.begins_with("[") ? "[" + p_host + "]" : p_host;
 	const String target = p_port >= 0 ? vformat("%s:%d", host, p_port) : host;
-	if (!Perm::check(Perm::NET, target)) return Async::ready(R::err("name lookup is not allowed", Err::PERMISSION_DENIED));
-	if (stopping || Pool::is_stopping()) return Async::ready(R::err("worker pool stopped", Err::INTERRUPTED));
+	if (!Perm::check(Perm::NET, target)) return Async::ready_pair({ Variant(), Err::make("name lookup is not allowed", Err::PERMISSION_DENIED) });
+	if (stopping || Pool::is_stopping()) return Async::ready_pair({ Variant(), Err::make("worker pool stopped", Err::INTERRUPTED) });
 	Ref<GDLookupCall> call;
 	call.instantiate();
 	call->self_hold = call;
@@ -42,7 +42,8 @@ Signal GDLookupCall::start(const String &p_host, bool p_single, int p_port) {
 	call->port = p_port;
 	const Signal out(call.ptr(), "finished");
 	if (GDDatagram::is_ip(p_host)) {
-		Async::post(call, callable_mp(call.ptr(), &GDLookupCall::done).bind(GDLookup::all(p_host))); // Numeric IP addresses do not need a resolver worker.
+		call->pending = GDLookup::all(p_host);
+		Async::post(call, callable_mp(call.ptr(), &GDLookupCall::deliver)); // Numeric IP addresses do not need a resolver worker.
 		return out;
 	}
 	Ref<GDLookupJob> job;
@@ -58,28 +59,31 @@ Signal GDLookupCall::start(const String &p_host, bool p_single, int p_port) {
 	call->entry = job->calls.push_back(call);
 	if (fresh && !job->submit()) {
 		call->cancel();
-		return Async::ready(R::err("worker pool stopped", Err::INTERRUPTED));
+		return Async::ready_pair({ Variant(), Err::make("worker pool stopped", Err::INTERRUPTED) });
 	}
 	return out;
 }
 
 // Filter results with each caller's IP permissions rather than sharing authorization.
-void GDLookupCall::done(const Ref<R> &p_result) {
+void GDLookupCall::done(const VariantPair &p_result) {
 	if (self_hold.is_null()) return;
 	Ref<GDLookupCall> keep(this);
 	self_hold.unref();
-	Ref<R> out = p_result;
-	if (out.is_valid() && out->get_ok()) {
-		const PackedStringArray addresses = out->get_v();
+	VariantPair out = p_result;
+	if (out.error.get_type() == Variant::NIL) {
+		const PackedStringArray addresses = out.value;
 		PackedStringArray allowed;
 		for (const String &address : addresses) {
 			if (port < 0 || Perm::check_net_ip(vformat("%s:%d", address, port))) allowed.push_back(address);
 		}
-		out = allowed.is_empty() ? R::err("no permitted address to connect", Err::PERMISSION_DENIED) :
-				(single ? R::ok(allowed[0]) : R::ok(allowed));
+		out = allowed.is_empty() ? VariantPair{ Variant(), Err::make("no permitted address to connect", Err::PERMISSION_DENIED) } :
+				VariantPair{ single ? Variant(allowed[0]) : Variant(allowed), Variant() };
 	}
-	emit_signal("finished", out.is_valid() ? out : R::err("name lookup failed", Err::NOT_FOUND));
+	Async::finish(this, SNAME("finished"), out.value, out.error);
 }
+
+// Complete a numeric lookup after its signal is available to the caller.
+void GDLookupCall::deliver() { done(pending); }
 
 // Remove a job from the shared registry when its last waiter leaves; the worker retains the OS call.
 void GDLookupCall::cancel() {
@@ -90,7 +94,7 @@ void GDLookupCall::cancel() {
 		if (job->calls.is_empty() && active && active->ptr() == job.ptr()) groups.erase(job->host);
 		job.unref();
 	}
-	done(R::err("name lookup canceled", Err::INTERRUPTED));
+	done({ Variant(), Err::make("name lookup canceled", Err::INTERRUPTED) });
 }
 
 // Cancel all calls at shutdown without starting new resolver jobs.
@@ -106,5 +110,5 @@ void GDLookupCall::shutdown_all() {
 // Register lookup completion and individual cancellation.
 void GDLookupCall::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDLookupCall::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }

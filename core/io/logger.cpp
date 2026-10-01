@@ -227,6 +227,7 @@ void StdLogger::logv(const char *p_format, va_list p_list, bool p_err) {
 	}
 
 	if (p_err) {
+		fflush(stdout); // Keep earlier output ahead of the error when both streams share one pipe.
 		vfprintf(stderr, p_format, p_list);
 	} else {
 		vprintf(p_format, p_list);

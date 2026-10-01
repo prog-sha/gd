@@ -108,6 +108,56 @@ Error ENetMultiplayerPeer::create_client(const String &p_address, int p_port, in
 	return OK;
 }
 
+// Set the DTLS key after creating the ENet host and before accepting clients.
+Error ENetMultiplayerPeer::create_server_dtls(int p_port, int p_max_clients, const Ref<TLSOptions> &p_options) {
+	ERR_FAIL_COND_V_MSG(_is_active(), ERR_ALREADY_IN_USE, "The multiplayer instance is already active.");
+	ERR_FAIL_COND_V(p_options.is_null() || !p_options->is_server(), ERR_INVALID_PARAMETER);
+	set_refuse_new_connections(false);
+	Ref<ENetConnection> host;
+	host.instantiate();
+	Error err = host->create_host_bound(bind_ip, p_port, p_max_clients, 0, 0, 0);
+	if (err == OK) {
+		err = host->dtls_server_setup(p_options);
+	}
+	if (err != OK) {
+		host->destroy();
+		return err;
+	}
+	active_mode = MODE_SERVER;
+	unique_id = 1;
+	connection_status = CONNECTION_CONNECTED;
+	hosts[0] = host;
+	return OK;
+}
+
+// Enable DTLS certificate verification, then start the ENet connection through the relay.
+Error ENetMultiplayerPeer::create_client_dtls(const String &p_address, int p_port, const String &p_hostname, const Ref<TLSOptions> &p_options) {
+	ERR_FAIL_COND_V_MSG(_is_active(), ERR_ALREADY_IN_USE, "The multiplayer instance is already active.");
+	ERR_FAIL_COND_V(p_hostname.is_empty() || p_options.is_null() || p_options->is_server(), ERR_INVALID_PARAMETER);
+	set_refuse_new_connections(false);
+	Ref<ENetConnection> host;
+	host.instantiate();
+	Error err = host->create_host(1, 0, 0, 0);
+	if (err == OK) {
+		err = host->dtls_client_setup(p_hostname, p_options);
+	}
+	if (err != OK) {
+		host->destroy();
+		return err;
+	}
+	unique_id = generate_unique_id();
+	Ref<ENetPacketPeer> peer = host->connect_to_host(p_address, p_port, 0, unique_id);
+	if (peer.is_null()) {
+		host->destroy();
+		return ERR_CANT_CREATE;
+	}
+	connection_status = CONNECTION_CONNECTING;
+	active_mode = MODE_CLIENT;
+	peers[1] = peer;
+	hosts[0] = host;
+	return OK;
+}
+
 Error ENetMultiplayerPeer::create_mesh(int p_id) {
 	ERR_FAIL_COND_V_MSG(p_id <= 0, ERR_INVALID_PARAMETER, "The unique ID must be greater then 0");
 	ERR_FAIL_COND_V_MSG(_is_active(), ERR_ALREADY_IN_USE, "The multiplayer instance is already active.");

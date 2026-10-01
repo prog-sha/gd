@@ -21,6 +21,7 @@
 #ifdef UNIX_ENABLED
 #include "drivers/unix/file_access_unix_pipe.h"
 
+#include <cerrno>
 #include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -30,6 +31,14 @@ namespace {
 
 constexpr uint64_t WAIT_MS = 0; // Default timeout; zero is unlimited.
 constexpr int READ_BYTES_MAX = 256 * 1024; // Maximum bytes drained from one pipe per step.
+
+// Append process bytes without replacing earlier output or imposing a total limit.
+bool append_output(PackedByteArray &r_out, const uint8_t *p_data, int64_t p_size) {
+	const int64_t at = r_out.size();
+	if (p_size > INT_MAX - 1 - at || r_out.resize(at + p_size) != OK) return false;
+	memcpy(r_out.ptrw() + at, p_data, p_size);
+	return true;
+}
 
 // Create an absolute deadline without overflow; zero is unlimited.
 uint64_t deadline_after(uint64_t p_wait) {
@@ -129,7 +138,7 @@ void ProcWaitJob::run() {
 			}
 		}
 		const bool moved = call->pull_output(done);
-		if (call->output_failed) {
+		if (call->output_failed || call->output_read_failed) {
 			call->reap_now();
 			break;
 		}
@@ -239,9 +248,7 @@ void GDProcCall::launch_on_worker() {
 	}
 }
 
-// Drain worker-side buffered output, returning true when bytes were read.
-// Use drained reads to determine EOF; FIONREAD returning zero is not sufficient.
-// Zero available bytes can mean either no arrival yet or a closed writer.
+// Drain worker-side output and distinguish an idle pipe from EOF.
 bool GDProcCall::pull_output(bool p_done) {
 	Ref<FileAccess> pipes[2] = { out_pipe, err_pipe };
 	bool *eofs[2] = { &out_eof, &err_eof };
@@ -252,11 +259,41 @@ bool GDProcCall::pull_output(bool p_done) {
 			continue;
 		}
 		int64_t took = 0;
+	#ifdef UNIX_ENABLED
+		const Ref<FileAccessUnixPipe> up = p;
+		if (up.is_valid()) {
+			uint8_t buf[32 * 1024]; // Per-read buffer; total captured output remains unlimited.
+			while (took < READ_BYTES_MAX) {
+				const ssize_t got = ::read(up->get_read_fd(), buf, MIN((int64_t)sizeof(buf), READ_BYTES_MAX - took));
+				if (got == 0) {
+					*eofs[i] = true;
+					break;
+				}
+				if (got < 0) {
+					if (errno == EINTR) continue;
+					if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+					output_read_failed = true;
+					return moved;
+				}
+				took += got;
+				moved = true;
+				if (!append_output(out, buf, got)) {
+					output_failed = true;
+					return moved;
+				}
+			}
+			continue;
+		}
+	#endif
 		while (took < READ_BYTES_MAX) {
 			// Read only the amount reported available.
 			// This avoids empty nonblocking reads returning EAGAIN.
 			const int64_t avail = (int64_t)p->get_length();
 			if (avail <= 0) {
+				if (p->get_error() != OK && p->get_error() != ERR_FILE_EOF) {
+					output_read_failed = true;
+					return moved;
+				}
 				// Mark EOF only after all writers close.
 				// A reaped child is insufficient if a grandchild still owns a writer.
 				if (writer_gone(p, p_done)) {
@@ -278,12 +315,10 @@ bool GDProcCall::pull_output(bool p_done) {
 			took += got;
 			moved = true;
 			// Retain all requested combined output and propagate allocation failure.
-			const int64_t at = out.size();
-			if (chunk.size() > INT_MAX - 1 - at || out.resize(at + chunk.size()) != OK) {
+			if (!append_output(out, chunk.ptr(), chunk.size())) {
 				output_failed = true;
 				return moved;
 			}
-			memcpy(out.ptrw() + at, chunk.ptr(), chunk.size());
 		}
 	}
 	return moved;
@@ -314,32 +349,33 @@ void GDProcCall::emit_now() {
 	out_pipe.unref();
 	err_pipe.unref();
 
-	Ref<R> result;
+	Ref<Err> error;
 	if (start_error.is_valid()) {
-		result = start_error;
+		error = start_error;
 	} else if (output_failed) {
-		result = R::err("cannot allocate process output buffer", Err::LIMITED);
+		error = Err::make("cannot allocate process output buffer", Err::LIMITED);
+	} else if (output_read_failed) {
+		error = Err::make("cannot read process output", Err::NONE);
 	} else if (!why.is_empty()) {
 		// Distinguish permission denial from launch failure and attach the path and original cause.
-		result = reject_kind != Err::NONE ? R::err(why, reject_kind)
+		error = reject_kind != Err::NONE ? Err::make(why, reject_kind)
 						: SourceError::path(start_path, "exec", ERR_CANT_CREATE, why);
 	} else if (canceled.is_set()) {
-		result = R::err("process was canceled", Err::INTERRUPTED);
+		error = Err::make("process was canceled", Err::INTERRUPTED);
 	} else if (killed.is_set()) {
-		result = R::err("process did not finish in time", Err::TIMED_OUT);
+		error = Err::make("process did not finish in time", Err::TIMED_OUT);
 	} else if (exit_code != 0) {
 		Dictionary info;
 		info["path"] = start_path;
 		info["operation"] = "exec";
 		info["code"] = exit_code;
-		result = R::err(Err::make(vformat("process exited with status %d", exit_code), Err::NONE, info));
+		error = Err::make(vformat("process exited with status %d", exit_code), Err::NONE, info);
 	}
 	// Keep exit status and all captured output even when the operation fails.
 	Dictionary d;
 	d["code"] = exit_code;
 	d["output"] = out.is_empty() ? String() : String::utf8((const char *)out.ptr(), out.size());
-	result = result.is_valid() ? R::err(result->get_e(), Err::NONE, d) : R::ok(d);
-	emit_signal("finished", result);
+	Async::finish(this, SNAME("finished"), d, error.is_valid() ? Variant(error->with_partial(d)) : Variant());
 	start_error.unref();
 	start_args.clear();
 	self_hold.unref(); // Release self-ownership; the call may be destroyed here.
@@ -370,7 +406,7 @@ void GDProcCall::reap_now() {
 // Register completion and cancellation.
 void GDProcCall::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDProcCall::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::DICTIONARY, "value"), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
 // Start a child and return its exit-completion signal.

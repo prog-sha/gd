@@ -36,6 +36,9 @@
 #include "core/object/callable_mp.h"
 #include "scene/main/node.h"
 #include "scene/main/scene_tree.h"
+#ifdef GD_VIEW
+#include "scene/main/window.h"
+#endif
 
 SceneCacheInterface::NodeCache &SceneCacheInterface::_track(Node *p_node) {
 	const ObjectID oid = p_node->get_instance_id();

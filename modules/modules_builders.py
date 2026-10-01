@@ -49,3 +49,13 @@ void uninitialize_modules(ModuleInitializationLevel p_level) {{
 }}
 """
         )
+
+
+def modules_tests_builder(target, source, env):
+    """Write includes so the test entry can run each module test."""
+    headers = sorted([os.path.relpath(src.path, methods.base_folder).replace("\\", "/") for src in source])
+    with methods.generated_wrapper(str(target[0])) as file:
+        file.write("// IWYU pragma: begin_keep.\n")
+        for header in headers:
+            file.write(f'#include "{header}"\n')
+        file.write("// IWYU pragma: end_keep.\n")

@@ -390,6 +390,17 @@ Ref<CryptoKey> CryptoMbedTLS::generate_rsa(int p_bytes) {
 	return out;
 }
 
+Ref<CryptoKey> CryptoMbedTLS::generate_ec() {
+	Ref<CryptoKeyMbedTLS> out;
+	out.instantiate();
+	int ret = mbedtls_pk_setup(&(out->pkey), mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
+	ERR_FAIL_COND_V(ret != 0, nullptr);
+	ret = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(out->pkey), mbedtls_ctr_drbg_random, &ctr_drbg);
+	out->public_only = false;
+	ERR_FAIL_COND_V(ret != 0, nullptr);
+	return out;
+}
+
 Ref<X509Certificate> CryptoMbedTLS::generate_self_signed_certificate(Ref<CryptoKey> p_key, const String &p_issuer_name, const String &p_not_before, const String &p_not_after) {
 	Ref<CryptoKeyMbedTLS> key = static_cast<Ref<CryptoKeyMbedTLS>>(p_key);
 	ERR_FAIL_COND_V_MSG(key.is_null(), nullptr, "Invalid private key argument.");

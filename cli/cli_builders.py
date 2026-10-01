@@ -17,6 +17,17 @@ inline constexpr const unsigned char gd_pkg_script[] = {{
 """)
 
 
+def make_mail_script(target, source, env):
+    """Convert the standard mail implementation into an embedded byte array."""
+    buffer = methods.get_buffer(str(source[0]))
+    with methods.generated_wrapper(str(target[0])) as file:
+        file.write(f"""\
+inline constexpr const unsigned char gd_mail_script[] = {{
+{methods.format_buffer(buffer, 1)}
+}};
+""")
+
+
 def make_manual(target, source, env):
     """Embed manual byte arrays with Japanese then English source ordering."""
     with methods.generated_wrapper(str(target[0])) as file:

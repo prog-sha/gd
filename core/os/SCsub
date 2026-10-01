@@ -3,4 +3,9 @@ from misc.utility.scons_hints import *
 
 Import("env")
 
-env.add_source_files(env.core_sources, "*.cpp")
+# Tell feature queries the distribution target; release builds keep debug diagnostics enabled.
+env_os = env.Clone()
+if env["target"] == "template_release":
+    env_os.Append(CPPDEFINES=["GD_RELEASE_TARGET"])
+env_os.add_source_files(env.core_sources, "os.cpp")
+env.add_source_files(env.core_sources, [source for source in Glob("*.cpp") if source.name != "os.cpp"])

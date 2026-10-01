@@ -119,6 +119,8 @@ public:
 
 	Error create_server(int p_port, int p_max_clients = 32, int p_max_channels = 0, int p_in_bandwidth = 0, int p_out_bandwidth = 0);
 	Error create_client(const String &p_address, int p_port, int p_channel_count = 0, int p_in_bandwidth = 0, int p_out_bandwidth = 0, int p_local_port = 0);
+	Error create_server_dtls(int p_port, int p_max_clients, const Ref<TLSOptions> &p_options); // Listen with DTLS enabled.
+	Error create_client_dtls(const String &p_address, int p_port, const String &p_hostname, const Ref<TLSOptions> &p_options); // Connect over DTLS, verifying the certificate.
 	Error create_mesh(int p_id);
 	Error add_mesh_peer(int p_id, Ref<ENetConnection> p_host);
 

@@ -248,7 +248,7 @@ Error GDExtensionLibraryLoader::initialize(GDExtensionInterfaceGetProcAddress p_
 	}
 
 	// Pass type metadata to the extension for application after class registration.
-	p_extension->set_type_metadata(await_classes, result_classes);
+	p_extension->set_type_metadata(await_classes);
 
 	return OK;
 }
@@ -410,11 +410,6 @@ Error GDExtensionLibraryLoader::parse_gdextension_file(const String &p_path) {
 	if (config->has_section("await")) {
 		for (const String &key : config->get_section_keys("await")) {
 			await_classes[key] = config->get_value("await", key);
-		}
-	}
-	if (config->has_section("result")) {
-		for (const String &key : config->get_section_keys("result")) {
-			result_classes[key] = config->get_value("result", key);
 		}
 	}
 

@@ -148,6 +148,8 @@ public:
 	~GDScriptDataType() {}
 };
 
+class GDScriptFunctionState;
+
 class GDScriptFunction {
 public:
 	enum Opcode {
@@ -192,12 +194,15 @@ public:
 		OPCODE_CONSTRUCT_TYPED_DICTIONARY,
 		OPCODE_CALL,
 		OPCODE_CALL_RETURN,
+		OPCODE_CALL_PAIR,
+		OPCODE_CALL_PAIR_ASYNC,
 		OPCODE_CALL_ASYNC,
 		OPCODE_CALL_UTILITY,
 		OPCODE_CALL_UTILITY_VALIDATED,
 		OPCODE_CALL_GDSCRIPT_UTILITY,
 		OPCODE_CALL_BUILTIN_TYPE_VALIDATED,
 		OPCODE_CALL_SELF_BASE,
+		OPCODE_CALL_SELF_BASE_PAIR,
 		OPCODE_CALL_METHOD_BIND,
 		OPCODE_CALL_METHOD_BIND_RET,
 		OPCODE_CALL_BUILTIN_STATIC,
@@ -208,6 +213,7 @@ public:
 		OPCODE_CALL_METHOD_BIND_VALIDATED_NO_RETURN,
 		OPCODE_AWAIT,
 		OPCODE_AWAIT_RESUME,
+		OPCODE_AWAIT_RESUME_PAIR,
 		OPCODE_CREATE_LAMBDA,
 		OPCODE_CREATE_SELF_LAMBDA,
 		OPCODE_JUMP,
@@ -216,6 +222,7 @@ public:
 		OPCODE_JUMP_TO_DEF_ARGUMENT,
 		OPCODE_JUMP_IF_SHARED,
 		OPCODE_RETURN,
+		OPCODE_RETURN_PAIR,
 		OPCODE_RETURN_TYPED_BUILTIN,
 		OPCODE_RETURN_TYPED_ARRAY,
 		OPCODE_RETURN_TYPED_DICTIONARY,
@@ -350,6 +357,7 @@ private:
 	bool _static = false;
 	Vector<GDScriptDataType> argument_types;
 	GDScriptDataType return_type;
+	bool result_pair = false; // Whether this function declares a separate Err return slot.
 	MethodInfo method_info;
 	Variant rpc_config;
 
@@ -490,10 +498,16 @@ public:
 		int line = 0;
 		int defarg = 0;
 		int result_addr = -1; // Bytecode destination for the child's completion value.
+		int result_error_addr = -1; // Bytecode destination for the child's completion error.
 		Variant result;
+		Variant result_error; // Second value received from a paired completion signal.
+		Ref<GDScriptFunctionState> awaited_child; // Child state whose completion may carry a script fault.
 		Variant completion_owner; // Reference retaining the original completion Signal across repeated suspension.
+		bool runtime_fault = false; // Stop a resumed frame after its awaited child faults.
 		bool preemptible = false; // Whether spawn created a preemptible continuation.
 		bool automatic = false; // Whether the continuation follows automatic VM suspension.
+		bool pair_return = false; // Whether this frame completes with a value and an error.
+		bool result_pair_signal = false; // Whether the awaited child emits two result arguments.
 	};
 
 	_FORCE_INLINE_ StringName get_name() const { return name; }
@@ -516,6 +530,7 @@ public:
 	static bool time_slice_due();
 	static uint64_t native_time_slice_deadline(); // Borrow the outer turn even before entering script code.
 	static uint64_t time_slice_deadline(); // Share the active deadline with resumable native operations.
+	static uint64_t runtime_fault_epoch(); // Observe script faults at a native callback boundary.
 	void debug_get_stack_member_state(int p_line, List<Pair<StringName, int>> *r_stackvars) const;
 
 #ifdef DEBUG_ENABLED
@@ -538,6 +553,9 @@ public:
 
 private:
 	GDScriptFunction *function = nullptr;
+	bool runtime_faulted = false; // Mark a suspended function that stopped on a script fault.
+	bool canceling_awaited = false; // Prevent repeated cancellation of an awaited native operation.
+	uint64_t async_scope = 0; // Logical scope carried across script suspension.
 	GDScriptFunction::CallState state;
 	Variant _signal_callback(const Variant **p_args, int p_argcount, Callable::CallError &r_error);
 	void _scheduler_run();
@@ -551,6 +569,8 @@ protected:
 public:
 	bool is_valid(bool p_extended_check = false) const;
 	bool is_automatic() const { return state.automatic; }
+	bool is_pair_return() const { return state.pair_return; }
+	bool is_runtime_faulted() const { return runtime_faulted; }
 	static bool has_scheduled() { return run_at < run_queue.size(); }
 	static void drain_scheduler();
 	static void clear_scheduler();
@@ -566,6 +586,7 @@ public:
 
 	void _clear_stack();
 	void _clear_connections();
+	void cancel_awaited(); // Stop the operation owned by this suspended frame.
 	void _finish_gone();
 
 	GDScriptFunctionState();

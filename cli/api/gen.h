@@ -22,7 +22,7 @@ public:
 	static String format(int64_t p_unix, const String &p_pattern);
 	static String to_iso(int64_t p_unix);
 	static String to_http(int64_t p_unix);
-	static Ref<R> parse_iso(const String &p_text);
+	static VariantPair parse_iso(const String &p_text);
 	// Supported units: second, minute, hour, day, and week.
 	static int64_t add(int64_t p_unix, int64_t p_amount, const String &p_unit);
 	static int64_t diff(int64_t p_a, int64_t p_b, const String &p_unit);
@@ -42,7 +42,7 @@ class Ulid {
 public:
 	String make(int64_t p_ms);
 	static bool is_valid(const String &p_text);
-	static Ref<R> time_of(const String &p_text);
+	static VariantPair time_of(const String &p_text);
 };
 
 // UUID。
@@ -50,9 +50,9 @@ class Uuid {
 public:
 	static String v4();
 	static bool is_valid(const String &p_text);
-	static Ref<R> to_bytes(const String &p_text);
+	static VariantPair to_bytes(const String &p_text);
 	// Derive a deterministic identifier from namespace and name.
-	static Ref<R> v5(const String &p_space, const String &p_name);
+	static VariantPair v5(const String &p_space, const String &p_name);
 	static int version_of(const String &p_text); // Return zero when the UUID cannot be parsed.
 
 	// Standard namespace values specified by RFC 4122.

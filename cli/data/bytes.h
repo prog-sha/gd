@@ -129,19 +129,19 @@ inline bool sock_flush(Wire &p_wire, ByteBuf &r_buf) {
 }
 
 // Decode received bytes as strict JSON.
-inline Ref<R> json_of(const PackedByteArray &p_body) {
+inline VariantPair json_of(const PackedByteArray &p_body) {
 	return JsonData::decode(p_body);
 }
 
 // Preserve the transport cause, supplying a category only when no cause exists.
-inline Ref<R> sock_error(const Wire &p_wire, const String &p_msg, Err::Kind p_kind = Err::INTERRUPTED) {
-	return R::err(p_wire.error().is_valid() ? p_wire.error() : Err::make(p_msg, p_kind));
+inline Ref<Err> sock_error(const Wire &p_wire, const String &p_msg, Err::Kind p_kind = Err::INTERRUPTED) {
+	return p_wire.error().is_valid() ? p_wire.error() : Err::make(p_msg, p_kind);
 }
 
-// Append up to the requested byte boundary, returning failures through R.
+// Append up to the requested byte boundary, returning a transport failure.
 // Read directly into storage after removing consumed bytes.
 // Use the same interface for plain and TLS-wrapped connections.
-inline Ref<R> sock_fill(Wire &p_wire, PackedByteArray &r_buf, int &r_at, int p_read_max, int64_t p_buf_max) {
+inline Ref<Err> sock_fill(Wire &p_wire, PackedByteArray &r_buf, int &r_at, int p_read_max, int64_t p_buf_max) {
 	if (!p_wire.is_valid()) {
 		return sock_error(p_wire, "connection closed");
 	}
@@ -153,12 +153,12 @@ inline Ref<R> sock_fill(Wire &p_wire, PackedByteArray &r_buf, int &r_at, int p_r
 	if (n > 0) {
 		// Enforce the caller's retained-input boundary before accepting additional bytes.
 		if ((int64_t)r_buf.size() - r_at + n > p_buf_max) {
-			return R::err("peer sent too much", Err::INVALID_DATA);
+			return Err::make("peer sent too much", Err::INVALID_DATA);
 		}
 		compact_recv(r_buf, r_at);
 		const int at = r_buf.size();
 		if (r_buf.resize(at + n) != OK) {
-			return R::err("receive buffer allocation failed", Err::LIMITED);
+			return Err::make("receive buffer allocation failed", Err::LIMITED);
 		}
 		// Undo reserved growth when no bytes were read.
 		// Otherwise uninitialized buffer capacity would be parsed as received content.
@@ -169,5 +169,5 @@ inline Ref<R> sock_fill(Wire &p_wire, PackedByteArray &r_buf, int &r_at, int p_r
 			return sock_error(p_wire, "read failed");
 		}
 	}
-	return R::ok();
+	return Ref<Err>();
 }

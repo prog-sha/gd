@@ -32,15 +32,15 @@ class GDWebJwt : public GDWebMiddleware {
 	String keep_name = "jwt";
 
 	static PackedByteArray key_of(const Variant &p_key);
-	static Ref<R> claims_of(const String &p_token, const Variant &p_key, const Dictionary &p_opts); // Validate token contents.
-	static Ref<R> check_claims(const Dictionary &claims, const Dictionary &p_opts); // Apply application revocation checks.
+	static VariantPair claims_of(const String &p_token, const Variant &p_key, const Dictionary &p_opts); // Validate token contents.
+	static VariantPair check_claims(const Dictionary &claims, const Dictionary &p_opts); // Apply application revocation checks.
 
 protected:
 	static void _bind_methods();
 
 public:
-	static Ref<R> sign(const Dictionary &p_claims, const Variant &p_key, const Dictionary &p_opts);
-	static Ref<R> verify(const String &p_token, const Variant &p_key, const Dictionary &p_opts);
+	static VariantPair sign(const Dictionary &p_claims, const Variant &p_key, const Dictionary &p_opts);
+	static VariantPair verify(const String &p_token, const Variant &p_key, const Dictionary &p_opts);
 	static Ref<GDWebJwt> auth(const Variant &p_key, const Dictionary &p_opts);
 	Variant handle(const Ref<GDWebRequest> &p_req) const;
 };
@@ -75,20 +75,21 @@ public:
 	static Dictionary object(const Dictionary &p_fields, bool p_extra);
 	static Dictionary optional(const Dictionary &p_rule, const Variant &p_fallback);
 	static Dictionary one_of(const Array &p_values);
-	static Ref<R> check(const Variant &p_value, const Dictionary &p_rule);
+	static VariantPair check(const Variant &p_value, const Dictionary &p_rule);
 	static Ref<GDWebValid> json(const Dictionary &p_rule, const String &p_name);
 	static Ref<GDWebValid> query(const Dictionary &p_rule, const String &p_name);
 	static Ref<GDWebValid> params(const Dictionary &p_rule, const String &p_name);
 	Variant handle(const Ref<GDWebRequest> &p_req) const;
 };
 
-// Limit requests per selected key within a time window.
+// Limit requests per selected key with a replenishing allowance.
 class GDWebRateLimit : public GDWebMiddleware {
 	GDCLASS(GDWebRateLimit, GDWebMiddleware);
 
 	struct Slot {
-		uint64_t due = 0; // Time when the next window may replace this one.
-		int count = 0;
+		uint64_t due = 0; // Time when an idle key may be removed.
+		uint64_t last = 0; // Time of the previous allowance update.
+		double tokens = 0.0; // Requests available before the next refill.
 	};
 	struct SlotTime {
 		uint64_t due = 0; // Expiry time in milliseconds.
@@ -108,10 +109,14 @@ class GDWebRateLimit : public GDWebMiddleware {
 	Callable key;
 	LocalVector<ProxyNet> proxies;
 	int limit = 60;
-	int key_max = 10000;
+	int key_max = 0; // Zero keeps every key until expiry cleanup.
 	uint64_t window_ms = 60000;
+	uint64_t expires_ms = 180000; // Idle time before releasing a key.
+	uint64_t sweep_due = 0; // Deadline for removing expired keys without an incoming request.
 
 	bool drop_expired(uint64_t p_now);
+	void arm();
+	void sweep();
 	bool trusted(const String &p_ip) const;
 	String client_ip(const Ref<GDWebRequest> &p_req) const;
 
@@ -119,6 +124,7 @@ protected:
 	static void _bind_methods();
 
 public:
+	~GDWebRateLimit();
 	static Ref<GDWebRateLimit> make(const Dictionary &p_opts);
 	Variant handle(const Ref<GDWebRequest> &p_req);
 };
@@ -218,8 +224,8 @@ protected:
 
 public:
 	static Ref<GDWebSessionStore> make(int64_t p_total, int64_t p_per_user, int64_t p_idle_seconds, int64_t p_life_seconds, const String &p_cookie, const String &p_keep);
-	Ref<R> issue(const Variant &p_value);
-	Ref<R> take(const String &p_id);
+	VariantPair issue(const Variant &p_value);
+	VariantPair take(const String &p_id);
 	void drop(const String &p_id);
 	void clear();
 	int size();

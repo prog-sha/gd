@@ -46,7 +46,7 @@ class GDProcCall : public RefCounted {
 	int exit_code = -1; // Child exit code.
 	PackedByteArray out; // Combined output retained as bytes across character boundaries.
 	String why; // Launch failure detail, empty after successful launch.
-	Ref<R> start_error; // Worker-observed launch failure details.
+	Ref<Err> start_error; // Worker-observed launch failure details.
 	String start_path; // Attempted executable for launch diagnostics.
 	PackedStringArray start_args; // Arguments passed to the worker.
 	Err::Kind reject_kind = Err::NONE; // Preflight failure category.
@@ -54,6 +54,7 @@ class GDProcCall : public RefCounted {
 	SafeFlag killed; // Atomic flag read by both deadline handling and the worker.
 	SafeFlag canceled; // The caller stopped waiting, as opposed to the deadline passing.
 	bool output_failed = false; // Worker output-allocation failure read by main only after join.
+	bool output_read_failed = false; // Worker pipe-read failure read by main only after join.
 	bool want_output = false; // Capture output when true; otherwise connect directly to the parent.
 	// Serialize reaping and termination because both can invoke waitpid.
 	// Otherwise one may see ECHILD or terminate a different process after PID reuse.

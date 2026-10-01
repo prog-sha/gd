@@ -50,12 +50,12 @@ String GDExtension::get_extension_list_config_file() {
 }
 
 // Store manifest type metadata for use after class initialization.
-void GDExtension::set_type_metadata(const HashMap<String, String> &p_await, const HashMap<String, String> &p_result) {
+void GDExtension::set_type_metadata(const HashMap<String, String> &p_await) {
 	await_classes = p_await;
-	result_classes = p_result;
 }
 
 // Apply manifest type metadata to registered classes.
+// A plain name declared together with its *_async twin waits automatically, as standard modules do.
 void GDExtension::apply_type_metadata() {
 	for (const KeyValue<String, String> &e : await_classes) {
 		const String cls = e.key.get_slicec('.', 0);
@@ -65,15 +65,9 @@ void GDExtension::apply_type_metadata() {
 			continue;
 		}
 		ClassDB::set_await_class(cls, method, e.value);
-	}
-	for (const KeyValue<String, String> &e : result_classes) {
-		const String cls = e.key.get_slicec('.', 0);
-		const String method = e.key.get_slicec('.', 1);
-		if (cls.is_empty() || method.is_empty() || !ClassDB::class_exists(cls)) {
-			ERR_PRINT(vformat("Bad result entry \"%s\".", e.key));
-			continue;
+		if (!method.ends_with("_async") && await_classes.has(e.key + "_async")) {
+			ClassDB::set_auto_wait(cls, method);
 		}
-		ClassDB::set_result_class(cls, method, e.value);
 	}
 }
 

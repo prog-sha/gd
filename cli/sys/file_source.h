@@ -66,7 +66,7 @@ protected:
 	static void _bind_methods();
 
 public:
-	// Open on a worker and signal R once the complete length is known.
+	// Open on a worker and signal the value and Err once the complete length is known.
 	Signal open(const String &p_path, bool p_read_body = true);
 	// Take an available chunk, returning false when a wait is required.
 	bool take(BodyChunk &r_chunk) override;

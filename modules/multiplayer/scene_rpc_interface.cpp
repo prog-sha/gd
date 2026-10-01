@@ -38,6 +38,9 @@
 #include "scene/main/multiplayer_api.h"
 #include "scene/main/node.h"
 #include "scene/main/scene_tree.h"
+#ifdef GD_VIEW
+#include "scene/main/window.h"
+#endif
 
 // The RPC meta is composed by a single byte that contains (starting from the least significant bit):
 // - `NetworkCommands` in the first four bits.

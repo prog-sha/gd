@@ -8,4 +8,4 @@ module_config = ""
 website = "https://gd.progsha.com/"
 docs = "4.7"
 cli = "0.8.0"  # Public runtime version.
-cli_status = "dev"  # Public runtime release channel.
+cli_status = "stable"  # Public runtime release channel.

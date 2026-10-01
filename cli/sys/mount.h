@@ -97,7 +97,10 @@ public:
 
 	// Create built-in mounts after ProjectSettings initialization.
 	// Return false and stop startup if internal storage is not owned by this user.
-	static bool setup();
+	static bool setup(const String &p_global = String());
+	// Move res:// onto a startup directory other than the working directory.
+	// Keep the current root when the path is empty or ".".
+	static bool bind_res(const String &p_path);
 	// Report whether strict file isolation is enabled.
 	static bool strict_mode() { return strict; }
 

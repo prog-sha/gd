@@ -81,9 +81,9 @@ public:
 	// Advance one row; return false on EOF or failure.
 	Signal next();
 	// Copy the current row into a column-name dictionary.
-	Ref<R> scan() const;
+	VariantPair scan() const;
 	// Return current-row values in column order.
-	Ref<R> values() const;
+	VariantPair values() const;
 	// Return result column names.
 	PackedStringArray columns() const;
 	// Return the reason Next returned false, or null for EOF.

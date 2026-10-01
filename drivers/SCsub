@@ -71,6 +71,9 @@ if env["sdl"] and env["platform"] in ["linuxbsd", "macos", "windows", "ios", "vi
 
 # Core dependencies
 
+if env["view"]:
+    SConscript("#game/drivers_png/SCsub")
+
 env.add_source_files(env.drivers_sources, "*.cpp")
 
 lib = env.add_library("drivers", env.drivers_sources)

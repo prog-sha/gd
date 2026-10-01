@@ -12,31 +12,31 @@
 GDTLSIdentity::~GDTLSIdentity() = default;
 
 // Validate configured certificate blocks and reject unusable signing keys before accepting clients.
-Ref<R> GDTLSIdentity::load(const String &p_cert, const String &p_key, const Dictionary &p_opts) {
-	for (const KeyValue<Variant,Variant> &entry : p_opts) if (String(entry.key) != "client_auth" && String(entry.key) != "client_ca") return R::err(vformat("unknown TLS listener option: %s",entry.key),Err::INVALID_DATA);
+VariantPair GDTLSIdentity::load(const String &p_cert, const String &p_key, const Dictionary &p_opts) {
+	for (const KeyValue<Variant,Variant> &entry : p_opts) if (String(entry.key) != "client_auth" && String(entry.key) != "client_ca") return { Variant(), Err::make(vformat("unknown TLS listener option: %s", entry.key), Err::INVALID_DATA) };
 	const Variant auth = p_opts.get("client_auth","none"), ca = p_opts.get("client_ca","");
-	if (auth.get_type() != Variant::STRING || ca.get_type() != Variant::STRING) return R::err("TLS client_auth and client_ca must be strings",Err::INVALID_DATA);
+	if (auth.get_type() != Variant::STRING || ca.get_type() != Variant::STRING) return { Variant(), Err::make("TLS client_auth and client_ca must be strings", Err::INVALID_DATA) };
 	const char *const modes[] = {"none","request","require","verify_if_given","require_and_verify"}; // Certificate presence and trust requirements are independent policy choices.
 	int mode = -1; for (int at = 0; at != 5; ++at) if (String(auth) == modes[at]) mode = at;
-	if (mode < 0) return R::err("invalid TLS client_auth policy",Err::INVALID_DATA);
-	const Ref<R> cert = Os::read_bytes(p_cert), key = Os::read_bytes(p_key);
-	if (!cert->get_ok()) return cert;
-	if (!key->get_ok()) return key;
-	const PackedByteArray chain = cert->get_v(), secret = key->get_v();
+	if (mode < 0) return { Variant(), Err::make("invalid TLS client_auth policy", Err::INVALID_DATA) };
+	const VariantPair cert = Os::read_bytes(p_cert), key = Os::read_bytes(p_key);
+	if (Ref<Err>(cert.error).is_valid()) return { Variant(), Ref<Err>(cert.error)->with_partial(cert.value) };
+	if (Ref<Err>(key.error).is_valid()) return { Variant(), Ref<Err>(key.error)->with_partial(key.value) };
+	const PackedByteArray chain = cert.value, secret = key.value;
 	const std::string_view certificates(reinterpret_cast<const char *>(chain.ptr()),chain.size()), private_key(reinterpret_cast<const char *>(secret.ptr()),secret.size());
 	auto config = GDCrypto::TLSIdentity::read(certificates,private_key);
-	if (!config) return R::err("invalid TLS certificate chain or private key",Err::INVALID_DATA);
+	if (!config) return { Variant(), Err::make("invalid TLS certificate chain or private key", Err::INVALID_DATA) };
 	// Every declared certificate must decode; malformed trailing configuration is not silently discarded.
 	constexpr std::string_view marker = "-----BEGIN CERTIFICATE-----"; // Exact textual certificate-container boundary.
 	size_t count = 0;
 	for (size_t at = certificates.find(marker); at != certificates.npos; at = certificates.find(marker,at+marker.size())) if (!at || certificates[at-1] == '\n') ++count;
-	if (count != config->chain().size() || (config->signer().kind() == GDCrypto::KeyKind::RSA && config->signer().bits() < 1024)) return R::err("invalid TLS certificate chain or private key",Err::INVALID_DATA);
+	if (count != config->chain().size() || (config->signer().kind() == GDCrypto::KeyKind::RSA && config->signer().bits() < 1024)) return { Variant(), Err::make("invalid TLS certificate chain or private key", Err::INVALID_DATA) };
 	Ref<GDTLSIdentity> identity; identity.instantiate(); identity->config = std::move(config); identity->client_auth = mode;
 	if (!String(ca).is_empty() || mode >= GDCrypto::TLSOptions::VERIFY_IF_GIVEN) {
-		const Ref<R> roots = GDTrust::load(ca); if (!roots->get_ok()) return roots;
-		identity->clients = roots->get_v();
+		const VariantPair roots = GDTrust::load(ca); if (roots.error.get_type() != Variant::NIL) return { Variant(), roots.error };
+		identity->clients = roots.value;
 	}
-	return R::ok(identity);
+	return { identity, Variant() };
 }
 
 // Keep protocol state and incomplete record framing private to the active cryptographic worker.
@@ -103,15 +103,15 @@ Error GDTLS::Context::setup() {
 		trust = identity->clients;
 		if (trust.is_valid()) options.authorities = trust->names();
 	} else if (!insecure && trust.is_null()) {
-		const Ref<R> loaded = GDTrust::load(String());
-		if (!loaded->get_ok()) return fail("TLS trust loading failed", loaded->get_e());
-		trust = loaded->get_v();
+		const VariantPair loaded = GDTrust::load(String());
+		if (loaded.error.get_type() != Variant::NIL) return fail("TLS trust loading failed", loaded.error);
+		trust = loaded.value;
 	}
 	options.verify = [this](const std::vector<GDCrypto::Cert::Ptr> &certificates, bool peer_server) {
 		if (trust.is_null()) return false;
-		const Ref<R> checked = trust->verify(certificates,host,peer_server);
-		if (!checked->get_ok() && failure.is_null()) failure = checked->get_e();
-		return checked->get_ok();
+		const Ref<Err> checked = trust->verify(certificates,host,peer_server);
+		if (checked.is_valid() && failure.is_null()) failure = checked;
+		return checked.is_null();
 	};
 	if (!connection.start(std::move(options))) return fail(vformat("TLS configuration failed (%d)",connection.alert()));
 	initialized = true; state = HANDSHAKE; return OK;
@@ -282,18 +282,18 @@ void GDTLS::launch() {
 	interests();
 	const Ref<GDTLS> keep(this);
 	const std::shared_ptr<Work> work = job;
-	Signal done = GDFileCall::start([keep, work]() -> Ref<R> { keep->ctx->run(*work); return R::ok(); }, true);
+	Signal done = GDPairCall::start([keep, work]() -> VariantPair { keep->ctx->run(*work); return { Variant(), Variant() }; }, true);
 	done.connect(callable_mp(this, &GDTLS::completed), Object::CONNECT_ONE_SHOT);
 }
 
 // Publish results after the completion barrier, keeping cancellation authoritative.
-void GDTLS::completed(const Ref<R> &p_result) {
+void GDTLS::completed(const Variant &, const Ref<Err> &p_error) {
 	const Ref<GDTLS> keep(this);
 	self_hold.unref();
 	const std::shared_ptr<Work> work = std::move(job);
 	busy = false;
 	// Finish an already-running operation before constructing the close alert on the same leased descriptor.
-	if (state == CLOSED && !work->closing && work->state == READY && work->ciphertext.is_empty() && !write_failed && p_result.is_valid() && p_result->get_ok() && !Pool::is_stopping()) {
+	if (state == CLOSED && !work->closing && work->state == READY && work->ciphertext.is_empty() && !write_failed && p_error.is_null() && !Pool::is_stopping()) {
 		job = std::make_shared<Work>();
 		job->closing = true;
 		launch();
@@ -310,7 +310,7 @@ void GDTLS::completed(const Ref<R> &p_result) {
 	if (failure.is_null() && work->state == BROKEN) failure = work->failure;
 	if (!work->ciphertext.is_empty() && !write_failed) { ciphertext.push_back(work->ciphertext); flush(); }
 	if (state == BROKEN) { if (callback.is_valid()) Async::post(keep, callback); return; }
-	if (p_result.is_null() || !p_result->get_ok()) fail("TLS worker failed", p_result.is_valid() ? p_result->get_e() : Ref<Err>());
+	if (p_error.is_valid()) fail("TLS worker failed", p_error);
 	else if (work->state == BROKEN) fail(work->why, work->failure);
 	else {
 		eof = work->eof;

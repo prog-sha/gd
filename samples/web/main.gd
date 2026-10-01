@@ -2,18 +2,18 @@
 var app := GD.web.app()
 
 # Build the shared response data from the requested name.
-func greeting(req):
+func greeting(req: GDWebRequest) -> Dictionary, Err:
 	var name := req.query.get("name", "world")
 	if not name is String:
-		return null, Err.err("name must be text", Err.INVALID_DATA)
-	return {"name": name, "message": "Hello, " + name + "!"}, null
+		return {}, Err("name must be text", Err.INVALID_DATA)
+	return {"name": name, "message": "Hello, " + name + "!"}
 
 # Render the page with escaped template values.
-func home(req):
+func home(req: GDWebRequest) -> GDWebResponse, Err:
 	return GD.web.view("index.html", greeting(req)?)
 
 # Return the same data as JSON.
-func hello(req):
+func hello(req: GDWebRequest) -> GDWebResponse, Err:
 	return GD.web.json(greeting(req)?)
 
 # Listen locally, using an optional port argument.

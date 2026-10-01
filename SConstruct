@@ -263,6 +263,8 @@ opts.Add(BoolVariable("disable_physics_3d", "Disable 3D physics nodes and server
 opts.Add(BoolVariable("disable_navigation_2d", "Disable 2D navigation features", True))  # Build only in the optional game layer.
 opts.Add(BoolVariable("disable_navigation_3d", "Disable 3D navigation features", True))  # Build only in the optional game layer.
 opts.Add(BoolVariable("disable_xr", "Disable XR nodes and server", True))  # Build only in the optional game layer.
+opts.Add(BoolVariable("view", "Build the display executable used by editor and run-game", False))
+opts.Add(BoolVariable("tests", "Compile recorded unit tests into the display executable", False))
 opts.Add(BoolVariable("disable_overrides", "Disable project settings overrides (override.cfg)", False))
 opts.Add(
     BoolVariable(
@@ -492,8 +494,8 @@ for name, path in modules_detected.items():
     else:
         enabled = False
 
-    if name not in GD_PRIME_MODULES:
-        enabled = False  # Exclude optional game modules by default.
+    if name not in GD_PRIME_MODULES and not env["view"]:
+        enabled = False  # Exclude optional game modules unless building the display executable.
 
     opts.Add(BoolVariable(f"module_{name}_enabled", f"Enable module '{name}'", enabled))
 
@@ -544,9 +546,68 @@ env.platform_apis = platform_apis
 # - Debug symbols for crash traces / debuggers
 
 env.dev_build = env["dev_build"]
-# Disable the editor because this build has no rendering or display servers.
-# Retain the false setting for build scripts that inspect it.
-env.editor_build = False
+# Keep the default executable free of display and editor objects.
+# view=yes builds a second executable that is started only for those commands.
+env["bin_stem"] = "gd"
+env["obj_folder"] = "obj"
+env.editor_build = bool(env["view"])
+if env["tests"] and not env["view"]:
+    print_error("Recorded unit tests compile only together with view=yes.")
+    Exit(255)
+if env["view"]:
+    env["bin_stem"] = "gd-godot"
+    env["obj_folder"] = "obj-view"
+    env.Append(CPPDEFINES=["TOOLS_ENABLED", "GD_VIEW"])
+    env.Prepend(CPPPATH=["#tmp/view-src", "#game"])
+    _helper_module("view_extract", "cli/view/extract.py")
+    import view_extract
+
+    view_extract.materialize()
+    if env["tests"]:
+        view_extract.materialize_tests()
+        env.Prepend(CPPPATH=["#tmp/godot-suite"])
+    for key in (
+        "disable_3d",
+        "disable_advanced_gui",
+        "disable_physics_2d",
+        "disable_physics_3d",
+        "disable_navigation_2d",
+        "disable_navigation_3d",
+        "disable_xr",
+    ):
+        if key not in ARGUMENTS:
+            env[key] = False
+    view_flags = {
+        "macos": {"display": True, "metal": True, "coreaudio": True},
+        "linuxbsd": {
+            "x11": True,
+            "wayland": True,
+            "alsa": True,
+            "pulseaudio": True,
+            "dbus": True,
+            "fontconfig": True,
+            "udev": True,
+            "libdecor": True,
+            "touch": True,
+            "vulkan": True,
+            "opengl3": True,
+        },
+        "windows": {"display": True, "vulkan": True, "opengl3": True, "d3d12": True},
+    }
+    for key, value in view_flags.get(env["platform"], {}).items():
+        if key not in ARGUMENTS:
+            env[key] = value
+    # Metal is available on arm64 only. Other architectures use the legacy renderer, which links without an extra SDK.
+    if env["platform"] == "macos" and env["arch"] != "arm64" and "metal" not in ARGUMENTS:
+        env["metal"] = False
+        if "opengl3" not in ARGUMENTS and "vulkan" not in ARGUMENTS:
+            env["opengl3"] = True
+            if "angle" not in ARGUMENTS:
+                env["angle"] = False
+    if not env.File("#main/splash_editor.png").exists():
+        env["no_editor_splash"] = True
+    if env.get("no_editor_splash", False):
+        env.Append(CPPDEFINES=["NO_EDITOR_SPLASH"])
 # Keep type warnings, API argument names, and script backtraces available in release builds.
 env.debug_features = True
 
@@ -1223,10 +1284,14 @@ Export("env")
 SConscript("core/SCsub")
 SConscript("servers/SCsub")
 SConscript("scene/SCsub")
+if env.editor_build:
+    SConscript("editor/SCsub")
 SConscript("drivers/SCsub")
 
 SConscript("platform/SCsub")
 SConscript("modules/SCsub")
+if env["tests"] and env["view"]:
+    SConscript("tmp/godot-suite/tests/SCsub")
 SConscript("main/SCsub")
 
 SConscript("platform/" + env["platform"] + "/SCsub")  # Build selected platform.

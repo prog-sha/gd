@@ -30,15 +30,20 @@
 
 #include "gdscript_parser.h"
 #include "cli/sys/pkgscope.h"
+#include "cli/sys/std.h"
 
 #include "gdscript.h"
+#include "gdscript_online.h"
 #include "gdscript_tokenizer_buffer.h"
 
 #include "core/config/project_settings.h"
+#include "core/io/file_access.h"
 #include "core/io/resource_loader.h"
+#include "core/io/resource_uid.h"
 #include "core/math/math_defs.h"
 #include "core/object/class_db.h"
 #include "core/templates/hash_set.h"
+#include "core/object/script_language.h"
 #include "scene/main/multiplayer_api.h"
 
 #ifdef DEBUG_ENABLED
@@ -150,6 +155,14 @@ GDScriptParser::GDScriptParser() {
 		register_annotation(MethodInfo("@abstract"), AnnotationInfo::SCRIPT | AnnotationInfo::CLASS | AnnotationInfo::FUNCTION, &GDScriptParser::abstract_annotation);
 		// Onready annotation.
 		register_annotation(MethodInfo("@onready"), AnnotationInfo::VARIABLE, &GDScriptParser::onready_annotation);
+		// Marks for who receives a value and whether it is saved. Written before extends, they apply to all members.
+		// An integer is sends per second; a Node reference expression broadcasts that property directly.
+		// The two save variants cannot apply to signals, so they don't accept signals at all.
+		register_annotation(MethodInfo("@online", PropertyInfo(Variant::NIL, "path_or_hz"), PropertyInfo(Variant::NIL, "hz_or_smooth"), PropertyInfo(Variant::NIL, "smooth_or_hz"), PropertyInfo(Variant::INT, "frames")), AnnotationInfo::SCRIPT | AnnotationInfo::VARIABLE | AnnotationInfo::SIGNAL | AnnotationInfo::FUNCTION, &GDScriptParser::online_annotation, varray(Variant(), Variant(), Variant(), 0));
+		register_annotation(MethodInfo("@online_my", PropertyInfo(Variant::NIL, "path_or_hz"), PropertyInfo(Variant::NIL, "hz_or_smooth"), PropertyInfo(Variant::NIL, "smooth_or_hz"), PropertyInfo(Variant::INT, "frames")), AnnotationInfo::SCRIPT | AnnotationInfo::VARIABLE | AnnotationInfo::SIGNAL | AnnotationInfo::FUNCTION, &GDScriptParser::online_annotation, varray(Variant(), Variant(), Variant(), 0));
+		register_annotation(MethodInfo("@online_input"), AnnotationInfo::VARIABLE, &GDScriptParser::online_annotation);
+		register_annotation(MethodInfo("@online_save", PropertyInfo(Variant::NIL, "path_or_hz"), PropertyInfo(Variant::NIL, "hz_or_smooth"), PropertyInfo(Variant::NIL, "smooth_or_hz"), PropertyInfo(Variant::INT, "frames")), AnnotationInfo::SCRIPT | AnnotationInfo::VARIABLE, &GDScriptParser::online_annotation, varray(Variant(), Variant(), Variant(), 0));
+		register_annotation(MethodInfo("@online_save_my", PropertyInfo(Variant::NIL, "path_or_hz"), PropertyInfo(Variant::NIL, "hz_or_smooth"), PropertyInfo(Variant::NIL, "smooth_or_hz"), PropertyInfo(Variant::INT, "frames")), AnnotationInfo::SCRIPT | AnnotationInfo::VARIABLE, &GDScriptParser::online_annotation, varray(Variant(), Variant(), Variant(), 0));
 		// Export annotations.
 		register_annotation(MethodInfo("@export"), AnnotationInfo::VARIABLE, &GDScriptParser::export_annotations<PROPERTY_HINT_NONE, Variant::NIL>);
 		register_annotation(MethodInfo("@export_enum", PropertyInfo(Variant::STRING, "names")), AnnotationInfo::VARIABLE, &GDScriptParser::export_annotations<PROPERTY_HINT_ENUM, Variant::NIL>, varray(), true);
@@ -721,7 +734,16 @@ void GDScriptParser::parse_program() {
 			}
 			AnnotationNode *annotation = parse_annotation(AnnotationInfo::SCRIPT | AnnotationInfo::CLASS_LEVEL | AnnotationInfo::STANDALONE);
 			if (annotation != nullptr) {
-				if (annotation->applies_to(AnnotationInfo::CLASS)) {
+				const bool online_binding = String(annotation->name).begins_with("@online") &&
+						!annotation->resolved_arguments.is_empty() && annotation->resolved_arguments[0].get_type() == Variant::STRING;
+				if (online_binding) {
+					if (previous.type != GDScriptTokenizer::Token::NEWLINE) {
+						push_error(R"(Expected newline after an online property binding.)");
+					}
+					annotation->apply(this, nullptr, head);
+					can_have_class_or_extends = false;
+					break;
+				} else if (annotation->applies_to(AnnotationInfo::CLASS)) {
 					// We do not know in advance what the annotation will be applied to: the `head` class or the subsequent inner class.
 					// If we encounter `class_name`, `extends` or pure `SCRIPT` annotation, then it's `head`, otherwise it's an inner class.
 					annotation_stack.push_back(annotation);
@@ -1106,6 +1128,21 @@ void GDScriptParser::parse_class_member(T *(GDScriptParser::*p_parse_function)(b
 	min_member_doc_line = member->end_line + 1; // Prevent multiple members from using the same doc comment.
 #endif // TOOLS_ENABLED
 
+	// Engine callbacks may be written three times under one name: for every client, owner only, and the Online side.
+	// They would clash in the source, so marked ones are renamed to names the author cannot type.
+	// The running copy strips the marks and an entry point calls them in turn, so the engine calls as usual.
+	if (member->identifier != nullptr && p_member_kind == "function" && GDScriptOnline::is_callback(member->identifier->name)) {
+		for (AnnotationNode *one : member->annotations) {
+			if (one->name == SNAME("@online")) {
+				member->identifier->name = StringName("@" + String(member->identifier->name));
+				break;
+			}
+			if (one->name == SNAME("@online_my")) {
+				member->identifier->name = StringName("@my" + String(member->identifier->name));
+				break;
+			}
+		}
+	}
 	if (member->identifier != nullptr) {
 		if (!((String)member->identifier->name).is_empty()) { // Enums may be unnamed.
 			if (current_class->members_indices.has(member->identifier->name)) {
@@ -1163,7 +1200,16 @@ void GDScriptParser::parse_class_body(bool p_is_multiline) {
 				// Check for class-level and standalone annotations.
 				AnnotationNode *annotation = parse_annotation(AnnotationInfo::CLASS_LEVEL | AnnotationInfo::STANDALONE);
 				if (annotation != nullptr) {
-					if (annotation->applies_to(AnnotationInfo::STANDALONE)) {
+					const bool online_binding = String(annotation->name).begins_with("@online") &&
+							!annotation->resolved_arguments.is_empty() && annotation->resolved_arguments[0].get_type() == Variant::STRING;
+					if (online_binding) {
+						// At line end it marks the child property itself; followed by a declaration it is that variable's display target.
+						if (previous.type == GDScriptTokenizer::Token::NEWLINE) {
+							annotation->apply(this, nullptr, current_class);
+						} else {
+							annotation_stack.push_back(annotation);
+						}
+					} else if (annotation->applies_to(AnnotationInfo::STANDALONE)) {
 						if (previous.type != GDScriptTokenizer::Token::NEWLINE) {
 							push_error(R"(Expected newline after a standalone annotation.)");
 						}
@@ -1300,7 +1346,7 @@ GDScriptParser::VariableNode *GDScriptParser::parse_variable(bool p_is_static, b
 		}
 	}
 
-	// Collect extra names, then either split one R or assign one value per name.
+	// Collect names and match each result to its receiving variable.
 	if (match(GDScriptTokenizer::Token::COMMA)) {
 		if (p_allow_property) {
 			// Members are declared one per line; skip the rest so the message stands alone.
@@ -1334,6 +1380,8 @@ GDScriptParser::VariableNode *GDScriptParser::parse_variable(bool p_is_static, b
 				complete_extents(variable);
 				return nullptr;
 			}
+			// Point errors for later names at the receiving name.
+			reset_extents(extra, extra->identifier);
 			extra->is_static = p_is_static;
 			extra->value_discard = extra->identifier->name == SNAME("_");
 			if (!extra->value_discard) {
@@ -1406,11 +1454,11 @@ GDScriptParser::VariableNode *GDScriptParser::parse_variable(bool p_is_static, b
 			extra->assignments++;
 		}
 		if (variable->extra_values.is_empty() && !variable->extra_variables.is_empty()) {
-			// One R expression unpacks into exactly one success and one Err.
+			// A paired call assigns exactly one value and one Err.
 			if (variable->extra_variables.size() != 1) {
 				push_error("A result declaration must have exactly two names: value and Err.");
 			}
-			variable->r_pair = true;
+			variable->pair_bind = true;
 			variable->error_variable = variable->extra_variables[0];
 			variable->error_discard = variable->error_variable->value_discard;
 		}
@@ -2001,9 +2049,9 @@ bool GDScriptParser::parse_function_signature(FunctionNode *p_function, SuiteNod
 		} else if (match(GDScriptTokenizer::Token::COMMA)) {
 			// Require every comma return signature to end with a failure type.
 			p_function->value_return_type = p_function->return_type;
-			p_function->r_return = true;
+			p_function->pair_return = true;
 			auto is_err_name = [](const TypeNode *type) {
-				return type != nullptr && type->type_chain.size() == 1 && type->type_chain[0]->name == SNAME("Err");
+				return type != nullptr && type->type_chain.size() == 1 && type->type_chain[0]->name == DataType::err_name();
 			};
 			if (is_err_name(p_function->value_return_type)) {
 				push_error(R"(Only the last return type can be "Err".)");
@@ -2285,7 +2333,7 @@ GDScriptParser::SuiteNode *GDScriptParser::parse_suite(const String &p_context, 
 						VariableNode *extra = variable->extra_variables[i];
 						bind(extra, extra->value_discard, extra->value_reuse);
 					}
-					if (variable->r_pair) {
+					if (variable->pair_bind) {
 						variable->error_reuse = variable->error_variable->value_reuse;
 					}
 					if (added == 0) {
@@ -2403,12 +2451,13 @@ GDScriptParser::Node *GDScriptParser::parse_statement() {
 		case GDScriptTokenizer::Token::RETURN: {
 			advance();
 			ReturnNode *n_return = alloc_node<ReturnNode>();
-			if (!is_statement_end()) {
-				if (current_function && (current_function->identifier->name == GDScriptLanguage::get_singleton()->strings._init || current_function->identifier->name == GDScriptLanguage::get_singleton()->strings._static_init)) {
+			if (!is_statement_end() || (in_lambda && !is_statement_end_token())) {
+				if (current_function && current_function->identifier && (current_function->identifier->name == GDScriptLanguage::get_singleton()->strings._init || current_function->identifier->name == GDScriptLanguage::get_singleton()->strings._static_init)) {
 					push_error(R"(Constructor cannot return a value.)");
 				}
 				n_return->return_value = parse_expression(false);
-				if (match(GDScriptTokenizer::Token::COMMA)) {
+				const bool lambda_pair = in_lambda && current_function != nullptr && current_function->return_type == nullptr && (!current_function->lambda_expression_context || current.start_line > current_function->start_line);
+				if ((!in_lambda || (current_function != nullptr && current_function->value_return_type != nullptr) || lambda_pair) && match(GDScriptTokenizer::Token::COMMA)) {
 					// Keep one success expression and one explicit failure expression.
 					n_return->error_value = parse_expression(false);
 					if (n_return->error_value == nullptr) {
@@ -2418,13 +2467,9 @@ GDScriptParser::Node *GDScriptParser::parse_statement() {
 						push_error("A result return must have exactly two values: value and Err.");
 					}
 					if (current_function != nullptr) {
-						current_function->r_return = true;
+						current_function->pair_return = true;
 					}
 				}
-			} else if (in_lambda && !is_statement_end_token()) {
-				// Try to parse it anyway as this might not be the statement end in a lambda.
-				// If this fails the expression will be nullptr, but that's the same as no return, so it's fine.
-				n_return->return_value = parse_expression(false);
 			}
 			complete_extents(n_return);
 			result = n_return;
@@ -2466,7 +2511,53 @@ GDScriptParser::Node *GDScriptParser::parse_statement() {
 		}
 		default: {
 			// Expression statement.
-			ExpressionNode *expression = parse_expression(true); // Allow assignment here.
+			auto parse_target = [&](bool first) -> ExpressionNode * {
+				if (match(GDScriptTokenizer::Token::UNDERSCORE)) {
+					IdentifierNode *discard = alloc_node<IdentifierNode>();
+					reset_extents(discard, previous);
+					discard->name = SNAME("_");
+					complete_extents(discard);
+					return discard;
+				}
+				return parse_expression(first, !first);
+			};
+			ExpressionNode *expression = parse_target(true);
+			if (expression != nullptr && expression->type == Node::IDENTIFIER && match(GDScriptTokenizer::Token::COMMA)) {
+				// Assign parallel targets after evaluating every source expression.
+				AssignmentNode *multi = alloc_node<AssignmentNode>();
+				reset_extents(multi, expression);
+				multi->assignee = expression;
+				do {
+					ExpressionNode *target = parse_target(false);
+					if (target == nullptr) {
+						push_error("Expected assignment target after comma.");
+						break;
+					}
+					multi->extra_assignees.push_back(target);
+				} while (match(GDScriptTokenizer::Token::COMMA));
+				if (consume(GDScriptTokenizer::Token::EQUAL, "Expected '=' after assignment targets.")) {
+					multi->assigned_value = parse_expression(false);
+					if (multi->assigned_value == nullptr) {
+						push_error("Expected value after '='.");
+					}
+					while (match(GDScriptTokenizer::Token::COMMA)) {
+						ExpressionNode *value = parse_expression(false);
+						if (value == nullptr) {
+							push_error("Expected value after comma.");
+							break;
+						}
+						multi->extra_values.push_back(value);
+					}
+				}
+				multi->pair_assign = multi->extra_assignees.size() == 1 && multi->extra_values.is_empty();
+				if (multi->extra_values.is_empty() && multi->extra_assignees.size() != 1) {
+					push_error("A two-result assignment needs exactly two targets.", multi);
+				}
+				complete_extents(multi);
+				expression = multi;
+			} else if (expression != nullptr && expression->type == Node::IDENTIFIER && static_cast<IdentifierNode *>(expression)->name == SNAME("_")) {
+				push_error("Discard '_' needs a parallel assignment.", expression);
+			}
 			bool has_ended_lambda = false;
 			if (expression == nullptr) {
 				if (in_lambda) {
@@ -4047,6 +4138,7 @@ GDScriptParser::ExpressionNode *GDScriptParser::parse_lambda(ExpressionNode *p_p
 	}
 
 	bool multiline_context = multiline_stack.back()->get();
+	function->lambda_expression_context = multiline_context;
 
 	push_completion_call(nullptr);
 
@@ -4734,6 +4826,25 @@ bool GDScriptParser::AnnotationNode::applies_to(uint32_t p_target_kinds) const {
 	return (info->target_kind & p_target_kinds) > 0;
 }
 
+// Convert an online Node reference expression into a safe relative property name without evaluating it.
+static bool online_path_argument(GDScriptParser::ExpressionNode *p_expression, String &r_path) {
+	if (p_expression->type == GDScriptParser::Node::IDENTIFIER) {
+		r_path = String(static_cast<GDScriptParser::IdentifierNode *>(p_expression)->name);
+		return true;
+	}
+	if (p_expression->type != GDScriptParser::Node::SUBSCRIPT) {
+		return false;
+	}
+	GDScriptParser::SubscriptNode *subscript = static_cast<GDScriptParser::SubscriptNode *>(p_expression);
+	if (!subscript->is_attribute || subscript->attribute == nullptr || subscript->base == nullptr ||
+			subscript->base->type != GDScriptParser::Node::GET_NODE) {
+		return false;
+	}
+	const String node = static_cast<GDScriptParser::GetNodeNode *>(subscript->base)->full_path;
+	r_path = node + "." + String(subscript->attribute->name);
+	return true;
+}
+
 bool GDScriptParser::validate_annotation_arguments(AnnotationNode *p_annotation) {
 	ERR_FAIL_COND_V_MSG(!valid_annotations.has(p_annotation->name), false, vformat(R"(Annotation "%s" not found to validate.)", p_annotation->name));
 
@@ -4747,6 +4858,45 @@ bool GDScriptParser::validate_annotation_arguments(AnnotationNode *p_annotation)
 	if (p_annotation->arguments.size() < info.arguments.size() - info.default_arguments.size()) {
 		push_error(vformat(R"(Annotation "%s" requires at least %d arguments, but %d were given.)", p_annotation->name, info.arguments.size() - info.default_arguments.size(), p_annotation->arguments.size()));
 		return false;
+	}
+
+	// online takes an integer or a Node reference, so resolve it here instead of normal constant evaluation.
+	if (String(p_annotation->name).begins_with("@online")) {
+		for (int i = 0; i < p_annotation->arguments.size(); i++) {
+			ExpressionNode *argument = p_annotation->arguments[i];
+			if (argument->type == Node::LITERAL) {
+				const Variant value = static_cast<LiteralNode *>(argument)->value;
+				if (value.get_type() != Variant::INT && value.get_type() != Variant::STRING) {
+					push_error(vformat(R"(Argument %d of annotation "%s" must be a property or integer.)", i + 1, p_annotation->name), argument);
+					return false;
+				}
+				p_annotation->resolved_arguments.push_back(value);
+				continue;
+			}
+			String path;
+			if (i != 0 || !online_path_argument(argument, path)) {
+				push_error(vformat(R"(Argument %d of annotation "%s" must be property, $Node.property, or integer.)", i + 1, p_annotation->name), argument);
+				return false;
+			}
+			p_annotation->resolved_arguments.push_back(path);
+		}
+		const int count = p_annotation->resolved_arguments.size();
+		const Variant::Type first = count > 0 ? p_annotation->resolved_arguments[0].get_type() : Variant::NIL;
+		// Later arguments are told apart by type: numbers are rate and past frames, strings are the smoothing name.
+		bool shape_ok = count == 0 || first == Variant::INT || first == Variant::STRING;
+		if (count > 1 && first != Variant::STRING) {
+			shape_ok = false;
+		}
+		for (int i = 1; shape_ok && i < count; i++) {
+			const Variant::Type type = p_annotation->resolved_arguments[i].get_type();
+			shape_ok = type == Variant::INT || type == Variant::STRING;
+		}
+		if (!shape_ok) {
+			push_error(vformat(R"(Annotation "%s" accepts (), (hz), (property), or a property with hz, a smoothing name, and past frames.)", p_annotation->name), p_annotation);
+			return false;
+		}
+		p_annotation->is_resolved = true;
+		return true;
 	}
 
 	// Some annotations need to be resolved and applied in the parser.
@@ -4853,6 +5003,353 @@ bool GDScriptParser::abstract_annotation(AnnotationNode *p_annotation, Node *p_t
 		return true;
 	}
 	ERR_FAIL_V_MSG(false, R"("@abstract" annotation can only be applied to classes and functions.)");
+}
+
+// Check whether an initializer starts from a Node reference, to decide whether it goes to the regular ready order.
+static bool online_initializer_needs_ready(GDScriptParser::ExpressionNode *p_expression) {
+	while (p_expression != nullptr) {
+		switch (p_expression->type) {
+			case GDScriptParser::Node::GET_NODE:
+				return true;
+			case GDScriptParser::Node::SUBSCRIPT:
+				p_expression = static_cast<GDScriptParser::SubscriptNode *>(p_expression)->base;
+				break;
+			case GDScriptParser::Node::CAST:
+				p_expression = static_cast<GDScriptParser::CastNode *>(p_expression)->operand;
+				break;
+			default:
+				return false;
+		}
+	}
+	return false;
+}
+
+// Check whether the base is Secret; only @online_save takes effect in a Secret.
+// Also follows scripts that extend a Secret subclass; otherwise one intermediate layer
+// would allow marks that are accepted but silently have no effect.
+static bool extends_secret(const GDScriptParser::ClassNode *p_class, const String &p_path) {
+	if (p_class == nullptr) {
+		return false;
+	}
+	String base = p_class->extends_path;
+	if (base.is_empty()) {
+		if (p_class->extends.size() != 1 || p_class->extends[0] == nullptr) {
+			return false; // A.B.C is an inner class, so not a Secret.
+		}
+		const StringName name = p_class->extends[0]->name;
+		if (name == SNAME("Secret")) {
+			return true;
+		}
+		base = ScriptServer::is_global_class(name) ? ScriptServer::get_global_class_path(name) : String();
+	} else if (!base.begins_with("res://") && !base.begins_with("uid://") && !base.is_absolute_path()) {
+		base = p_path.get_base_dir().path_join(base);
+	}
+	if (base.begins_with("uid://")) {
+		base = ResourceUID::ensure_path(base);
+	}
+	if (base.is_empty() || base == p_path || base.get_extension().to_lower() != "gd") {
+		return false;
+	}
+	Error err = OK;
+	const String source = FileAccess::get_file_as_string(base, &err);
+	return err == OK && GDScriptOnline::secret_source(source, base);
+}
+
+// Detect types that can be neither sent nor saved at write time, not at runtime.
+// Untyped values pass; refusing unknowns would reject ordinary code.
+bool GDScriptParser::online_syncable_type(const GDScriptParser::DataType &p_type) {
+	if (!p_type.is_set() || p_type.is_variant()) {
+		return true;
+	}
+	switch (p_type.kind) {
+		case GDScriptParser::DataType::NATIVE:
+		case GDScriptParser::DataType::SCRIPT:
+		case GDScriptParser::DataType::CLASS:
+			// Node and Resource are Objects; references mean nothing on the other side.
+			return false;
+		case GDScriptParser::DataType::BUILTIN:
+			break;
+		default:
+			return true;
+	}
+	switch (p_type.builtin_type) {
+		case Variant::OBJECT:
+		case Variant::RID:
+		case Variant::CALLABLE:
+		case Variant::SIGNAL:
+			return false;
+		default:
+			break;
+	}
+	// Arrays and dictionaries are checked deeply, to the same depth the Client makes read-only.
+	for (int i = 0; i < p_type.get_container_element_type_count(); i++) {
+		if (!online_syncable_type(p_type.get_container_element_type(i))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Whether a type is allowed as an @online function argument. Nodes share the same serial on both sides,
+// so they are sent as numbers; no reference is needed to point at world objects.
+bool GDScriptParser::online_argument_type(const GDScriptParser::DataType &p_type) {
+	if (p_type.is_set() && !p_type.is_variant() && p_type.kind == GDScriptParser::DataType::NATIVE &&
+			ClassDB::is_parent_class(p_type.native_type, SNAME("Node"))) {
+		return true;
+	}
+	return online_syncable_type(p_type);
+}
+
+// Validate the shape of a Node path and property given as a string.
+static bool valid_online_path(const String &p_path) {
+	if (p_path.is_empty() || p_path.length() > 256) {
+		return false;
+	}
+	const int dot = p_path.rfind_char('.');
+	const String property = dot < 0 ? p_path : p_path.substr(dot + 1);
+	if (!property.is_valid_identifier()) {
+		return false;
+	}
+	if (dot < 0) {
+		return true;
+	}
+	// Absolute paths are allowed too: a display target in another scene is normal
+	// and writable. If not found, the name is reported at runtime.
+	const NodePath path(p_path.substr(0, dot));
+	if (path.get_subname_count() != 0 || path.get_name_count() < 1) {
+		return false;
+	}
+	for (int i = 0; i < path.get_name_count(); i++) {
+		if (!String(path.get_name(i)).is_valid_identifier()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Record the marks for who receives a value and whether it is saved.
+bool GDScriptParser::online_annotation(AnnotationNode *p_annotation, Node *p_target, ClassNode *p_class) {
+	const String name = p_annotation->name;
+	const ClassNode *owner = p_class != nullptr ? p_class : (current_class != nullptr ? current_class : head);
+	const bool in_secret = extends_secret(owner, script_path);
+	// @online on a function inside a Secret means an entry point callable from the world, not broadcasting.
+	// The extends line decides which meaning applies, so no separate spelling is needed.
+	const bool door = in_secret && name == "@online" && p_target != nullptr && p_target->type == Node::FUNCTION;
+	// _my limits recipients to the owner; _save persists to the database. Both may be combined.
+	int flags = door ? GDScriptOnline::F_SECRET : GDScriptOnline::F_ONLINE;
+	// _input is decided on the owner's client and sent to the Online side; the reverse direction, never broadcast.
+	if (name == "@online_input") {
+		flags |= GDScriptOnline::F_INPUT;
+	}
+	if (name.ends_with("_my")) {
+		flags |= GDScriptOnline::F_MY;
+	}
+	if (name.contains("_save")) {
+		flags |= GDScriptOnline::F_SAVE;
+	}
+	StringName who;
+	StringName binding;
+	int hz = 0;
+	int smooth = 0;
+	int frames = 0;
+	const Vector<Variant> &args = p_annotation->resolved_arguments;
+	int first = 0;
+	if (!args.is_empty() && args[0].get_type() == Variant::STRING) {
+		const String path = args[0];
+		if (!valid_online_path(path)) {
+			push_error(vformat(R"(@online: "%s" is not a relative Node property.)", path), p_annotation);
+			return false;
+		}
+		who = path;
+		binding = path;
+		first = 1;
+	}
+	// Later arguments are read by type, not position: numbers are rate and past frames, strings are the smoothing name.
+	int numbers = 0;
+	for (int i = first; i < args.size(); i++) {
+		if (args[i].get_type() == Variant::STRING) {
+			smooth = GDScriptOnline::smooth_id(args[i]);
+			if (smooth < 0) {
+				push_error(vformat(R"(@online: "%s" is not a smoothing name. Use one of %s.)", String(args[i]), GDScriptOnline::smooth_names()), p_annotation);
+				return false;
+			}
+			continue;
+		}
+		if (numbers++ == 0) {
+			hz = args[i];
+		} else {
+			frames = args[i];
+		}
+	}
+	// Store the per-second rate and smoothing in the upper bits of the mark.
+	if (hz != 0) {
+		if (hz < 0 || hz > GDScriptOnline::RATE_MAX) {
+			push_error(vformat(R"(@online: times per second must be 0..%d.)", (int)GDScriptOnline::RATE_MAX), p_annotation);
+			return false;
+		}
+		flags |= hz << GDScriptOnline::RATE_SHIFT;
+	}
+	if (frames != 0) {
+		if (frames < 1 || frames > GDScriptOnline::FRAMES_MAX) {
+			push_error(vformat(R"(@online: past frames must be 1..%d.)", (int)GDScriptOnline::FRAMES_MAX), p_annotation);
+			return false;
+		}
+		flags |= frames << GDScriptOnline::FRAMES_SHIFT;
+	}
+	flags |= smooth << GDScriptOnline::SMOOTH_SHIFT;
+	// A Secret is never broadcast and has no owner; only save marks and world entry points apply.
+	if (!door && in_secret && (!(flags & GDScriptOnline::F_SAVE) || (flags & GDScriptOnline::F_MY))) {
+		push_error(vformat(R"(@online: "%s" cannot be used in a Secret. A Secret only accepts @online_save, and @online on a function for the one door from the world.)", name), p_annotation);
+		return false;
+	}
+	// The world itself has no owner. _my would have no recipient and
+	// never be delivered at runtime, so reject it at write time.
+	if ((flags & (GDScriptOnline::F_MY | GDScriptOnline::F_INPUT)) && owner != nullptr && owner->extends_path.is_empty() &&
+			owner->extends.size() == 1 && owner->extends[0] != nullptr && owner->extends[0]->name == SNAME("Online")) {
+		push_error((flags & GDScriptOnline::F_INPUT)
+						   ? String(R"(@online_input cannot be used in an Online. The world itself has no owner, so there is nobody to take the input from.)")
+						   : vformat(R"(@online: "%s" cannot use _my in an Online. The world itself has no owner, so there is nobody to send it to.)", name),
+				p_annotation);
+		return false;
+	}
+	// Marks are recorded in the script namespace. On an inner class they would mark the outer Node,
+	// silently broadcasting an unmarked variable of the same name, so reject at write time.
+	if (owner != head) {
+		push_error(vformat(R"(@online: "%s" cannot be used in an inner class. Put synchronized members in the Node's own script.)", name), p_annotation);
+		return false;
+	}
+	if (p_target == nullptr) {
+		flags |= GDScriptOnline::F_BIND;
+		GDScriptOnline::mark(script_path, who, flags);
+		return true;
+	}
+	if (binding != StringName() && p_target->type != Node::VARIABLE) {
+		push_error("@online: a Node property path can only bind a variable.", p_annotation);
+		return false;
+	}
+	switch (p_target->type) {
+		case Node::VARIABLE: {
+			VariableNode *variable = static_cast<VariableNode *>(p_target);
+			// A static var belongs to no instance, so there is nothing to send or restore.
+			if (variable->is_static) {
+				push_error(vformat(R"(@online: "%s" cannot be applied to a static variable.)", variable->identifier->name), p_annotation);
+				return false;
+			}
+			who = variable->identifier->name;
+			// "auto_off" is a standalone line-end mark (don't sync position); a variable of that name would collide in the mark table.
+			if (who == SNAME("auto_off")) {
+				push_error(R"(@online: "auto_off" is reserved. @online("auto_off") on its own line stops sharing the position.)", p_annotation);
+				return false;
+			}
+			if (binding == StringName()) {
+				String inferred;
+				if (variable->initializer != nullptr && online_path_argument(variable->initializer, inferred) && valid_online_path(inferred)) {
+					binding = inferred;
+				}
+			}
+			// Reject types that can be neither sent nor saved at write time instead of dropping them silently at runtime.
+			if (!online_syncable_type(variable->get_datatype())) {
+				push_error(vformat(R"(@online: "%s" has type %s. Object, RID, Callable and Signal cannot be synchronized or saved.)", who, variable->get_datatype().to_string()), p_annotation);
+				return false;
+			}
+			// Input takes small values only; don't stream arrays or dictionaries every tick.
+			if (flags & GDScriptOnline::F_INPUT) {
+				const DataType type = variable->get_datatype();
+				const Variant::Type t = type.kind == DataType::BUILTIN ? type.builtin_type : Variant::NIL;
+				if (t != Variant::BOOL && t != Variant::INT && t != Variant::FLOAT && t != Variant::VECTOR2 && t != Variant::VECTOR3) {
+					push_error(vformat(R"(@online_input: "%s" must be a bool, int, float, Vector2 or Vector3 with a type or an initial value.)", who), p_annotation);
+					return false;
+				}
+			}
+			if (binding != StringName()) {
+				GDScriptOnline::bind_field(script_path, who, binding);
+			}
+			// Show marked variables in the Inspector (same as @export); the scene value becomes the initial value.
+			// Variables whose initializer names a location take that location's value, so they are not shown.
+			// If the author wrote an @export variant, use that form.
+			bool own_export = variable->exported;
+			for (AnnotationNode *annotation : variable->annotations) {
+				own_export = own_export || String(annotation->name).begins_with("@export");
+			}
+			if (!own_export && !online_initializer_needs_ready(variable->initializer)) {
+				if (variable->datatype_specifier == nullptr && variable->initializer == nullptr) {
+					push_error(vformat(R"(@online: "%s" needs a type or an initial value.)", who), p_annotation);
+					return false;
+				}
+				AnnotationNode *exported = alloc_recovery_node<AnnotationNode>();
+				reset_extents(exported, p_annotation);
+				exported->name = SNAME("@export");
+				if (!export_annotations<PROPERTY_HINT_NONE, Variant::NIL>(exported, variable, p_class)) {
+					return false;
+				}
+			}
+			bool explicit_onready = false;
+			for (AnnotationNode *annotation : variable->annotations) {
+				explicit_onready = explicit_onready || annotation->name == SNAME("@onready");
+			}
+			if (!explicit_onready && online_initializer_needs_ready(variable->initializer)) {
+				variable->onready = true;
+				p_class->onready_used = true;
+			}
+		} break;
+		case Node::SIGNAL: {
+			SignalNode *signal = static_cast<SignalNode *>(p_target);
+			// Arguments travel over the network and have the same type limits as variables and func arguments.
+			// Without rejecting here, the whole signal would be dropped silently at runtime.
+			for (ParameterNode *parameter : signal->parameters) {
+				if (!online_syncable_type(parameter->get_datatype())) {
+					push_error(vformat(R"(@online: parameter "%s" has type %s. Object, RID, Callable and Signal cannot be sent.)",
+									   parameter->identifier->name, parameter->get_datatype().to_string()),
+							p_annotation);
+					return false;
+				}
+			}
+			who = signal->identifier->name;
+			flags |= GDScriptOnline::F_SIGNAL;
+		} break;
+		case Node::FUNCTION: {
+			FunctionNode *function = static_cast<FunctionNode *>(p_target);
+			if (function->rest_parameter != nullptr || function->parameters.size() > GDScriptOnline::CALL_ARGS_MAX) {
+				push_error(vformat("@online: function accepts at most %d fixed arguments.", (int)GDScriptOnline::CALL_ARGS_MAX), p_annotation);
+				return false;
+			}
+			// Arguments travel over the network with the same type limits as variables; default values are not sent.
+			for (ParameterNode *parameter : function->parameters) {
+				if (parameter->initializer != nullptr) {
+					push_error(vformat(R"(@online: parameter "%s" cannot have a default value. The caller always sends every argument.)", parameter->identifier->name), p_annotation);
+					return false;
+				}
+			}
+			who = function->identifier->name;
+			// @online_my code runs only on the owner's client; it is neither a network endpoint nor a broadcast mark.
+			// The running copy inserts "return unless owner" at the start of the body.
+			// Keep it out of the broadcast table, or the function itself would look like a broadcast value.
+			if (flags & GDScriptOnline::F_MY) {
+				if (door || (flags & GDScriptOnline::F_SAVE)) {
+					push_error(vformat(R"(Annotation "%s" cannot be applied to a function.)", name), p_annotation);
+					return false;
+				}
+				GDScriptOnline::touch(script_path);
+				return true;
+			}
+			// For engine callbacks called while walking the tree, the mark only decides host only or everyone.
+			// They are not network endpoints: the engine calls them, not local author code.
+			// Keep them out of the broadcast table, but record that the body carries @online.
+			if (GDScriptOnline::is_callback(who) || String(who).begins_with("@")) {
+				GDScriptOnline::touch(script_path);
+				return true;
+			}
+			// A Secret entry point gets the callable mark, set separately from the broadcast mark (F_METHOD).
+			if (!door) {
+				flags |= GDScriptOnline::F_METHOD;
+			}
+		} break;
+		default:
+			push_error(vformat(R"(@online: "%s" can only mark a variable, a signal or a function.)", name), p_annotation);
+			return false;
+	}
+	GDScriptOnline::mark(script_path, who, flags);
+	return true;
 }
 
 bool GDScriptParser::onready_annotation(AnnotationNode *p_annotation, Node *p_target, ClassNode *p_class) {
@@ -5664,7 +6161,38 @@ String GDScriptParser::SuiteNode::Local::get_name() const {
 	}
 }
 
+// Return the registered class identity used for language error values.
+const StringName &GDScriptParser::DataType::err_name() {
+	return Err::get_class_static();
+}
+
+// Build the fixed type of a function's second result.
+GDScriptParser::DataType GDScriptParser::DataType::err_type() {
+	DataType type;
+	type.kind = NATIVE;
+	type.builtin_type = Variant::OBJECT;
+	type.native_type = err_name();
+	type.type_source = ANNOTATED_INFERRED;
+	return type;
+}
+
+// Recognize an error class or a class derived from it.
+bool GDScriptParser::DataType::is_err_type() const {
+	const bool object = kind == NATIVE || kind == CLASS || kind == SCRIPT;
+	return object && !is_meta_type && native_type != StringName() && ClassDB::is_parent_class(native_type, err_name());
+}
+
+// Require the exact fixed type for a receiving error slot.
+bool GDScriptParser::DataType::is_err_slot() const {
+	return kind == NATIVE && !is_meta_type && native_type == err_name();
+}
+
 String GDScriptParser::DataType::to_string() const {
+	if (result_pair) {
+		DataType payload = *this;
+		payload.result_pair = false;
+		return payload.to_string() + ", Err";
+	}
 	switch (kind) {
 		case VARIANT:
 			return "Variant";
@@ -6021,6 +6549,10 @@ void GDScriptParser::TreePrinter::print_assignment(AssignmentNode *p_assignment)
 		default:
 			break; // Unreachable.
 	}
+	for (ExpressionNode *target : p_assignment->extra_assignees) {
+		push_text(", ");
+		print_expression(target);
+	}
 
 	push_text(" ");
 	switch (p_assignment->operation) {
@@ -6062,6 +6594,10 @@ void GDScriptParser::TreePrinter::print_assignment(AssignmentNode *p_assignment)
 	}
 	push_text("= ");
 	print_expression(p_assignment->assigned_value);
+	for (ExpressionNode *value : p_assignment->extra_values) {
+		push_text(", ");
+		print_expression(value);
+	}
 	push_line();
 }
 

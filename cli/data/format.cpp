@@ -220,7 +220,7 @@ Vector<String> split_top(const String &s, char32_t sep) {
 // ---------------- CSV ----------------
 
 // Parse CSV records.
-Ref<R> Csv::parse(const String &p_src, const String &p_sep) {
+VariantPair Csv::parse(const String &p_src, const String &p_sep) {
 	const char32_t sep = p_sep.is_empty() ? ',' : p_sep[0];
 	Array rows;
 	Array row;
@@ -254,13 +254,13 @@ Ref<R> Csv::parse(const String &p_src, const String &p_sep) {
 		// Otherwise a quoted value with trailing text could collapse to the same value as unquoted input.
 		// Only a separator or record ending may follow a quoted field.
 		if (closed && c != sep && c != '\r' && c != '\n') {
-			return R::err("extra character after quoted field", Err::INVALID_DATA);
+			return { Variant(), Err::make("extra character after quoted field", Err::INVALID_DATA) };
 		}
 		if (c == '"') {
 			// Reject quotes inside an unquoted field to prevent alternate ambiguous spellings.
 			// A bare quote cannot appear in an unquoted field.
 			if (!field.is_empty()) {
-				return R::err("bare quote in non-quoted field", Err::INVALID_DATA);
+				return { Variant(), Err::make("bare quote in non-quoted field", Err::INVALID_DATA) };
 			}
 			quoted = true;
 			had = true;
@@ -276,6 +276,14 @@ Ref<R> Csv::parse(const String &p_src, const String &p_sep) {
 			continue;
 		}
 		if (c == '\r') {
+			// Preserve carriage returns inside fields and discard only a record terminator.
+			if (i + 1 < n && r[i + 1] != '\n') {
+				if (closed) {
+					return { Variant(), Err::make("extra character after quoted field", Err::INVALID_DATA) };
+				}
+				field += "\r";
+				had = true;
+			}
 			i++;
 			continue;
 		}
@@ -297,13 +305,13 @@ Ref<R> Csv::parse(const String &p_src, const String &p_sep) {
 	}
 
 	if (quoted) {
-		return R::err("unterminated quote", Err::INVALID_DATA);
+		return { Variant(), Err::make("unterminated quote", Err::INVALID_DATA) };
 	}
 	if (had || !field.is_empty() || !row.is_empty()) {
 		row.push_back(field);
 		rows.push_back(row);
 	}
-	return R::ok(rows);
+	return { rows, Variant() };
 }
 
 // Serialize CSV rows.
@@ -332,14 +340,14 @@ String Csv::stringify(const Array &p_rows, const String &p_sep) {
 }
 
 // Parse CSV rows as dictionaries using the first row's field names.
-Ref<R> Csv::parse_objects(const String &p_src, const String &p_sep) {
-	const Ref<R> got = parse(p_src, p_sep);
-	if (got->get_e().is_valid()) {
+VariantPair Csv::parse_objects(const String &p_src, const String &p_sep) {
+	const VariantPair got = parse(p_src, p_sep);
+	if (got.error.get_type() != Variant::NIL) {
 		return got;
 	}
-	const Array rows = got->get_v();
+	const Array rows = got.value;
 	if (rows.is_empty()) {
-		return R::ok(Array());
+		return { Array(), Variant() };
 	}
 	const Array head = rows[0];
 	Array out;
@@ -349,7 +357,7 @@ Ref<R> Csv::parse_objects(const String &p_src, const String &p_sep) {
 		// Silently dropping extras would make distinct records indistinguishable.
 		// Fill missing fields with empty values up to the header width.
 		if (row.size() > head.size()) {
-			return R::err(vformat("row %d has %d fields but the header has %d", r, row.size(), head.size()), Err::INVALID_DATA);
+			return { Variant(), Err::make(vformat("row %d has %d fields but the header has %d", r, row.size(), head.size()), Err::INVALID_DATA) };
 		}
 		Dictionary obj;
 		for (int c = 0; c < head.size(); c++) {
@@ -357,7 +365,7 @@ Ref<R> Csv::parse_objects(const String &p_src, const String &p_sep) {
 		}
 		out.push_back(obj);
 	}
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // Serialize dictionaries as CSV with a header row.
@@ -365,8 +373,20 @@ String Csv::stringify_objects(const Array &p_items, const String &p_sep) {
 	if (p_items.is_empty()) {
 		return String();
 	}
-	const Dictionary first = p_items[0];
-	const Array head = first.keys();
+	Array head;
+	Dictionary seen;
+	// Build one stable header so fields added by later records remain visible.
+	for (int i = 0; i < p_items.size(); i++) {
+		const Dictionary obj = p_items[i];
+		const Array keys = obj.keys();
+		for (int c = 0; c < keys.size(); c++) {
+			const Variant key = keys[c];
+			if (!seen.has(key)) {
+				seen[key] = true;
+				head.push_back(key);
+			}
+		}
+	}
 	Array rows;
 	rows.push_back(head);
 	for (int i = 0; i < p_items.size(); i++) {
@@ -383,7 +403,7 @@ String Csv::stringify_objects(const Array &p_items, const String &p_sep) {
 // ---------------- INI ----------------
 
 // Parse INI sections and keys.
-Ref<R> Ini::parse(const String &p_src) {
+VariantPair Ini::parse(const String &p_src) {
 	Dictionary out;
 	String section; // Store keys at the root before the first section.
 	int line_no = 0;
@@ -395,6 +415,10 @@ Ref<R> Ini::parse(const String &p_src) {
 		}
 		if (line.begins_with("[") && line.ends_with("]")) {
 			section = unquote_dq(line.substr(1, line.length() - 2).strip_edges());
+			// Reject names that cannot hold a section dictionary.
+			if (section.is_empty() || (out.has(section) && out[section].get_type() != Variant::DICTIONARY)) {
+				return { Variant(), Err::make(vformat("invalid section at line %d", line_no), Err::INVALID_DATA) };
+			}
 			if (!out.has(section)) {
 				out[section] = Dictionary();
 			}
@@ -402,9 +426,14 @@ Ref<R> Ini::parse(const String &p_src) {
 		}
 		const int eq = mark_at(line, '=', 0);
 		if (eq < 0) {
-			return R::err(vformat("no '=' at line %d", line_no), Err::INVALID_DATA);
+			return { Variant(), Err::make(vformat("no '=' at line %d", line_no), Err::INVALID_DATA) };
 		}
-		const String key = unquote_dq(line.substr(0, eq).strip_edges());
+		const String raw_key = line.substr(0, eq).strip_edges();
+		const String key = unquote_dq(raw_key);
+		// Preserve quoted empty keys while rejecting a missing name.
+		if (key.is_empty() && raw_key.is_empty()) {
+			return { Variant(), Err::make(vformat("empty key at line %d", line_no), Err::INVALID_DATA) };
+		}
 		const Variant val = typed_of(line.substr(eq + 1).strip_edges());
 		if (section.is_empty()) {
 			out[key] = val;
@@ -413,7 +442,7 @@ Ref<R> Ini::parse(const String &p_src) {
 			box[key] = val;
 		}
 	}
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 namespace {
@@ -496,11 +525,19 @@ Variant toml_value(const String &s, bool &r_bad, String &r_why, int depth);
 // Parse a TOML array.
 Variant toml_array(const String &s, bool &r_bad, String &r_why, int depth) {
 	const int close = s.rfind_char(']');
+	const String body = s.substr(1, close - 1);
+	const Vector<String> parts = split_top(body, ',');
 	Array out;
-	for (const String &part : split_top(s.substr(1, close - 1), ',')) {
-		const String t = part.strip_edges();
+	for (int i = 0; i < parts.size(); i++) {
+		const String t = parts[i].strip_edges();
 		if (t.is_empty()) {
-			continue;
+			// Permit an empty array and its optional final comma only.
+			if ((i == 0 && parts.size() == 1) || (i == parts.size() - 1 && body.strip_edges().ends_with(","))) {
+				continue;
+			}
+			r_bad = true;
+			r_why = "empty array item";
+			return Variant();
 		}
 		const Variant v = toml_value(t, r_bad, r_why, depth + 1);
 		if (r_bad) {
@@ -514,11 +551,19 @@ Variant toml_array(const String &s, bool &r_bad, String &r_why, int depth) {
 // Parse a TOML inline table.
 Variant toml_inline(const String &s, bool &r_bad, String &r_why, int depth) {
 	const int close = s.rfind_char('}');
+	const String body = s.substr(1, close - 1);
+	const Vector<String> parts = split_top(body, ',');
 	Dictionary out;
-	for (const String &part : split_top(s.substr(1, close - 1), ',')) {
-		const String t = part.strip_edges();
+	for (int i = 0; i < parts.size(); i++) {
+		const String t = parts[i].strip_edges();
 		if (t.is_empty()) {
-			continue;
+			// Accept an empty table while rejecting omitted entries.
+			if (i == 0 && parts.size() == 1) {
+				continue;
+			}
+			r_bad = true;
+			r_why = "empty inline table item";
+			return Variant();
 		}
 		const int eq = mark_at(t, '=', 0);
 		if (eq < 0) {
@@ -530,7 +575,13 @@ Variant toml_inline(const String &s, bool &r_bad, String &r_why, int depth) {
 		if (r_bad) {
 			return Variant();
 		}
-		out[unquote_dq(t.substr(0, eq).strip_edges())] = v;
+		const String key = unquote_dq(t.substr(0, eq).strip_edges());
+		if (out.has(key)) {
+			r_bad = true;
+			r_why = "duplicate inline table key";
+			return Variant();
+		}
+		out[key] = v;
 	}
 	return out;
 }
@@ -573,36 +624,77 @@ Variant toml_value(const String &s, bool &r_bad, String &r_why, int depth) {
 	return s; // Retain dates and other unsupported scalar forms as text.
 }
 
-// Find or create a nested table.
-Dictionary toml_dig(Dictionary p_root, const Vector<String> &p_path) {
-	Dictionary cur = p_root;
-	for (const String &seg : p_path) {
-		const String key = unquote_dq(seg.strip_edges());
-		if (key.is_empty()) {
-			continue;
-		}
-		if (!cur.has(key)) {
-			cur[key] = Dictionary();
-		}
-		if (cur[key].get_type() == Variant::ARRAY) {
-			Array arr = cur[key];
-			if (arr.is_empty()) {
-				arr.push_back(Dictionary());
-			}
-			cur = arr[arr.size() - 1];
-		} else {
-			cur = cur[key];
+// Enter a table path without converting an existing value into a table.
+bool toml_descend(Dictionary &r_cur, const String &p_seg, bool p_dotted, HashSet<const void *> &r_defined, const HashSet<const void *> &p_inline, const HashSet<const void *> &p_arrays, String &r_why) {
+	const String part = p_seg.strip_edges();
+	if (part.is_empty()) {
+		r_why = "empty table name";
+		return false;
+	}
+	const String key = unquote_dq(part);
+	if (!r_cur.has(key)) {
+		Dictionary child;
+		r_cur[key] = child;
+		if (p_dotted) {
+			r_defined.insert(child.id());
 		}
 	}
-	return cur;
+	const Variant next = r_cur[key];
+	if (next.get_type() == Variant::DICTIONARY) {
+		const Dictionary child = next;
+		if (p_inline.has(child.id())) {
+			r_why = "inline table cannot be extended";
+			return false;
+		}
+		r_cur = child;
+		return true;
+	}
+	if (next.get_type() == Variant::ARRAY) {
+		const Array items = next;
+		if (p_arrays.has(items.id()) && !items.is_empty()) {
+			r_cur = items[items.size() - 1];
+			return true;
+		}
+	}
+	r_why = "value is not a table";
+	return false;
+}
+
+// Resolve the parent of a table or dotted key before defining its final name.
+bool toml_parent(Dictionary &r_cur, const Vector<String> &p_segs, bool p_dotted, HashSet<const void *> &r_defined, const HashSet<const void *> &p_inline, const HashSet<const void *> &p_arrays, String &r_why) {
+	for (int i = 0; i < p_segs.size() - 1; i++) {
+		if (!toml_descend(r_cur, p_segs[i], p_dotted, r_defined, p_inline, p_arrays, r_why)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Remember inline tables so later headers cannot add members to them.
+void toml_seal(const Variant &p_value, HashSet<const void *> &r_inline) {
+	if (p_value.get_type() == Variant::DICTIONARY) {
+		const Dictionary table = p_value;
+		r_inline.insert(table.id());
+		for (const KeyValue<Variant, Variant> &entry : table) {
+			toml_seal(entry.value, r_inline);
+		}
+	} else if (p_value.get_type() == Variant::ARRAY) {
+		const Array items = p_value;
+		for (const Variant &value : items) {
+			toml_seal(value, r_inline);
+		}
+	}
 }
 
 } // namespace
 
 // Parse TOML documents.
-Ref<R> Toml::parse(const String &p_src) {
+VariantPair Toml::parse(const String &p_src) {
 	Dictionary root;
 	Dictionary cur = root;
+	HashSet<const void *> defined; // Tables already named by a header or dotted key.
+	HashSet<const void *> inline_tables; // Tables closed by an inline value.
+	HashSet<const void *> table_arrays; // Arrays created by double-bracket headers.
 	int line_no = 0;
 	bool bad = false;
 	String why;
@@ -618,12 +710,29 @@ Ref<R> Toml::parse(const String &p_src) {
 		if (line.begins_with("[[") && line.ends_with("]]")) {
 			const String path = line.substr(2, line.length() - 4).strip_edges();
 			const Vector<String> segs = split_top(path, '.');
-			const String last = unquote_dq(segs[segs.size() - 1].strip_edges());
-			Dictionary parent = toml_dig(root, segs.slice(0, segs.size() - 1));
-			if (!parent.has(last) || parent[last].get_type() != Variant::ARRAY) {
-				parent[last] = Array();
+			Dictionary parent = root;
+			if (!toml_parent(parent, segs, false, defined, inline_tables, table_arrays, why)) {
+				return { Variant(), Err::make(vformat("%s at line %d", why, line_no), Err::INVALID_DATA) };
 			}
-			Array arr = parent[last];
+			const String tail = segs[segs.size() - 1].strip_edges();
+			if (tail.is_empty()) {
+				return { Variant(), Err::make(vformat("empty table name at line %d", line_no), Err::INVALID_DATA) };
+			}
+			const String last = unquote_dq(tail);
+			Array arr;
+			if (parent.has(last)) {
+				if (parent[last].get_type() != Variant::ARRAY) {
+					return { Variant(), Err::make(vformat("table name conflicts with value at line %d", line_no), Err::INVALID_DATA) };
+				}
+				arr = parent[last];
+				if (!table_arrays.has(arr.id())) {
+					return { Variant(), Err::make(vformat("array is not a table array at line %d", line_no), Err::INVALID_DATA) };
+				}
+			} else {
+				arr = Array();
+				table_arrays.insert(arr.id());
+				parent[last] = arr;
+			}
 			Dictionary item;
 			arr.push_back(item);
 			cur = item;
@@ -632,22 +741,56 @@ Ref<R> Toml::parse(const String &p_src) {
 
 		// Table.
 		if (line.begins_with("[") && line.ends_with("]")) {
-			cur = toml_dig(root, split_top(line.substr(1, line.length() - 2).strip_edges(), '.'));
+			const Vector<String> segs = split_top(line.substr(1, line.length() - 2).strip_edges(), '.');
+			Dictionary parent = root;
+			if (!toml_parent(parent, segs, false, defined, inline_tables, table_arrays, why)) {
+				return { Variant(), Err::make(vformat("%s at line %d", why, line_no), Err::INVALID_DATA) };
+			}
+			const String tail = segs[segs.size() - 1].strip_edges();
+			if (tail.is_empty()) {
+				return { Variant(), Err::make(vformat("empty table name at line %d", line_no), Err::INVALID_DATA) };
+			}
+			const String last = unquote_dq(tail);
+			if (!parent.has(last)) {
+				parent[last] = Dictionary();
+			}
+			if (parent[last].get_type() != Variant::DICTIONARY) {
+				return { Variant(), Err::make(vformat("table name conflicts with value at line %d", line_no), Err::INVALID_DATA) };
+			}
+			cur = parent[last];
+			if (defined.has(cur.id()) || inline_tables.has(cur.id())) {
+				return { Variant(), Err::make(vformat("table redefined at line %d", line_no), Err::INVALID_DATA) };
+			}
+			defined.insert(cur.id());
 			continue;
 		}
 
 		// Key-value assignment.
 		const int eq = mark_at(line, '=', 0);
 		if (eq < 0) {
-			return R::err(vformat("no '=' at line %d", line_no), Err::INVALID_DATA);
+			return { Variant(), Err::make(vformat("no '=' at line %d", line_no), Err::INVALID_DATA) };
 		}
 		const Variant v = toml_value(line.substr(eq + 1).strip_edges(), bad, why, 0);
 		if (bad) {
-			return R::err(vformat("%s at line %d", why, line_no), Err::INVALID_DATA);
+			return { Variant(), Err::make(vformat("%s at line %d", why, line_no), Err::INVALID_DATA) };
 		}
-		cur[unquote_dq(line.substr(0, eq).strip_edges())] = v;
+		const Vector<String> segs = split_top(line.substr(0, eq).strip_edges(), '.');
+		Dictionary parent = cur;
+		if (!toml_parent(parent, segs, true, defined, inline_tables, table_arrays, why)) {
+			return { Variant(), Err::make(vformat("%s at line %d", why, line_no), Err::INVALID_DATA) };
+		}
+		const String tail = segs[segs.size() - 1].strip_edges();
+		if (tail.is_empty()) {
+			return { Variant(), Err::make(vformat("empty key at line %d", line_no), Err::INVALID_DATA) };
+		}
+		const String key = unquote_dq(tail);
+		if (parent.has(key)) {
+			return { Variant(), Err::make(vformat("duplicate key at line %d", line_no), Err::INVALID_DATA) };
+		}
+		parent[key] = v;
+		toml_seal(v, inline_tables);
 	}
-	return R::ok(root);
+	return { root, Variant() };
 }
 
 namespace {
@@ -734,11 +877,11 @@ String toml_write(const Dictionary &p_data, const String &p_prefix) {
 } // namespace
 
 // Serialize a TOML dictionary with its prefix.
-Ref<R> Toml::stringify(const Dictionary &p_data, const String &p_prefix) {
+VariantPair Toml::stringify(const Dictionary &p_data, const String &p_prefix) {
 	if (!tree_ok(p_data)) {
-		return R::err("unsupported value, cyclic data, or invalid nesting depth", Err::INVALID_DATA);
+		return { Variant(), Err::make("unsupported value, cyclic data, or invalid nesting depth", Err::INVALID_DATA) };
 	}
-	return R::ok(toml_write(p_data, p_prefix));
+	return { toml_write(p_data, p_prefix), Variant() };
 }
 
 // ---------------- YAML ----------------
@@ -775,32 +918,59 @@ int colon_at(const String &s) {
 }
 
 // Parse a YAML scalar with type inference.
-Variant yaml_scalar(const String &s) {
-	if (s.begins_with("[") && s.ends_with("]")) {
+Variant yaml_scalar(const String &s, bool &r_bad) {
+	// Reject an incomplete flow collection before treating it as plain text.
+	if (s.begins_with("[")) {
+		if (!s.ends_with("]")) {
+			r_bad = true;
+			return Variant();
+		}
 		Array out;
-		for (const String &part : split_top(s.substr(1, s.length() - 2), ',')) {
+		const String inner = s.substr(1, s.length() - 2);
+		if (inner.strip_edges().is_empty()) return out;
+		for (const String &part : split_top(inner, ',')) {
 			const String t = part.strip_edges();
-			if (!t.is_empty()) {
-				out.push_back(yaml_scalar(t));
+			if (t.is_empty()) {
+				r_bad = true;
+				return Variant();
 			}
+			out.push_back(yaml_scalar(t, r_bad));
 		}
 		return out;
 	}
-	if (s.begins_with("{") && s.ends_with("}")) {
+	if (s.begins_with("{")) {
+		if (!s.ends_with("}")) {
+			r_bad = true;
+			return Variant();
+		}
 		Dictionary box;
-		for (const String &part : split_top(s.substr(1, s.length() - 2), ',')) {
+		const String inner = s.substr(1, s.length() - 2);
+		if (inner.strip_edges().is_empty()) return box;
+		for (const String &part : split_top(inner, ',')) {
 			const String t = part.strip_edges();
 			if (t.is_empty()) {
-				continue;
+				r_bad = true;
+				return Variant();
 			}
 			const int c = colon_at(t);
-			if (c >= 0) {
-				box[unquote_dq(t.substr(0, c).strip_edges())] = yaml_scalar(t.substr(c + 1).strip_edges());
+			if (c < 0) {
+				r_bad = true;
+				return Variant();
 			}
+			const String key = unquote_dq(t.substr(0, c).strip_edges());
+			if (box.has(key)) {
+				r_bad = true;
+				return Variant();
+			}
+			box[key] = yaml_scalar(t.substr(c + 1).strip_edges(), r_bad);
 		}
 		return box;
 	}
 	if (s.begins_with("\"") || s.begins_with("'")) {
+		if (s.length() < 2 || s[s.length() - 1] != s[0]) {
+			r_bad = true;
+			return Variant();
+		}
 		return unquote_dq(s);
 	}
 	const String low = s.to_lower();
@@ -847,7 +1017,7 @@ Variant YamlReader::block(int depth) {
 	if (at >= (int)lines->size()) {
 		return Variant();
 	}
-	if ((*lines)[at].text.begins_with("- ")) {
+	if ((*lines)[at].text == "-" || (*lines)[at].text.begins_with("- ")) {
 		return seq(depth);
 	}
 	return map(depth);
@@ -858,11 +1028,11 @@ Variant YamlReader::seq(int depth) {
 	Array out;
 	while (at < (int)lines->size() && !bad) {
 		const Line &ln = (*lines)[at];
-		if (ln.depth < depth || !ln.text.begins_with("- ")) {
+		// Only entries at this sequence's depth belong to it.
+		if (ln.depth != depth || (ln.text != "-" && !ln.text.begins_with("- "))) {
 			break;
 		}
-		at++;
-		const String body = ln.text.substr(2).strip_edges();
+		const String body = ln.text == "-" ? String() : ln.text.substr(2).strip_edges();
 		// A sequence item with a mapping key starts a map; quoted colons remain content.
 		if (colon_at(body) >= 0 || body.ends_with(":")) {
 			Dictionary item;
@@ -877,13 +1047,20 @@ Variant YamlReader::seq(int depth) {
 			out.push_back(item);
 			continue;
 		}
+		at++;
 		if (body.is_empty()) {
-			nest++;
-			out.push_back(block(ln.depth + 2));
-			nest--;
+			// Only a deeper line can provide the value of an empty sequence item.
+			if (at < (int)lines->size() && (*lines)[at].depth > ln.depth) {
+				nest++;
+				out.push_back(block((*lines)[at].depth));
+				nest--;
+			} else {
+				out.push_back(Variant());
+			}
 			continue;
 		}
-		out.push_back(yaml_scalar(body));
+		out.push_back(yaml_scalar(body, bad));
+		if (bad) why = vformat("invalid flow value at line %d", ln.no);
 	}
 	return out;
 }
@@ -901,7 +1078,7 @@ Variant YamlReader::map(int depth) {
 			why = vformat("unexpected indent at line %d", ln.no);
 			break;
 		}
-		if (ln.text.begins_with("- ")) {
+		if (ln.text == "-" || ln.text.begins_with("- ")) {
 			break;
 		}
 		pair_into(out, ln.text, depth);
@@ -918,6 +1095,11 @@ void YamlReader::pair_into(Dictionary &box, const String &text, int depth) {
 		return;
 	}
 	const String key = unquote_dq(text.substr(0, colon).strip_edges());
+	if (box.has(key)) {
+		bad = true;
+		why = vformat("duplicate key at line %d", (*lines)[at].no);
+		return;
+	}
 	const String val = text.substr(colon + 1).strip_edges();
 	at++;
 
@@ -943,14 +1125,16 @@ void YamlReader::pair_into(Dictionary &box, const String &text, int depth) {
 	}
 
 	if (!val.is_empty()) {
-		box[key] = yaml_scalar(val);
+		box[key] = yaml_scalar(val, bad);
+		if (bad) why = vformat("invalid flow value at line %d", (*lines)[at - 1].no);
 		return;
 	}
 
 	// An empty value takes its content from the nested block.
 	if (at < (int)lines->size()) {
 		const Line &ln3 = (*lines)[at];
-		if (ln3.depth > depth) {
+		// A value sequence may align its dash with the mapping key.
+		if (ln3.depth > depth || (ln3.depth == depth && ln3.text.begins_with("- "))) {
 			nest++;
 			box[key] = block(ln3.depth);
 			nest--;
@@ -963,7 +1147,7 @@ void YamlReader::pair_into(Dictionary &box, const String &text, int depth) {
 } // namespace
 
 // Parse a YAML document.
-Ref<R> Yaml::parse(const String &p_src) {
+VariantPair Yaml::parse(const String &p_src) {
 	LocalVector<Line> lines;
 	int no = 0;
 	for (const String &raw : p_src.split("\n")) {
@@ -981,15 +1165,19 @@ Ref<R> Yaml::parse(const String &p_src) {
 		lines.push_back(ln);
 	}
 	if (lines.is_empty()) {
-		return R::ok(Dictionary());
+		return { Dictionary(), Variant() };
 	}
 	YamlReader r;
 	r.lines = &lines;
 	const Variant v = r.block(lines[0].depth);
 	if (r.bad) {
-		return R::err(r.why, Err::INVALID_DATA);
+		return { Variant(), Err::make(r.why, Err::INVALID_DATA) };
 	}
-	return R::ok(v);
+	// Reject a second top-level collection instead of silently dropping it.
+	if (r.at != (int)lines.size()) {
+		return { Variant(), Err::make(vformat("unexpected collection at line %d", lines[r.at].no), Err::INVALID_DATA) };
+	}
+	return { v, Variant() };
 }
 
 namespace {
@@ -1085,6 +1273,14 @@ String yaml_write(const Variant &p_data, int p_depth) {
 				out += vformat("%s- %s\n", pad, yaml_text(it));
 				continue;
 			}
+			if (yaml_empty(it)) {
+				out += vformat("%s- %s\n", pad, it.get_type() == Variant::ARRAY ? "[]" : "{}");
+				continue;
+			}
+			if (it.get_type() == Variant::ARRAY) {
+				out += pad + "-\n" + yaml_write(it, p_depth + 1);
+				continue;
+			}
 			// Replace only the first indentation level with a sequence marker.
 			const String body = yaml_write(it, p_depth + 1);
 			const int first_nl = body.find_char('\n');
@@ -1098,11 +1294,11 @@ String yaml_write(const Variant &p_data, int p_depth) {
 } // namespace
 
 // Serialize YAML with the requested indentation depth.
-Ref<R> Yaml::stringify(const Variant &p_data, int p_depth) {
+VariantPair Yaml::stringify(const Variant &p_data, int p_depth) {
 	if (p_depth < 0 || !tree_ok(p_data, p_depth)) {
-		return R::err("unsupported value, cyclic data, or invalid nesting depth", Err::INVALID_DATA);
+		return { Variant(), Err::make("unsupported value, cyclic data, or invalid nesting depth", Err::INVALID_DATA) };
 	}
-	return R::ok(yaml_write(p_data, p_depth));
+	return { yaml_write(p_data, p_depth), Variant() };
 }
 
 // ---------------- Commented JSON ----------------
@@ -1146,6 +1342,11 @@ String Jsonc::strip(const String &p_src) {
 			while (i + 1 < n && !(r[i] == '*' && r[i + 1] == '/')) {
 				i++;
 			}
+			if (i + 1 >= n) {
+				mid += "/*";
+				break;
+			}
+			mid += " ";
 			i += 2;
 			continue;
 		}
@@ -1197,9 +1398,10 @@ String Jsonc::strip(const String &p_src) {
 }
 
 // Strip comments and decode JSON.
-Ref<R> Jsonc::parse(const String &p_src) {
-	const Ref<R> decoded = JsonData::decode(strip(p_src).to_utf8_buffer());
-	return decoded->get_ok() ? decoded : decoded->note("invalid jsonc");
+VariantPair Jsonc::parse(const String &p_src) {
+	const VariantPair decoded = JsonData::decode(strip(p_src).to_utf8_buffer());
+	const Ref<Err> error = decoded.error;
+	return { decoded.value, error.is_valid() ? Variant(error->note("invalid jsonc")) : Variant() };
 }
 
 // ---------------- Front matter ----------------
@@ -1219,12 +1421,12 @@ const FrontMark FRONT_MARKS[] = {
 };
 
 // Build a front-matter result containing attributes, body, and format.
-Ref<R> front_of(const Variant &p_attrs, const String &p_body, const String &p_kind) {
+VariantPair front_of(const Variant &p_attrs, const String &p_body, const String &p_kind) {
 	Dictionary box;
 	box["attrs"] = p_attrs;
 	box["body"] = p_body;
 	box["kind"] = p_kind;
-	return R::ok(box);
+	return { box, Variant() };
 }
 
 } // namespace
@@ -1232,7 +1434,8 @@ Ref<R> front_of(const Variant &p_attrs, const String &p_body, const String &p_ki
 // Check whether a document begins with front matter.
 bool Front::has(const String &p_src) {
 	for (int m = 0; FRONT_MARKS[m].mark; m++) {
-		if (p_src.begins_with(String(FRONT_MARKS[m].mark) + "\n")) {
+		const String mark = FRONT_MARKS[m].mark;
+		if (p_src.begins_with(mark + "\n") || p_src.begins_with(mark + "\r\n")) {
 			return true;
 		}
 	}
@@ -1240,31 +1443,41 @@ bool Front::has(const String &p_src) {
 }
 
 // Parse front matter and retain the document body.
-Ref<R> Front::parse(const String &p_src) {
+VariantPair Front::parse(const String &p_src) {
 	for (int m = 0; FRONT_MARKS[m].mark; m++) {
 		const String mark = FRONT_MARKS[m].mark;
 		const String kind = FRONT_MARKS[m].kind;
-		if (!p_src.begins_with(mark + "\n")) {
+		const bool crlf = p_src.begins_with(mark + "\r\n");
+		if (!crlf && !p_src.begins_with(mark + "\n")) {
 			continue;
 		}
-		const int end = p_src.find("\n" + mark, mark.length());
-		if (end < 0) {
-			return R::err("front matter is not closed", Err::INVALID_DATA);
+		const int open_end = mark.length() + (crlf ? 2 : 1);
+		int end = p_src.find("\n" + mark, mark.length());
+		// Only a complete delimiter line closes the metadata block.
+		while (end >= 0) {
+			const int after = end + 1 + mark.length();
+			if (after == p_src.length() || p_src[after] == '\n' || (p_src[after] == '\r' && after + 1 < p_src.length() && p_src[after + 1] == '\n')) {
+				break;
+			}
+			end = p_src.find("\n" + mark, end + 1);
 		}
-		// For empty front matter, opening and closing line boundaries can overlap.
-		// Clamp the extracted length to zero instead of treating a negative length as the remaining document.
-		const int head_len = MAX(end - (int)mark.length() - 1, 0);
-		const String head = p_src.substr(mark.length() + 1, head_len);
-		const String body = p_src.substr(end + mark.length() + 1).lstrip("\n");
+		if (end < 0) {
+			return { Variant(), Err::make("front matter is not closed", Err::INVALID_DATA) };
+		}
+		const int after = end + 1 + mark.length();
+		const int body_at = after == p_src.length() ? after : after + (p_src[after] == '\r' ? 2 : 1);
+		const String head = p_src.substr(open_end, MAX(end - open_end, 0));
+		const String body = p_src.substr(body_at);
 		// An empty delimited block still counts as front matter with empty attributes.
 		if (head.strip_edges().is_empty()) {
 			return front_of(Dictionary(), body, kind);
 		}
-		const Ref<R> got = kind == "yaml" ? Yaml::parse(head) : Toml::parse(head);
-		if (got->get_e().is_valid()) {
-			return got->note("front matter");
+		const VariantPair got = kind == "yaml" ? Yaml::parse(head) : Toml::parse(head);
+		const Ref<Err> error = got.error;
+		if (error.is_valid()) {
+			return { got.value, error->note("front matter") };
 		}
-		return front_of(got->get_v(), body, kind);
+		return front_of(got.value, body, kind);
 	}
 
 	// Read JSON front matter from its opening brace through the matching closing brace.
@@ -1293,38 +1506,56 @@ Ref<R> Front::parse(const String &p_src) {
 			} else if (c == '}') {
 				depth--;
 				if (depth == 0) {
-					const Ref<R> decoded = JsonData::decode(p_src.substr(0, i + 1).to_utf8_buffer());
-					if (!decoded->get_ok()) {
-						return decoded->note("invalid json front matter");
+					const VariantPair decoded = JsonData::decode(p_src.substr(0, i + 1).to_utf8_buffer());
+					const Ref<Err> error = decoded.error;
+					if (error.is_valid()) {
+						return { decoded.value, error->note("invalid json front matter") };
 					}
-					return front_of(decoded->get_v(), p_src.substr(i + 1).lstrip("\n"), "json");
+					int body_at = i + 1;
+					if (body_at < p_src.length() && p_src[body_at] == '\r' && body_at + 1 < p_src.length() && p_src[body_at + 1] == '\n') {
+						body_at += 2;
+					} else if (body_at < p_src.length() && p_src[body_at] == '\n') {
+						body_at++;
+					}
+					return front_of(decoded.value, p_src.substr(body_at), "json");
 				}
 			}
 		}
+		return { Variant(), Err::make("front matter is not closed", Err::INVALID_DATA) };
 	}
 	return front_of(Dictionary(), p_src, "");
 }
 
 // Serialize front-matter attributes and document body.
-Ref<R> Front::stringify(const Dictionary &p_attrs, const String &p_body, const String &p_kind) {
+VariantPair Front::stringify(const Dictionary &p_attrs, const String &p_body, const String &p_kind) {
+	if (p_kind == "json") {
+		// Preserve the requested format for both empty and nonempty metadata.
+		const VariantPair encoded = JsonData::encode(p_attrs);
+		if (encoded.error.get_type() != Variant::NIL) return encoded;
+		const PackedByteArray bytes = encoded.value;
+		return { String::utf8((const char *)bytes.ptr(), bytes.size()) + "\n" + p_body, Variant() };
+	}
+	if (p_kind != "yaml" && p_kind != "toml") {
+		return { Variant(), Err::make("unsupported front matter format", Err::INVALID_DATA) };
+	}
 	// Without attributes, return the body unless its prefix resembles front matter.
 	// Wrap such a body with an empty front-matter block to preserve its interpretation.
 	const String mk = (p_kind == "toml") ? "+++" : "---";
 	// A body beginning with a front-matter marker needs an empty leading block.
 	// Otherwise the reader would consume part of the body as metadata.
 	if (p_attrs.is_empty()) {
-		return R::ok(has(p_body) ? mk + "\n" + mk + "\n\n" + p_body : p_body);
+		return { has(p_body) ? mk + "\n" + mk + "\n" + p_body : p_body, Variant() };
 	}
-	const Ref<R> head = (p_kind == "toml") ? Toml::stringify(p_attrs, String()) : Yaml::stringify(p_attrs, 0);
-	if (!head->get_ok()) return head;
-	return R::ok(mk + "\n" + String(head->get_v()) + mk + "\n\n" + p_body);
+	const VariantPair head = (p_kind == "toml") ? Toml::stringify(p_attrs, String()) : Yaml::stringify(p_attrs, 0);
+	if (head.error.get_type() != Variant::NIL) return head;
+	return { mk + "\n" + String(head.value) + mk + "\n" + p_body, Variant() };
 }
 
 // ---------------- .env ----------------
 
 namespace {
 
-// Remove quotes and decode escapes only inside double-quoted values.
+// Remove quotes and decode the escapes supported by each quote kind.
 String env_unquote(const String &p_v) {
 	char32_t quote = 0;
 	const String body = unquote(p_v, &quote);
@@ -1332,57 +1563,81 @@ String env_unquote(const String &p_v) {
 		return unesc_dq(body); // Decode escapes only for double quotes.
 	}
 	if (quote == '\'') {
-		return body;
+		// Decode only the escapes supported inside literal quotes.
+		String out;
+		for (int i = 0; i < body.length(); i++) {
+			if (body[i] == '\\' && i + 1 < body.length() && (body[i + 1] == '\\' || body[i + 1] == '\'')) {
+				i++;
+			}
+			out += String::chr(body[i]);
+		}
+		return out;
 	}
-	// Strip a trailing comment from unquoted values.
-	const int at = p_v.find(" #");
-	return at >= 0 ? p_v.substr(0, at).strip_edges() : p_v;
+	// Treat a hash after whitespace as an unquoted comment marker.
+	for (int i = 1; i < p_v.length(); i++) {
+		if (p_v[i] == '#' && (p_v[i - 1] == ' ' || p_v[i - 1] == '\t')) {
+			return p_v.substr(0, i).strip_edges();
+		}
+	}
+	return p_v.strip_edges();
 }
 
 } // namespace
 
 // Parse .env assignments.
-Ref<R> Dotenv::parse(const String &p_src) {
+VariantPair Dotenv::parse(const String &p_src) {
 	Dictionary out;
-	int line_no = 0;
-	for (const String &raw : p_src.split("\n")) {
-		line_no++;
+	const Vector<String> lines = p_src.split("\n");
+	for (int line_no = 0; line_no < lines.size(); line_no++) {
+		String raw = lines[line_no];
+		if (raw.ends_with("\r")) raw = raw.substr(0, raw.length() - 1);
 		String line = raw.strip_edges();
 		if (line.is_empty() || line.begins_with("#")) continue;
 		if (line.begins_with("export ")) line = line.substr(7).strip_edges();
 		const int eq = line.find_char('=');
 		const String key = eq < 0 ? line : line.substr(0, eq).strip_edges();
-		if (!bare_ok(key, "_.")) return R::err(vformat("invalid environment name at line %d", line_no), Err::INVALID_DATA);
-		const String value = eq < 0 ? String() : line.substr(eq + 1).strip_edges();
-		if (!value.is_empty() && (value[0] == '\'' || value[0] == '"')) {
-			int end = 1;
-			for (; end < value.length(); end++) {
-				if (value[end] == '\\' && end + 1 < value.length()) { end++; continue; }
-				if (value[end] == value[0]) break;
+		if (!bare_ok(key, "_.")) return { Variant(), Err::make(vformat("invalid environment name at line %d", line_no + 1), Err::INVALID_DATA) };
+		const String value = eq < 0 ? String() : raw.substr(raw.find_char('=') + 1);
+		String quoted = value.lstrip(" \t");
+		if (!quoted.is_empty() && (quoted[0] == '\'' || quoted[0] == '"')) {
+			const int start_line = line_no + 1;
+			int end = -1;
+			int pos = 1;
+			while (end < 0) {
+				for (; pos < quoted.length(); pos++) {
+					if (quoted[pos] == '\\' && pos + 1 < quoted.length()) { pos++; continue; }
+					if (quoted[pos] == quoted[0]) { end = pos; break; }
+				}
+				if (end >= 0) break;
+				if (line_no + 1 >= lines.size()) return { Variant(), Err::make(vformat("unterminated environment quote at line %d", start_line), Err::INVALID_DATA) };
+				const int old_length = quoted.length();
+				String next = lines[++line_no];
+				if (next.ends_with("\r")) next = next.substr(0, next.length() - 1);
+				quoted += "\n" + next;
+				pos = old_length + 1;
 			}
-			if (end == value.length()) return R::err(vformat("unterminated environment quote at line %d", line_no), Err::INVALID_DATA);
-			const String tail = value.substr(end + 1).strip_edges();
-			if (!tail.is_empty() && !tail.begins_with("#")) return R::err(vformat("unexpected text after environment value at line %d", line_no), Err::INVALID_DATA);
-			out[key] = env_unquote(value.substr(0, end + 1));
+			const String tail = quoted.substr(end + 1).strip_edges();
+			if (!tail.is_empty() && !tail.begins_with("#")) return { Variant(), Err::make(vformat("unexpected text after environment value at line %d", line_no + 1), Err::INVALID_DATA) };
+			out[key] = env_unquote(quoted.substr(0, end + 1));
 		} else {
 			out[key] = env_unquote(value);
 		}
 	}
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // Serialize environment assignments without dropping invalid names.
-Ref<R> Dotenv::stringify(const Dictionary &p_box) {
-	if (!tree_ok(p_box)) return R::err("unsupported environment value", Err::INVALID_DATA);
+VariantPair Dotenv::stringify(const Dictionary &p_box) {
+	if (!tree_ok(p_box)) return { Variant(), Err::make("unsupported environment value", Err::INVALID_DATA) };
 	String out;
 	for (const Variant &k : p_box.keys()) {
 		const String key = Pool::text(k);
-		if (!bare_ok(key, "_.")) return R::err(vformat("invalid environment name %s", key), Err::INVALID_DATA);
+		if (!bare_ok(key, "_.")) return { Variant(), Err::make(vformat("invalid environment name %s", key), Err::INVALID_DATA) };
 		const String v = Pool::text(p_box[k]);
 		const bool needs = needs_dq(v) || v.contains(" ") || v.contains("#");
 		out += vformat("%s=%s\n", key, needs ? as_dq(v) : v);
 	}
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // ---------------- XML ----------------
@@ -1398,6 +1653,7 @@ struct XmlFrame {
 	Dictionary node;
 	String name;
 	Vector<String> text;
+	bool has_child = false; // Whether whitespace-only text is layout between elements.
 };
 
 // Promote repeated element names to an array.
@@ -1421,19 +1677,22 @@ void xml_attach(Dictionary &p_parent, const String &p_name, const Dictionary &p_
 // Join text fragments once and store them in the element.
 void xml_finish(XmlFrame &p_frame) {
 	if (!p_frame.text.is_empty()) {
-		p_frame.node[XML_TEXT_KEY] = String().join(p_frame.text);
+		const String text = String().join(p_frame.text);
+		if (!p_frame.has_child || !text.strip_edges().is_empty()) {
+			p_frame.node[XML_TEXT_KEY] = text;
+		}
 	}
 }
 
 } // namespace
 
 // Parse XML iteratively into nested dictionaries of attributes and text.
-Ref<R> Xml::parse(const String &p_src) {
+VariantPair Xml::parse(const String &p_src) {
 	const PackedByteArray raw = p_src.to_utf8_buffer();
 	Ref<XMLParser> p;
 	p.instantiate();
 	if (p->open_buffer(raw) != OK) {
-		return R::err("cannot open xml", Err::INVALID_DATA);
+		return { Variant(), Err::make("cannot open xml", Err::INVALID_DATA) };
 	}
 
 	Dictionary root;
@@ -1442,13 +1701,18 @@ Ref<R> Xml::parse(const String &p_src) {
 	XmlFrame base;
 	base.node = root;
 	stack.push_back(base);
+	int root_count = 0; // Number of document elements encountered.
 	Error read_err = OK;
 	while ((read_err = p->read()) == OK) {
 		const XMLParser::NodeType kind = p->get_node_type();
 		if (kind == XMLParser::NODE_ELEMENT) {
-			if (!p->is_empty() && stack.size() >= XML_DEPTH_MAX) {
-				return R::err("xml exceeds the depth limit", Err::LIMITED);
+			if (stack.size() == 1 && ++root_count != 1) {
+					return { Variant(), Err::make("xml has more than one root element", Err::INVALID_DATA) };
 			}
+			if (!p->is_empty() && stack.size() >= XML_DEPTH_MAX) {
+				return { Variant(), Err::make("xml exceeds the depth limit", Err::LIMITED) };
+			}
+			stack.write[stack.size() - 1].has_child = true;
 			Dictionary node;
 			for (int i = 0; i < p->get_attribute_count(); i++) {
 				node[XML_ATTR_MARK + p->get_attribute_name(i)] = p->get_attribute_value(i);
@@ -1464,22 +1728,31 @@ Ref<R> Xml::parse(const String &p_src) {
 		} else if (kind == XMLParser::NODE_ELEMENT_END) {
 			const String close_name = p->get_node_name().rstrip(" \t\r\n");
 			if (stack.size() == 1 || stack[stack.size() - 1].name != close_name) {
-				return R::err(vformat("xml closing element does not match \"%s\"", p->get_node_name()), Err::INVALID_DATA);
+				return { Variant(), Err::make(vformat("xml closing element does not match \"%s\"", p->get_node_name()), Err::INVALID_DATA) };
 			}
 			xml_finish(stack.write[stack.size() - 1]);
 			stack.resize(stack.size() - 1);
 		} else if (kind == XMLParser::NODE_TEXT || kind == XMLParser::NODE_CDATA) {
-			const String txt = (kind == XMLParser::NODE_TEXT ? p->get_node_data() : p->get_node_name()).strip_edges();
+			const String txt = kind == XMLParser::NODE_TEXT ? p->get_node_data() : p->get_node_name();
+			if (stack.size() == 1) {
+				if (kind == XMLParser::NODE_CDATA || !txt.strip_edges().is_empty()) {
+						return { Variant(), Err::make("xml contains text outside the root element", Err::INVALID_DATA) };
+				}
+				continue;
+			}
 			if (!txt.is_empty()) {
 				stack.write[stack.size() - 1].text.push_back(txt);
 			}
 		}
 	}
 	if (read_err != ERR_FILE_EOF || stack.size() != 1) {
-		return R::err("xml ends before all elements are closed", Err::INVALID_DATA);
+		return { Variant(), Err::make("xml ends before all elements are closed", Err::INVALID_DATA) };
 	}
 	xml_finish(stack.write[0]);
-	return R::ok(root);
+	if (root_count != 1) {
+		return { Variant(), Err::make("xml requires one root element", Err::INVALID_DATA) };
+	}
+	return { root, Variant() };
 }
 
 namespace {
@@ -1520,13 +1793,18 @@ String xml_write(const Dictionary &p_data, int p_indent, Ref<Err> &r_error) {
 } // namespace
 
 // Serialize an XML dictionary with the requested indentation.
-Ref<R> Xml::stringify(const Dictionary &p_data, int p_indent) {
-	if (p_indent < 0 || !tree_ok(p_data, p_indent)) {
-		return R::err("unsupported value, cyclic data, or invalid nesting depth", Err::INVALID_DATA);
+VariantPair Xml::stringify(const Dictionary &p_data, int p_indent) {
+	if (p_indent < 0 || p_data.size() != 1 || !tree_ok(p_data, p_indent)) {
+		return { Variant(), Err::make("unsupported value, cyclic data, or invalid nesting depth", Err::INVALID_DATA) };
+	}
+	const Variant key = p_data.keys()[0];
+	const String name = Pool::text(key);
+	if (name == XML_TEXT_KEY || name.begins_with(XML_ATTR_MARK) || p_data[key].get_type() == Variant::ARRAY) {
+		return { Variant(), Err::make("xml requires one root element", Err::INVALID_DATA) };
 	}
 	Ref<Err> error;
 	const String text = xml_write(p_data, p_indent, error);
-	return error.is_valid() ? R::err(error) : R::ok(text);
+	return { error.is_valid() ? Variant() : Variant(text), error };
 }
 
 namespace {
@@ -1572,54 +1850,49 @@ String xml_one(const String &p_name, const Variant &p_v, int p_indent, Ref<Err> 
 
 // ---------------- Newline-delimited JSON ----------------
 
-Ref<R> Jsonl::parse(const String &p_src) {
-	Array out;
-	int no = 0;
-	for (const String &raw : p_src.split("\n")) {
-		no++;
-		const String line = raw.strip_edges();
-		if (line.is_empty()) {
-			continue;
-		}
-		const Ref<R> decoded = JsonData::decode(line.to_utf8_buffer());
-		if (!decoded->get_ok()) {
-			return decoded->note(vformat("invalid json at line %d", no));
-		}
-		out.push_back(decoded->get_v());
-	}
-	return R::ok(out);
+VariantPair Jsonl::parse(const String &p_src) {
+	Ref<GDJSONLReader> reader;
+	reader.instantiate();
+	const VariantPair complete = reader->feed(p_src);
+	if (complete.error.get_type() != Variant::NIL) return complete;
+	Array out = complete.value;
+	const VariantPair tail = reader->finish();
+	out.append_array(Array(tail.value));
+	const Ref<Err> error = tail.error;
+	return { out, error.is_valid() ? Variant(error->with_partial(out)) : Variant() };
 }
 
 // Serialize strict JSON values one per line.
-Ref<R> Jsonl::stringify(const Array &p_items) {
+VariantPair Jsonl::stringify(const Array &p_items) {
 	PackedByteArray out;
 	for (int i = 0; i < p_items.size(); i++) {
-		const Ref<R> encoded = JsonData::encode(p_items[i]);
-		if (!encoded->get_ok()) {
-			return encoded->note(vformat("cannot encode json at line %d", i + 1));
+		const VariantPair encoded = JsonData::encode(p_items[i]);
+		const Ref<Err> error = encoded.error;
+		if (error.is_valid()) {
+			return { encoded.value, error->note(vformat("cannot encode json at line %d", i + 1)) };
 		}
-		const PackedByteArray line = encoded->get_v();
+		const PackedByteArray line = encoded.value;
 		const int64_t at = out.size();
 		// Respect the UTF-8 decoder's length and terminator boundary, reporting allocation failure.
 		if (line.size() > INT_MAX - 2 - at || out.resize(at + line.size() + 1) != OK) {
-			return R::err("cannot allocate JSONL string", Err::LIMITED);
+			return { Variant(), Err::make("cannot allocate JSONL string", Err::LIMITED) };
 		}
 		memcpy(out.ptrw() + at, line.ptr(), line.size());
 		out.ptrw()[at + line.size()] = '\n';
 	}
-	return R::ok(String::utf8((const char *)out.ptr(), out.size()));
+	return { String::utf8((const char *)out.ptr(), out.size()), Variant() };
 }
 
 // Register public script methods and properties.
 void GDJSONLReader::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("feed", "chunk"), &GDJSONLReader::feed);
 	ClassDB::bind_method(D_METHOD("finish"), &GDJSONLReader::finish);
-	ADD_RESULT("feed", "Array");
-	ADD_RESULT("finish", "Array");
+	ADD_PAIR_RESULT("feed", "Array");
+	ADD_PAIR_RESULT("finish", "Array");
 }
 
 // Append an input fragment to the incremental decoder.
-Ref<R> GDJSONLReader::feed(const String &p_chunk) {
+VariantPair GDJSONLReader::feed(const String &p_chunk) {
 	buf += p_chunk;
 	Array out;
 	int offset = 0; // First unconsumed character in the shared input buffer.
@@ -1634,24 +1907,25 @@ Ref<R> GDJSONLReader::feed(const String &p_chunk) {
 		if (line.is_empty()) {
 			continue;
 		}
-		const Ref<R> decoded = JsonData::decode(line.to_utf8_buffer());
-		if (!decoded->get_ok()) {
+		const VariantPair decoded = JsonData::decode(line.to_utf8_buffer());
+		const Ref<Err> error = decoded.error;
+		if (error.is_valid()) {
 			buf = buf.substr(offset);
-			return decoded->note(vformat("invalid json at line %d", line_no));
+			return { out, error->note(vformat("invalid json at line %d", line_no))->with_partial(out) };
 		}
-		out.push_back(decoded->get_v());
+		out.push_back(decoded.value);
 	}
 	buf = buf.substr(offset);
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // Finish input and decode any remaining final line.
-Ref<R> GDJSONLReader::finish() {
+VariantPair GDJSONLReader::finish() {
 	if (buf.strip_edges().is_empty()) {
 		buf = String();
-		return R::ok(Array());
+		return { Array(), Variant() };
 	}
-	const Ref<R> got = feed("\n");
-	buf = String();
+	const VariantPair got = feed("\n");
+	if (got.error.get_type() == Variant::NIL) buf = String();
 	return got;
 }

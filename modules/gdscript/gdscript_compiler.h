@@ -147,12 +147,10 @@ class GDScriptCompiler {
 
 	void _set_error(const String &p_error, const GDScriptParser::Node *p_node);
 	// Validate and convert a successful result before exposing its inferred payload.
-	void _write_result_return(CodeGen &codegen, const GDScriptCodeGenerator::Address &p_result);
-	void _write_failure_return(CodeGen &codegen, const GDScriptCodeGenerator::Address &p_result, const GDScriptParser::DataType &p_source);
 
 	GDScriptDataType _gdtype_from_datatype(const GDScriptParser::DataType &p_datatype, GDScript *p_owner, bool p_handle_metatype = true);
 
-	GDScriptCodeGenerator::Address _parse_expression(CodeGen &codegen, Error &r_error, const GDScriptParser::ExpressionNode *p_expression, bool p_root = false, bool p_initializer = false);
+	GDScriptCodeGenerator::Address _parse_expression(CodeGen &codegen, Error &r_error, const GDScriptParser::ExpressionNode *p_expression, bool p_root = false, bool p_initializer = false, const GDScriptCodeGenerator::Address *p_pair_error = nullptr);
 	GDScriptCodeGenerator::Address _parse_match_pattern(CodeGen &codegen, Error &r_error, const GDScriptParser::PatternNode *p_pattern, const GDScriptCodeGenerator::Address &p_value_addr, const GDScriptCodeGenerator::Address &p_type_addr, const GDScriptCodeGenerator::Address &p_previous_test, bool p_is_first, bool p_is_nested);
 	List<GDScriptCodeGenerator::Address> _add_block_locals(CodeGen &codegen, const GDScriptParser::SuiteNode *p_block);
 	void _clear_block_locals(CodeGen &codegen, const List<GDScriptCodeGenerator::Address> &p_locals);

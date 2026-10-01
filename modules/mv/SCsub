@@ -1,0 +1,22 @@
+#!/usr/bin/env python
+from misc.utility.scons_hints import *
+
+# Builds the mv module sources; the vault is compiled only with online_secret_enabled.
+
+Import("env")
+Import("env_modules")
+
+module_env = env_modules.Clone()
+if env["builtin_enet"]:
+    module_env.Prepend(CPPPATH=["#thirdparty/enet/"])
+    module_env.Append(CPPDEFINES=["GODOT_ENET"])
+if env["online_secret_enabled"]:
+    module_env.Append(CPPDEFINES=["MV_SECRET_ENABLED"])
+if env["tests"]:
+    module_env.Append(CPPDEFINES=["TESTS_ENABLED"])
+sources = module_env.Glob("*.cpp")
+if not env["online_secret_enabled"]:
+    # Only the authentication vault is dropped. The Secret Node type authors place is needed on both sides
+    sources = [source for source in sources if not str(source).endswith("mv_vault.cpp")]
+sources.sort(key=lambda source: 0 if str(source).endswith("register_types.cpp") else 1)
+module_env.add_source_files(env.modules_sources, sources)

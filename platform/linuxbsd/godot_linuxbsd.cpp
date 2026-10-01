@@ -30,6 +30,7 @@
 
 #include "os_linuxbsd.h"
 
+#include "cli/view/handoff.h"
 #include "core/profiling/profiling.h"
 #include "main/main.h"
 
@@ -68,6 +69,12 @@ extern "C" const char *pck_section_dummy_call() {
 #endif
 
 int main(int argc, char *argv[]) {
+	// Leave this process before engine startup when a display command is present.
+	int handed = View::handoff(argc, argv);
+	if (handed != 0) {
+		return handed;
+	}
+
 #if defined(__x86_64) || defined(__x86_64__)
 	int cpuinfo[4];
 	__cpuid(cpuinfo, 0x01);
@@ -100,6 +107,11 @@ int main(int argc, char *argv[]) {
 	OS_LinuxBSD os;
 
 	setlocale(LC_CTYPE, "");
+
+#ifdef GD_VIEW
+	// Leave before project startup when recorded unit tests were requested.
+	TEST_MAIN_OVERRIDE
+#endif
 
 	char *cwd = (char *)malloc(PATH_MAX);
 	ERR_FAIL_NULL_V(cwd, ERR_OUT_OF_MEMORY);

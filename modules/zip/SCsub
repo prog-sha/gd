@@ -9,3 +9,7 @@ env_zip = env_modules.Clone()
 # Module files
 env_zip.add_source_files(env.modules_sources, "*.cpp")
 
+if env["tests"]:
+    # Compile the archive tests into this module.
+    env_zip.add_source_files(env.modules_sources, "./tests/*.cpp")
+

@@ -29,24 +29,40 @@
 /**************************************************************************/
 
 #include "gdscript.h"
+#include "cli/sys/std.h"
 
 #include "gdscript_analyzer.h"
 #include "gdscript_cache.h"
 #include "gdscript_compiler.h"
+#include "gdscript_online.h"
 #include "gdscript_parser.h"
 #include "gdscript_rpc_callable.h"
 #include "gdscript_tokenizer_buffer.h"
 #include "gdscript_warning.h"
 
+#include "core/io/resource_loader.h"
+#include "core/object/callable_mp.h"
+#include "core/object/class_db.h"
+
+#ifdef TOOLS_ENABLED
+#include "editor/gdscript_docgen.h"
+#endif
+
+#ifdef TESTS_ENABLED
+#include "tests/gdscript_test_runner.h"
+#endif
+
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/core_constants.h"
 #include "core/io/file_access.h"
-#include "core/io/resource_loader.h"
-#include "core/object/callable_mp.h"
-#include "core/object/class_db.h"
 #include "scene/resources/packed_scene.h"
 #include "scene/scene_string_names.h"
+
+#ifdef TOOLS_ENABLED
+#include "core/extension/gdextension_manager.h"
+#include "editor/file_system/editor_paths.h"
+#endif
 
 ///////////////////////////
 
@@ -55,6 +71,13 @@ GDScriptNativeClass::GDScriptNativeClass(const StringName &p_name) {
 }
 
 bool GDScriptNativeClass::_get(const StringName &p_name, Variant &r_ret) const {
+	if (name == Err::get_class_static()) {
+		Ref<Err> value = Err::constant(p_name);
+		if (value.is_valid()) {
+			r_ret = value;
+			return true;
+		}
+	}
 	bool ok;
 	int64_t v = ClassDB::get_integer_constant(name, p_name, &ok);
 
@@ -240,7 +263,11 @@ Variant GDScript::_new(const Variant **p_args, int p_argcount, Callable::CallErr
 }
 
 bool GDScript::can_instantiate() const {
+#ifdef TOOLS_ENABLED
+	return valid && (tool || ScriptServer::is_scripting_enabled()) && !Engine::get_singleton()->is_recovery_mode_hint();
+#else
 	return valid;
+#endif
 }
 
 Ref<Script> GDScript::get_base_script() const {
@@ -266,6 +293,14 @@ struct _GDScriptMemberSort {
 	StringName name;
 	_FORCE_INLINE_ bool operator<(const _GDScriptMemberSort &p_member) const { return index < p_member.index; }
 };
+
+#ifdef TOOLS_ENABLED
+
+void GDScript::_placeholder_erased(PlaceHolderScriptInstance *p_placeholder) {
+	placeholders.erase(p_placeholder);
+}
+
+#endif
 
 void GDScript::_get_script_method_list(List<MethodInfo> *r_list, bool p_include_base) const {
 	const GDScript *current = this;
@@ -307,6 +342,10 @@ void GDScript::_get_script_property_list(List<PropertyInfo> *r_list, bool p_incl
 		for (int i = 0; i < msort.size(); i++) {
 			props.push_front(sptr->member_indices[msort[i].name].property_info);
 		}
+
+#ifdef TOOLS_ENABLED
+		r_list->push_back(sptr->get_class_category());
+#endif // TOOLS_ENABLED
 
 		for (const PropertyInfo &E : props) {
 			r_list->push_back(E);
@@ -358,6 +397,18 @@ MethodInfo GDScript::get_method_info(const StringName &p_method) const {
 }
 
 bool GDScript::get_property_default_value(const StringName &p_property, Variant &r_value) const {
+#ifdef TOOLS_ENABLED
+
+	HashMap<StringName, Variant>::ConstIterator E = member_default_values_cache.find(p_property);
+	if (E) {
+		r_value = E->value;
+		return true;
+	}
+
+	if (base_cache.is_valid()) {
+		return base_cache->get_property_default_value(p_property, r_value);
+	}
+#endif
 	return false;
 }
 
@@ -382,8 +433,21 @@ ScriptInstance *GDScript::instance_create(Object *p_this) {
 	return _create_instance(nullptr, 0, p_this, unchecked_error);
 }
 
+// Initialize script members for a copied object without requiring constructor arguments.
+ScriptInstance *GDScript::instance_create_without_constructor(Object *p_this) {
+	Callable::CallError unchecked_error;
+	return _create_instance(nullptr, -1, p_this, unchecked_error);
+}
+
 PlaceHolderScriptInstance *GDScript::placeholder_instance_create(Object *p_this) {
+#ifdef TOOLS_ENABLED
+	PlaceHolderScriptInstance *si = memnew(PlaceHolderScriptInstance(GDScriptLanguage::get_singleton(), Ref<Script>(this), p_this));
+	placeholders.insert(si);
+	_update_exports(nullptr, false, si);
+	return si;
+#else
 	return nullptr;
+#endif
 }
 
 bool GDScript::has_source_code() const {
@@ -399,14 +463,213 @@ void GDScript::set_source_code(const String &p_code) {
 		return;
 	}
 	source = p_code;
+#ifdef TOOLS_ENABLED
+	source_changed_cache = true;
+#endif
 }
 
+#ifdef TOOLS_ENABLED
+void GDScript::_update_exports_values(HashMap<StringName, Variant> &values, List<PropertyInfo> &propnames) {
+	for (const KeyValue<StringName, Variant> &E : member_default_values_cache) {
+		values[E.key] = E.value;
+	}
+
+	for (const PropertyInfo &E : members_cache) {
+		propnames.push_back(E);
+	}
+
+	if (base_cache.is_valid()) {
+		base_cache->_update_exports_values(values, propnames);
+	}
+}
+
+void GDScript::_add_doc(const DocData::ClassDoc &p_doc) {
+	doc_class_name = p_doc.name;
+	if (_owner) { // Only the top-level class stores doc info.
+		_owner->_add_doc(p_doc);
+	} else { // Remove old docs, add new.
+		for (int i = 0; i < docs.size(); i++) {
+			if (docs[i].name == p_doc.name) {
+				docs.remove_at(i);
+				break;
+			}
+		}
+		docs.append(p_doc);
+	}
+}
+
+void GDScript::_clear_doc() {
+	doc_class_name = StringName();
+	doc = DocData::ClassDoc();
+	docs.clear();
+}
+
+String GDScript::get_class_icon_path() const {
+	return simplified_icon_path;
+}
+#endif
+
 bool GDScript::_update_exports(bool *r_err, bool p_recursive_call, PlaceHolderScriptInstance *p_instance_to_update, bool p_base_exports_changed) {
+#ifdef TOOLS_ENABLED
+
+	static Vector<GDScript *> base_caches;
+	if (!p_recursive_call) {
+		base_caches.clear();
+	}
+	base_caches.append(this);
+
+	bool changed = p_base_exports_changed;
+
+	if (source_changed_cache) {
+		source_changed_cache = false;
+		changed = true;
+
+		String basedir = path;
+
+		if (basedir.is_empty()) {
+			basedir = get_path();
+		}
+
+		if (!basedir.is_empty()) {
+			basedir = basedir.get_base_dir();
+		}
+
+		GDScriptParser parser;
+		GDScriptAnalyzer analyzer(&parser);
+		Error err = parser.parse(source, path, false);
+
+		if (err == OK && analyzer.analyze() == OK) {
+			const GDScriptParser::ClassNode *c = parser.get_tree();
+
+			if (base_cache.is_valid()) {
+				base_cache->inheriters_cache.erase(get_instance_id());
+				base_cache = Ref<GDScript>();
+			}
+
+			GDScriptParser::DataType base_type = parser.get_tree()->base_type;
+			if (base_type.kind == GDScriptParser::DataType::CLASS) {
+				Ref<GDScript> bf = GDScriptCache::get_full_script(base_type.script_path, err, path);
+				if (err == OK) {
+					bf = Ref<GDScript>(bf->find_class(base_type.class_type->fqcn));
+					if (bf.is_valid()) {
+						base_cache = bf;
+						bf->inheriters_cache.insert(get_instance_id());
+					}
+				}
+			}
+
+			members_cache.clear();
+			member_default_values_cache.clear();
+			_signals.clear();
+
+			members_cache.push_back(get_class_category());
+
+			for (int i = 0; i < c->members.size(); i++) {
+				const GDScriptParser::ClassNode::Member &member = c->members[i];
+
+				switch (member.type) {
+					case GDScriptParser::ClassNode::Member::VARIABLE: {
+						if (!member.variable->exported) {
+							continue;
+						}
+
+						members_cache.push_back(member.variable->export_info);
+						Variant default_value = analyzer.make_variable_default_value(member.variable);
+						member_default_values_cache[member.variable->identifier->name] = default_value;
+					} break;
+					case GDScriptParser::ClassNode::Member::SIGNAL: {
+						_signals[member.signal->identifier->name] = member.signal->method_info;
+					} break;
+					case GDScriptParser::ClassNode::Member::GROUP: {
+						members_cache.push_back(member.annotation->export_info);
+					} break;
+					default:
+						break; // Nothing.
+				}
+			}
+		} else {
+			placeholder_fallback_enabled = true;
+			return false;
+		}
+	} else if (placeholder_fallback_enabled) {
+		return false;
+	}
+
+	placeholder_fallback_enabled = false;
+
+	if (base_cache.is_valid() && base_cache->is_valid()) {
+		for (int i = 0; i < base_caches.size(); i++) {
+			if (base_caches[i] == base_cache.ptr()) {
+				if (r_err) {
+					*r_err = true;
+				}
+				valid = false; // to show error in the editor
+				base_cache->valid = false;
+				base_cache->inheriters_cache.clear(); // to prevent future stackoverflows
+				base_cache.unref();
+				base.unref();
+				ERR_FAIL_V_MSG(false, "Cyclic inheritance in script class.");
+			}
+		}
+		if (base_cache->_update_exports(r_err, true)) {
+			if (r_err && *r_err) {
+				return false;
+			}
+			changed = true;
+		}
+	}
+
+	if ((changed || p_instance_to_update) && placeholders.size()) { //hm :(
+
+		// update placeholders if any
+		HashMap<StringName, Variant> values;
+		List<PropertyInfo> propnames;
+		_update_exports_values(values, propnames);
+
+		if (changed) {
+			for (PlaceHolderScriptInstance *E : placeholders) {
+				E->update(propnames, values);
+			}
+		} else {
+			p_instance_to_update->update(propnames, values);
+		}
+	}
+
+	return changed;
+
+#else
 	return false;
+#endif
 }
 
 void GDScript::update_exports() {
+#ifdef TOOLS_ENABLED
+	_update_exports_down(false);
+#endif
 }
+
+#ifdef TOOLS_ENABLED
+void GDScript::_update_exports_down(bool p_base_exports_changed) {
+	bool cyclic_error = false;
+	bool changed = _update_exports(&cyclic_error, false, nullptr, p_base_exports_changed);
+
+	if (cyclic_error) {
+		return;
+	}
+
+	HashSet<ObjectID> copy(inheriters_cache); //might get modified
+
+	for (const ObjectID &E : copy) {
+		Object *id = ObjectDB::get_instance(E);
+		GDScript *s = Object::cast_to<GDScript>(id);
+
+		if (!s) {
+			continue;
+		}
+		s->_update_exports_down(p_base_exports_changed || changed);
+	}
+}
+#endif
 
 String GDScript::_get_debug_path() const {
 	if (is_built_in() && !get_name().is_empty()) {
@@ -460,6 +723,31 @@ void GDScript::_static_default_init() {
 		}
 	}
 }
+
+#ifdef TOOLS_ENABLED
+
+void GDScript::_save_old_static_data() {
+	old_static_variables_indices = static_variables_indices;
+	old_static_variables = static_variables;
+	for (KeyValue<StringName, Ref<GDScript>> &inner : subclasses) {
+		inner.value->_save_old_static_data();
+	}
+}
+
+void GDScript::_restore_old_static_data() {
+	for (KeyValue<StringName, MemberInfo> &E : old_static_variables_indices) {
+		if (static_variables_indices.has(E.key)) {
+			static_variables.write[static_variables_indices[E.key].index] = old_static_variables[E.value.index];
+		}
+	}
+	old_static_variables_indices.clear();
+	old_static_variables.clear();
+	for (KeyValue<StringName, Ref<GDScript>> &inner : subclasses) {
+		inner.value->_restore_old_static_data();
+	}
+}
+
+#endif
 
 // Display errors with line, column, and a marker on the source line.
 // Explain rejected type and error-handling constructs at their source location.
@@ -566,6 +854,12 @@ Error GDScript::reload(bool p_keep_state) {
 	}
 
 	// Loading a template, don't parse.
+#ifdef TOOLS_ENABLED
+	if (EditorPaths::get_singleton() && basedir.begins_with(EditorPaths::get_singleton()->get_project_script_templates_dir())) {
+		reloading = false;
+		return OK;
+	}
+#endif
 
 	{
 		String source_path = path;
@@ -596,6 +890,12 @@ Error GDScript::reload(bool p_keep_state) {
 	}
 
 	bool can_run = ScriptServer::is_scripting_enabled() || is_tool();
+
+#ifdef TOOLS_ENABLED
+	if (p_keep_state && can_run && is_valid()) {
+		_save_old_static_data();
+	}
+#endif
 
 	valid = false;
 	GDScriptParser parser;
@@ -656,6 +956,12 @@ Error GDScript::reload(bool p_keep_state) {
 		}
 	}
 
+#ifdef TOOLS_ENABLED
+	// Done after compilation because it needs the GDScript object's inner class GDScript objects,
+	// which are made by calling make_scripts() within compiler.compile() above.
+	GDScriptDocGen::generate_docs(this, parser.get_tree());
+#endif
+
 #ifdef DEBUG_ENABLED
 	for (const GDScriptWarning &warning : parser.get_warnings()) {
 		if (EngineDebugger::is_active()) {
@@ -672,6 +978,17 @@ Error GDScript::reload(bool p_keep_state) {
 			return err;
 		}
 	}
+
+#ifdef TOOLS_ENABLED
+	if (can_run && p_keep_state) {
+		_restore_old_static_data();
+	}
+
+	if (p_keep_state) {
+		// Update the properties in the inspector.
+		update_exports();
+	}
+#endif
 
 	reloading = false;
 	return OK;
@@ -861,6 +1178,9 @@ void GDScript::set_path_cache(const String &p_path) {
 
 	path = p_path;
 	path_valid = true;
+	online_client = p_path.begins_with("online-client://");
+	online_authority = p_path.begins_with("online-authority://");
+	online_dynamic = GDScriptOnline::is_dynamic(p_path);
 
 	for (KeyValue<StringName, Ref<GDScript>> &kv : subclasses) {
 		kv.value->set_path_cache(p_path);
@@ -875,6 +1195,9 @@ void GDScript::set_path(const String &p_path, bool p_take_over) {
 	String old_path = path;
 	path = p_path;
 	path_valid = true;
+	online_client = p_path.begins_with("online-client://");
+	online_authority = p_path.begins_with("online-authority://");
+	online_dynamic = GDScriptOnline::is_dynamic(p_path);
 
 	String old_base = GDScript::canonicalize_path(old_path);
 	if (!old_base.is_empty() && fully_qualified_name.begins_with(old_base)) {
@@ -930,6 +1253,11 @@ Error GDScript::load_source_code(const String &p_path) {
 	source = s;
 	path = p_path;
 	path_valid = true;
+#ifdef TOOLS_ENABLED
+	source_changed_cache = true;
+	set_edited(false);
+	set_last_modified_time(FileAccess::get_modified_time(path));
+#endif // TOOLS_ENABLED
 	return OK;
 }
 
@@ -1051,6 +1379,11 @@ bool GDScript::has_script_signal(const StringName &p_signal) const {
 	if (base.is_valid()) {
 		return base->has_script_signal(p_signal);
 	}
+#ifdef TOOLS_ENABLED
+	else if (base_cache.is_valid()) {
+		return base_cache->has_script_signal(p_signal);
+	}
+#endif
 	return false;
 }
 
@@ -1066,6 +1399,11 @@ void GDScript::_get_script_signal_list(List<MethodInfo> *r_list, bool p_include_
 	if (base.is_valid()) {
 		base->get_script_signal_list(r_list);
 	}
+#ifdef TOOLS_ENABLED
+	else if (base_cache.is_valid()) {
+		base_cache->get_script_signal_list(r_list);
+	}
+#endif
 }
 
 void GDScript::get_script_signal_list(List<MethodInfo> *r_signals) const {
@@ -1231,6 +1569,13 @@ void GDScript::clear() {
 
 	_save_orphaned_subclasses();
 
+#ifdef TOOLS_ENABLED
+	// Clearing inner class doc, script doc only cleared when the script source deleted.
+	if (_owner) {
+		_clear_doc();
+	}
+#endif
+
 	// All dependencies have been accounted for
 	for (GDScriptFunction *E : functions_to_clear) {
 		memdelete(E);
@@ -1287,7 +1632,96 @@ GDScript::~GDScript() {
 //         INSTANCE         //
 //////////////////////////////
 
+// Names already reported as read-only. Silently blocking would make the assignment look successful.
+// Tell the author once per name which value cannot be written and why.
+HashSet<String> GDScriptInstance::told_read_only;
+
+void GDScriptInstance::online_refuse(const StringName &p_name) const {
+	// Report once per script, not per Node, so many Nodes sharing a script yield one line.
+	const String key = script.is_valid() ? script->get_path() + ":" + String(p_name) : String(p_name);
+	if (told_read_only.has(key)) {
+		return;
+	}
+	told_read_only.insert(key);
+	ERR_PRINT(vformat(String::utf8("Online: %s is decided by the Online side and cannot be changed on the client. Move the write into _physics_process or an @online func"), String(p_name)));
+}
+
+// Decide whether a member written directly by the VM must be blocked because it is @online.
+bool GDScriptInstance::online_read_only_member(int p_index) const {
+	if (owner == nullptr || p_index < 0 || p_index >= members.size()) {
+		return false;
+	}
+	// Cache the answer per member index instead of scanning the member table on every assignment.
+	if (online_guard.size() != members.size()) {
+		online_guard.clear();
+		online_guard.resize_initialized(members.size());
+	}
+	int8_t &answer = online_guard.write[p_index];
+	if (answer == 0) {
+		// Don't cache before the mark table exists (while declaration initializers run); decide once it is set.
+		const Dictionary marks = owner->get_meta(SNAME("mark"), Dictionary());
+		if (marks.is_empty()) {
+			return false;
+		}
+		answer = 1;
+		for (const KeyValue<StringName, GDScript::MemberInfo> &entry : script->member_indices) {
+			if (entry.value.index != p_index) {
+				continue;
+			}
+			const int flags = marks.get(entry.key, 0);
+			if (flags & GDScriptOnline::F_INPUT) {
+				answer = 3;
+			} else if (script->is_online_client() && (flags & GDScriptOnline::F_ONLINE) && !(flags & (GDScriptOnline::F_METHOD | GDScriptOnline::F_SIGNAL))) {
+				answer = 2;
+			} else if (flags & GDScriptOnline::F_ONLINE) {
+				answer = 4; // Value broadcast by the Online side: writable, but the write is reported to the collector.
+			}
+			break;
+		}
+	}
+	if (answer == 4) {
+		GDScriptOnline::touched(owner);
+		return false;
+	}
+	if (GDScriptOnline::is_trusted_write() || GDScriptOnline::is_field_init()) {
+		return false;
+	}
+	// Only the owner's own client writes input. Unmarked code runs on every client, so drop others' writes silently.
+	if (answer == 3) {
+		return !GDScriptOnline::is_mine(owner);
+	}
+	if (answer == 2) {
+		for (const KeyValue<StringName, GDScript::MemberInfo> &entry : script->member_indices) {
+			if (entry.value.index == p_index) {
+				online_refuse(entry.key);
+				break;
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
 bool GDScriptInstance::set(const StringName &p_name, const Variant &p_value) {
+	if (owner != nullptr && script->is_online_guarded()) {
+		const Dictionary marks = owner->get_meta(SNAME("mark"), Dictionary());
+		const int flags = marks.get(p_name, 0);
+		const bool client = script->is_online_client() && (flags & GDScriptOnline::F_ONLINE) && !(flags & (GDScriptOnline::F_METHOD | GDScriptOnline::F_SIGNAL));
+		if (!client && !(flags & GDScriptOnline::F_INPUT) && (flags & GDScriptOnline::F_ONLINE)) {
+			GDScriptOnline::touched(owner); // A broadcast value was written on the Online side; the next collection reads it. Applies to trusted writes too.
+		}
+		if (!GDScriptOnline::is_trusted_write() && !GDScriptOnline::is_field_init()) {
+			if (flags & GDScriptOnline::F_INPUT) {
+				// Only the owner's own client writes input. Unmarked code also runs on the Online side and other clients, so drop silently.
+				if (!GDScriptOnline::is_mine(owner)) {
+					return true;
+				}
+			} else if (client) {
+				online_refuse(p_name);
+				return true;
+			}
+		}
+	}
 	{
 		HashMap<StringName, GDScript::MemberInfo>::Iterator E = script->member_indices.find(p_name);
 		if (E) {
@@ -1586,6 +2020,10 @@ void GDScriptInstance::get_property_list(List<PropertyInfo> *p_properties) const
 			props.push_front(sptr->member_indices[msort[i].name].property_info);
 		}
 
+#ifdef TOOLS_ENABLED
+		p_properties->push_back(sptr->get_class_category());
+#endif // TOOLS_ENABLED
+
 		for (PropertyInfo &prop : props) {
 			validate_property(prop);
 			p_properties->push_back(prop);
@@ -1691,7 +2129,11 @@ void GDScriptInstance::_call_implicit_ready_recursively(GDScript *p_script) {
 	}
 	if (likely(p_script->valid) && p_script->implicit_ready) {
 		Callable::CallError err;
+		// Initializers like `@online var angle := $body.rotation` are part of the declaration, not author writes.
+		// Refusing them would break binding a marked value to its display target.
+		GDScriptOnline::begin_field_init();
 		p_script->implicit_ready->call(this, nullptr, 0, err);
+		GDScriptOnline::end_field_init();
 	}
 }
 
@@ -1926,13 +2368,46 @@ void GDScriptLanguage::init() {
 		_add_global(E.name, E.ptr);
 	}
 
+#ifdef TOOLS_ENABLED
+	if (Engine::get_singleton()->is_editor_hint()) {
+		GDExtensionManager::get_singleton()->connect("extension_loaded", callable_mp(this, &GDScriptLanguage::_extension_loaded));
+		GDExtensionManager::get_singleton()->connect("extension_unloading", callable_mp(this, &GDScriptLanguage::_extension_unloading));
+	}
+#endif // TOOLS_ENABLED
+
 #ifdef DEBUG_ENABLED
 	GDScriptParser::update_project_settings();
 	if (!ProjectSettings::get_singleton()->is_connected("settings_changed", callable_mp_static(&GDScriptParser::update_project_settings))) {
 		ProjectSettings::get_singleton()->connect("settings_changed", callable_mp_static(&GDScriptParser::update_project_settings));
 	}
 #endif // DEBUG_ENABLED
+
+#ifdef TESTS_ENABLED
+	GDScriptTests::GDScriptTestRunner::handle_cmdline();
+#endif // TESTS_ENABLED
 }
+
+#ifdef TOOLS_ENABLED
+void GDScriptLanguage::_extension_loaded(const Ref<GDExtension> &p_extension) {
+	List<StringName> class_list;
+	ClassDB::get_extension_class_list(p_extension, &class_list);
+	for (const StringName &n : class_list) {
+		if (globals.has(n)) {
+			continue;
+		}
+		Ref<GDScriptNativeClass> nc = memnew(GDScriptNativeClass(n));
+		_add_global(n, nc);
+	}
+}
+
+void GDScriptLanguage::_extension_unloading(const Ref<GDExtension> &p_extension) {
+	List<StringName> class_list;
+	ClassDB::get_extension_class_list(p_extension, &class_list);
+	for (const StringName &n : class_list) {
+		_remove_global(n);
+	}
+}
+#endif
 
 String GDScriptLanguage::get_type() const {
 	return "GDScript";
@@ -2165,6 +2640,19 @@ void GDScriptLanguage::reload_all_scripts() {
 			}
 			elem = elem->next();
 		}
+
+#ifdef TOOLS_ENABLED
+		if (Engine::get_singleton()->is_editor_hint()) {
+			// Reload all pointers to existing singletons so that tool scripts can work with the reloaded extensions.
+			List<Engine::Singleton> singletons;
+			Engine::get_singleton()->get_singletons(&singletons);
+			for (const Engine::Singleton &E : singletons) {
+				if (globals.has(E.name)) {
+					_add_global(E.name, E.ptr);
+				}
+			}
+		}
+#endif // TOOLS_ENABLED
 	}
 
 	reload_scripts(scripts, true);
@@ -2219,6 +2707,24 @@ void GDScriptLanguage::reload_scripts(const Array &p_scripts, bool p_soft_reload
 			}
 
 			//same thing for placeholders
+#ifdef TOOLS_ENABLED
+
+			while (scr->placeholders.size()) {
+				Object *obj = (*scr->placeholders.begin())->get_owner();
+
+				//save instance info
+				if (obj->get_script_instance()) {
+					map.insert(obj->get_instance_id(), List<Pair<StringName, Variant>>());
+					List<Pair<StringName, Variant>> &state = map[obj->get_instance_id()];
+					obj->get_script_instance()->get_property_state(state);
+					obj->set_script(Variant());
+				} else {
+					// no instance found. Let's remove it so we don't loop forever
+					scr->placeholders.erase(*scr->placeholders.begin());
+				}
+			}
+
+#endif // TOOLS_ENABLED
 
 			for (const KeyValue<ObjectID, List<Pair<StringName, Variant>>> &F : scr->pending_reload_state) {
 				map[F.key] = F.value; //pending to reload, use this one instead

@@ -14,20 +14,20 @@
 #include <memory>
 
 // Decode once without replacement, BOM stripping, or NUL truncation.
-Variant utf8_value(const uint8_t *p_data, int64_t p_size, bool p_strict) {
+VariantPair utf8_value(const uint8_t *p_data, int64_t p_size, bool p_strict) {
 	// Keep binary values outside the native string representation lossless.
-	auto binary = [&]() -> Variant {
+	auto binary = [&]() -> VariantPair {
 		PackedByteArray bytes;
-		if (bytes.resize(p_size) != OK) return R::err("cannot allocate byte value", Err::LIMITED);
+		if (bytes.resize(p_size) != OK) return { Variant(), Err::make("cannot allocate byte value", Err::NONE) };
 		if (p_size) memcpy(bytes.ptrw(), p_data, p_size);
-		return bytes;
+		return { bytes, Variant() };
 	};
 	// Text-only formats reject malformed sequences instead of accepting binary fallback.
-	auto invalid = [&]() -> Variant { return p_strict ? Variant(R::err("invalid UTF-8 text", Err::INVALID_DATA)) : binary(); };
-	if (!p_size) return String();
+	auto invalid = [&]() -> VariantPair { return p_strict ? VariantPair{ Variant(), Err::make("invalid UTF-8 text", Err::INVALID_DATA) } : binary(); };
+	if (!p_size) return { String(), Variant() };
 	if (p_size > INT_MAX - 1) return binary();
 	String text;
-	if (text.resize_uninitialized(p_size + 1) != OK) return R::err("cannot allocate text value", Err::LIMITED);
+	if (text.resize_uninitialized(p_size + 1) != OK) return { Variant(), Err::make("cannot allocate text value", Err::NONE) };
 	char32_t *dst = text.ptrw();
 	int used = 0;
 	bool has_nul = false; // Embedded NUL requires binary storage but remains valid UTF-8.
@@ -51,7 +51,20 @@ Variant utf8_value(const uint8_t *p_data, int64_t p_size, bool p_strict) {
 	if (has_nul) return binary();
 	dst[used] = 0;
 	text.resize_uninitialized(used + 1);
-	return text;
+	return { text, Variant() };
+}
+
+// Return text without allowing malformed bytes or NUL to become successful replacement text.
+VariantPair utf8_text(const uint8_t *p_data, int64_t p_size) {
+	if (p_size > INT_MAX - 1) return { Variant(), Err::make("text exceeds decoder representation", Err::LIMITED) };
+	if (p_size >= 3 && p_data[0] == 0xef && p_data[1] == 0xbb && p_data[2] == 0xbf) {
+		p_data += 3;
+		p_size -= 3;
+	}
+	const VariantPair decoded = utf8_value(p_data, p_size, true);
+	if (decoded.error.get_type() != Variant::NIL) return decoded;
+	if (decoded.value.get_type() != Variant::STRING) return { Variant(), Err::make("text contains NUL", Err::INVALID_DATA) };
+	return decoded;
 }
 
 namespace {
@@ -221,15 +234,15 @@ class GDTextCall : public PoolJob {
 		if (canceled.load(std::memory_order_relaxed)) { text = Utf8Text(); reply = {}; alive = Callable(); return; }
 		if (!alive.is_null() && (!alive.is_valid() || !bool(alive.call()))) {
 			cancel();
-			emit_signal("finished", Variant());
+			Async::finish(this, SNAME("finished"), Variant());
 			return;
 		}
-		const Variant result = unavailable ? Variant(R::err("text worker unavailable", Err::INTERRUPTED)) :
-				text.error == OK ? reply(text) : Variant(R::err("cannot allocate response text", Err::LIMITED));
+		const Variant result = unavailable ? Variant(Err::make("text worker unavailable", Err::INTERRUPTED)) :
+				text.error == OK ? reply(text) : Variant(Err::make("cannot allocate response text", Err::NONE));
 		text = Utf8Text();
 		reply = {};
 		alive = Callable();
-		emit_signal("finished", result);
+		Async::finish(this, SNAME("finished"), result);
 	}
 
 	void offload() {
@@ -326,7 +339,7 @@ Variant text_reply(const String &p_text, uint64_t p_until, bool p_measure, Reply
 	// Avoid speculative allocation when the prefix already requires wider encoding.
 	uint8_t small[text_scratch];
 	local.probe = !p_measure && p_text.length() > text_scratch && GDUtf8::ascii(p_text.ptr(), small, text_scratch);
-	if (local.advance(p_until)) return local.error == OK ? p_reply(local) : Variant(R::err("cannot allocate response text", Err::LIMITED));
+	if (local.advance(p_until)) return local.error == OK ? p_reply(local) : Variant(Err::make("cannot allocate response text", Err::NONE));
 	return GDTextCall::start(std::move(local), std::move(p_reply));
 }
 

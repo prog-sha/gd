@@ -18,7 +18,7 @@ env_cli.Prepend(CPPPATH=["#thirdparty/sqlite/"])
 env_cli.add_source_files(env.core_sources, "#thirdparty/sqlite/sqlite.c")
 
 # Collect sources by feature area in alphabetical order.
-for part in ["api", "data", "db", "main", "net", "run", "sys", "tool"]:
+for part in ["api", "data", "db", "mail", "main", "net", "online", "run", "sys", "tool", "view"]:
     env_cli.add_source_files(env.core_sources, part + "/*.cpp")
 
 # Embed the package-management script as executable data.
@@ -26,6 +26,13 @@ env_cli.CommandNoCache(
     "#cli/tool/pkg.gen.h",
     "#cli/tool/pkg.gd",
     env.Run(cli_builders.make_pkg_script),
+)
+
+# Embed the standard mail implementation beside the native API facade.
+env_cli.CommandNoCache(
+    "#cli/mail/mail.gen.h",
+    "#cli/mail/mail.gd",
+    env.Run(cli_builders.make_mail_script),
 )
 
 # Embed both language editions of the manual for terminal access.

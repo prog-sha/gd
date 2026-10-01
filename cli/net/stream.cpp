@@ -137,6 +137,22 @@ Error GDStream::dial(const String &p_host, int p_port) {
 // Confirm actual connection establishment even if socket readiness arrives early.
 void GDStream::poll() {
 	if (status() != CONNECTING) return;
+#ifdef WINDOWS_ENABLED
+	// Wait for connection completion before querying a peer address that may exist while dialing.
+	fd_set writable, failed;
+	FD_ZERO(&writable);
+	FD_ZERO(&failed);
+	FD_SET(Socket(fd), &writable);
+	FD_SET(Socket(fd), &failed);
+	timeval timeout = {}; // Probe readiness without blocking the runtime.
+	const int ready = ::select(0, nullptr, &writable, &failed, &timeout);
+	if (ready == 0) return;
+	if (ready == SOCKET_ERROR) {
+		dial_error = last_error();
+		state = BROKEN;
+		return;
+	}
+#endif
 	int error = 0;
 	AddrSize size = sizeof(error);
 	if (::getsockopt(Socket(fd), SOL_SOCKET, SO_ERROR, reinterpret_cast<char *>(&error), &size) != 0) {
@@ -239,6 +255,7 @@ Error GDStream::listen(const String &p_host, int p_port, bool p_reuse) {
 
 // Make an arrived connection noninheritable and nonblocking before returning it.
 Error GDStream::accept(Ref<GDStream> &r_peer) {
+	accept_os_error = 0;
 	for (;;) {
 #if defined(LINUXBSD_ENABLED) && defined(__linux__)
 		const Socket accepted = ::accept4(Socket(fd), nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
@@ -253,10 +270,13 @@ Error GDStream::accept(Ref<GDStream> &r_peer) {
 #endif
 		if (!valid) {
 			const int error = last_error();
+			accept_os_error = error;
 #ifdef WINDOWS_ENABLED
 			if (error == WSAECONNABORTED || error == WSAECONNRESET || interrupted(error)) continue;
+			if (error == WSAENOBUFS || error == WSAEMFILE) return ERR_OUT_OF_MEMORY;
 #else
 			if (error == ECONNABORTED || interrupted(error)) continue;
+			if (error == EMFILE || error == ENFILE || error == ENOBUFS || error == ENOMEM) return ERR_OUT_OF_MEMORY;
 #endif
 			return failure(error);
 		}
@@ -266,6 +286,7 @@ Error GDStream::accept(Ref<GDStream> &r_peer) {
 #if !defined(LINUXBSD_ENABLED) || !defined(__linux__)
 		const Error configured = configure(peer->fd);
 		if (configured != OK) {
+			accept_os_error = last_error();
 			peer->close();
 			return configured;
 		}
@@ -273,6 +294,7 @@ Error GDStream::accept(Ref<GDStream> &r_peer) {
 		peer->state = CONNECTED;
 		peer->defaults();
 		r_peer = peer;
+		accept_os_error = 0;
 		return OK;
 	}
 }

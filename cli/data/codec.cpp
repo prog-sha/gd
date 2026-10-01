@@ -48,13 +48,18 @@ int b64_val(char32_t p_c, char32_t p_c62, char32_t p_c63) {
 	return p_c == p_c62 ? 62 : 63;
 }
 
+// Return decoded bytes and attach the completed prefix to the error.
+VariantPair bytes_failure(const PackedByteArray &p_value, const String &p_message, Err::Kind p_kind) {
+	return { p_value, Err::make(p_message, p_kind, Dictionary(), p_value) };
+}
+
 // Decode complete quanta while retaining the prefix preceding malformed input.
 // Identity-sensitive decoding forbids padding, whitespace, and nonzero spare bits.
-Ref<R> decode_b64(const String &p_text, bool p_url, bool p_raw, bool p_identity = false) {
+VariantPair decode_b64(const String &p_text, bool p_url, bool p_raw, bool p_identity = false) {
 	const char32_t c62 = p_url ? '-' : '+'; // Alphabet value 62.
 	const char32_t c63 = p_url ? '_' : '/'; // Alphabet value 63.
 	PackedByteArray out;
-	if (out.resize((int64_t(p_text.length()) + 3) / 4 * 3) != OK) return R::err("cannot allocate base64 output", Err::LIMITED);
+	if (out.resize((int64_t(p_text.length()) + 3) / 4 * 3) != OK) return bytes_failure(PackedByteArray(), "cannot allocate base64 output", Err::LIMITED);
 	uint8_t *w = out.ptrw();
 	int at = 0, count = 0;
 	uint32_t bits = 0;
@@ -62,9 +67,9 @@ Ref<R> decode_b64(const String &p_text, bool p_url, bool p_raw, bool p_identity 
 	auto put = [&]() {
 		for (int n = count * 6 - 8; n >= 0; n -= 8) w[at++] = uint8_t(bits >> n);
 	};
-	auto fail = [&](int pos) {
+	auto fail = [&](int pos) -> VariantPair {
 		out.resize(at);
-		return R::err(vformat("invalid base64 at %d", pos), Err::INVALID_DATA, out);
+		return bytes_failure(out, vformat("invalid base64 at %d", pos), Err::INVALID_DATA);
 	};
 	for (int i = 0; i < p_text.length(); i++) {
 		const char32_t c = p_text[i];
@@ -83,7 +88,7 @@ Ref<R> decode_b64(const String &p_text, bool p_url, bool p_raw, bool p_identity 
 				if (p_text[i] != '\r' && p_text[i] != '\n') return fail(i);
 			}
 			out.resize(at);
-			return R::ok(out);
+			return { out, Variant() };
 		}
 		if (c != c62 && c != c63 && !is_ascii_alphanumeric_char(c)) return fail(i);
 		bits = (bits << 6) | b64_val(c, c62, c63);
@@ -92,7 +97,7 @@ Ref<R> decode_b64(const String &p_text, bool p_url, bool p_raw, bool p_identity 
 	if (count == 1 || (!p_raw && count) || (p_identity && count && (bits & ((1U << (count * 6 % 8)) - 1)))) return fail(p_text.length());
 	put();
 	out.resize(at);
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // Append an integer most-significant byte first.
@@ -129,16 +134,16 @@ String Encoding::hex_encode(const PackedByteArray &p_data) {
 }
 
 // Decode hexadecimal text into bytes.
-Ref<R> Encoding::hex_decode(const String &p_text) {
+VariantPair Encoding::hex_decode(const String &p_text) {
 	const int n = p_text.length();
 	PackedByteArray out;
-	if (out.resize(n / 2) != OK) return R::err("cannot allocate hex output", Err::LIMITED);
+	if (out.resize(n / 2) != OK) return { PackedByteArray(), Err::make("cannot allocate hex output", Err::LIMITED) };
 	const size_t at = GDHex::decode(p_text.ptr(), out.ptrw(), n - n % 2);
 	if (at != size_t(n - n % 2) || n % 2) {
 		out.resize(at / 2);
-		return R::err(vformat("invalid hex at %d", at), Err::INVALID_DATA, out);
+		return bytes_failure(out, vformat("invalid hex at %d", at), Err::INVALID_DATA);
 	}
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // Encode bytes as standard base64.
@@ -160,7 +165,7 @@ String Encoding::base64_encode(const PackedByteArray &p_data) {
 }
 
 // Decode standard base64 text.
-Ref<R> Encoding::base64_decode(const String &p_text, bool p_raw) {
+VariantPair Encoding::base64_decode(const String &p_text, bool p_raw) {
 	return decode_b64(p_text, false, p_raw);
 }
 
@@ -170,14 +175,14 @@ String Encoding::base64url_encode(const PackedByteArray &p_data) {
 }
 
 // Decode URL-safe base64 text.
-Ref<R> Encoding::base64url_decode(const String &p_text, bool p_raw) {
+VariantPair Encoding::base64url_decode(const String &p_text, bool p_raw) {
 	return decode_b64(p_text, true, p_raw);
 }
 
 // Decode canonical unpadded base64url.
 // Text used as an identity key, such as a JWT, must not accept multiple equivalent spellings.
 // Alternative spellings would bypass comparisons or revocation records.
-Ref<R> Encoding::base64url_raw_decode(const String &p_text) {
+VariantPair Encoding::base64url_raw_decode(const String &p_text) {
 	return decode_b64(p_text, true, true, true);
 }
 
@@ -213,9 +218,9 @@ String Encoding::base32_encode(const PackedByteArray &p_data) {
 }
 
 // Decode base32 text into bytes.
-Ref<R> Encoding::base32_decode(const String &p_text, bool p_raw) {
+VariantPair Encoding::base32_decode(const String &p_text, bool p_raw) {
 	PackedByteArray out;
-	if (out.resize((int64_t(p_text.length()) + 7) / 8 * 5) != OK) return R::err("cannot allocate base32 output", Err::LIMITED);
+	if (out.resize((int64_t(p_text.length()) + 7) / 8 * 5) != OK) return bytes_failure(PackedByteArray(), "cannot allocate base32 output", Err::LIMITED);
 	uint8_t *w = out.ptrw();
 	uint64_t bits = 0;
 	int count = 0, at = 0;
@@ -224,9 +229,9 @@ Ref<R> Encoding::base32_decode(const String &p_text, bool p_raw) {
 		for (int n = count * 5 - 8; n >= 0; n -= 8) w[at++] = uint8_t(bits >> n);
 	};
 	auto valid = [&]() { return count == 0 || count == 2 || count == 4 || count == 5 || count == 7; };
-	auto fail = [&](int pos) {
+	auto fail = [&](int pos) -> VariantPair {
 		out.resize(at);
-		return R::err(vformat("invalid base32 at %d", pos), Err::INVALID_DATA, out);
+		return bytes_failure(out, vformat("invalid base32 at %d", pos), Err::INVALID_DATA);
 	};
 	for (int i = 0; i < p_text.length(); i++) {
 		char32_t c = p_text[i];
@@ -248,7 +253,7 @@ Ref<R> Encoding::base32_decode(const String &p_text, bool p_raw) {
 			if (need) return fail(i);
 			put();
 			out.resize(at);
-			return R::ok(out);
+			return { out, Variant() };
 		}
 		if (!((c >= 'A' && c <= 'Z') || (c >= '2' && c <= '7'))) return fail(i);
 		bits = (bits << 5) | (c >= 'A' ? c - 'A' : c - '2' + 26);
@@ -257,7 +262,7 @@ Ref<R> Encoding::base32_decode(const String &p_text, bool p_raw) {
 	if (!p_raw && count) return fail(p_text.length());
 	if (valid()) put();
 	out.resize(at);
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // Encode an integer as a varint.
@@ -278,8 +283,12 @@ PackedByteArray Encoding::varint_encode(int64_t p_n) {
 }
 
 // Decode a varint at the supplied byte offset.
-Ref<R> Encoding::varint_decode(const PackedByteArray &p_data, int p_at) {
-	if (p_at < 0 || p_at > p_data.size()) return R::err("varint offset is outside the input", Err::INVALID_DATA);
+VariantPair Encoding::varint_decode(const PackedByteArray &p_data, int p_at) {
+	auto fail = [](const String &p_message) -> VariantPair {
+		Dictionary empty;
+		return { empty, Err::make(p_message, Err::INVALID_DATA, Dictionary(), empty) };
+	};
+	if (p_at < 0 || p_at > p_data.size()) return fail("varint offset is outside the input");
 	uint64_t v = 0;
 	int shift = 0;
 	int i = p_at;
@@ -287,21 +296,21 @@ Ref<R> Encoding::varint_decode(const PackedByteArray &p_data, int p_at) {
 	const uint8_t *r = p_data.ptr();
 	while (i < n) {
 		const uint8_t b = r[i];
-		if (shift == 63 && b > 1) return R::err("varint overflows 64 bits", Err::INVALID_DATA);
+		if (shift == 63 && b > 1) return fail("varint overflows 64 bits");
 		v |= (uint64_t)(b & 127) << shift;
 		i++;
 		if ((b & 128) == 0) {
 			Dictionary box;
 			box["value"] = (int64_t)v;
 			box["next"] = i;
-			return R::ok(box);
+			return { box, Variant() };
 		}
 		shift += 7;
 		if (shift > 63) {
-			return R::err("varint too long", Err::INVALID_DATA);
+			return fail("varint too long");
 		}
 	}
-	return R::err("varint truncated", Err::INVALID_DATA);
+	return fail("varint truncated");
 }
 
 // ---------------- Byte sequences ----------------
@@ -663,14 +672,14 @@ struct Reader {
 	Variant text(int64_t p_size, bool p_strict = false) {
 		const PackedByteArray bytes = take(p_size);
 		if (bad) return Variant();
-		const Variant value = utf8_value(bytes.ptr(), bytes.size(), p_strict);
-		const Ref<R> error = value;
+		const VariantPair value = utf8_value(bytes.ptr(), bytes.size(), p_strict);
+		const Ref<Err> error = value.error;
 		if (error.is_valid()) {
 			bad = true;
-			why = error->get_e()->text();
+			why = error->text();
 			return Variant();
 		}
-		return value;
+		return value.value;
 	}
 };
 
@@ -816,17 +825,17 @@ Variant mp_get(Reader &r, int depth) {
 } // namespace
 
 // Encode a value as MessagePack bytes.
-Ref<R> Msgpack::encode(const Variant &p_v) {
+VariantPair Msgpack::encode(const Variant &p_v) {
 	LocalVector<uint8_t> out;
 	HashSet<const void *> active;
 	if (!mp_put(out, p_v, 0, active)) {
-		return R::err("unsupported value, cyclic data, or invalid nesting depth", Err::INVALID_DATA);
+		return { PackedByteArray(), Err::make("unsupported value, cyclic data, or invalid nesting depth", Err::INVALID_DATA) };
 	}
-	return R::ok(to_packed(out));
+	return { to_packed(out), Variant() };
 }
 
 // Decode MessagePack bytes into a value.
-Ref<R> Msgpack::decode(const PackedByteArray &p_data) {
+VariantPair Msgpack::decode(const PackedByteArray &p_data) {
 	Reader r;
 	r.b = p_data.ptr();
 	r.n = p_data.size();
@@ -835,9 +844,9 @@ Ref<R> Msgpack::decode(const PackedByteArray &p_data) {
 		if (!r.bad) {
 			r.why = "trailing bytes";
 		}
-		return R::err(r.why, r.why.begins_with("unknown") ? Err::UNSUPPORTED : Err::INVALID_DATA);
+		return { Variant(), Err::make(r.why, r.why.begins_with("unknown") ? Err::UNSUPPORTED : Err::INVALID_DATA) };
 	}
-	return R::ok(v);
+	return { v, Variant() };
 }
 
 // ---------------- CBOR ----------------
@@ -1079,17 +1088,17 @@ Variant cb_get(Reader &r, int depth) {
 } // namespace
 
 // Encode a value as CBOR bytes.
-Ref<R> Cbor::encode(const Variant &p_v) {
+VariantPair Cbor::encode(const Variant &p_v) {
 	LocalVector<uint8_t> out;
 	HashSet<const void *> active;
 	if (!cb_put(out, p_v, 0, active)) {
-		return R::err("unsupported value, cyclic data, or invalid nesting depth", Err::INVALID_DATA);
+		return { PackedByteArray(), Err::make("unsupported value, cyclic data, or invalid nesting depth", Err::INVALID_DATA) };
 	}
-	return R::ok(to_packed(out));
+	return { to_packed(out), Variant() };
 }
 
 // Decode CBOR bytes into a value.
-Ref<R> Cbor::decode(const PackedByteArray &p_data) {
+VariantPair Cbor::decode(const PackedByteArray &p_data) {
 	Reader r;
 	r.b = p_data.ptr();
 	r.n = p_data.size();
@@ -1098,9 +1107,9 @@ Ref<R> Cbor::decode(const PackedByteArray &p_data) {
 		if (!r.bad) {
 			r.why = "trailing bytes";
 		}
-		return R::err(r.why, r.why.begins_with("unsupported") ? Err::UNSUPPORTED : Err::INVALID_DATA);
+		return { Variant(), Err::make(r.why, r.why.begins_with("unsupported") ? Err::UNSUPPORTED : Err::INVALID_DATA) };
 	}
-	return R::ok(v);
+	return { v, Variant() };
 }
 
 // ---------------- tar ----------------
@@ -1110,6 +1119,16 @@ namespace {
 constexpr int TAR_BLOCK = 512; // USTAR header and data-padding block size.
 constexpr int TAR_NAME = 100; // USTAR name-field width.
 constexpr int TAR_PREFIX = 155; // USTAR prefix-field width.
+
+// Return a tar failure through the separate error slot.
+VariantPair tar_fail(const String &p_msg, Err::Kind p_kind) {
+	return { Variant(), Err::make(p_msg, p_kind) };
+}
+
+// Return an archive value through the success slot.
+VariantPair tar_ok(const Variant &p_value) {
+	return { p_value, Variant() };
+}
 
 // Write one bounded TAR header field.
 bool tar_put(uint8_t *h, int at, int width, const String &s) {
@@ -1221,6 +1240,103 @@ bool tar_octal(const uint8_t *p_data, int64_t p_at, int p_len, int64_t &r_value)
 		r_value = r_value * 8 + (c - '0');
 	}
 	return digit;
+}
+
+// Append a PAX record whose decimal prefix counts every byte in the record.
+void tar_pax_record(LocalVector<uint8_t> &r_out, const String &p_key, const String &p_value) {
+	const CharString field = (p_key + "=" + p_value + "\n").utf8();
+	int64_t length = field.length() + 2;
+	while (true) {
+		const int64_t next = field.length() + String::num_int64(length).length() + 1;
+		if (next == length) break;
+		length = next;
+	}
+	const CharString prefix = (String::num_int64(length) + " ").utf8();
+	for (int i = 0; i < prefix.length(); i++) r_out.push_back(prefix[i]);
+	for (int i = 0; i < field.length(); i++) r_out.push_back(field[i]);
+}
+
+// Append a checked USTAR header and its padded body.
+bool tar_append(PackedByteArray &r_out, const String &p_name, char p_kind, int64_t p_mode, int64_t p_mtime, const uint8_t *p_body, int64_t p_size) {
+	uint8_t h[TAR_BLOCK] = {};
+	if (!tar_put_name(h, p_name) || !tar_put(h, 100, 8, vformat("%07o", p_mode)) ||
+			!tar_put(h, 108, 8, "0000000") || !tar_put(h, 116, 8, "0000000") ||
+			!tar_put(h, 124, 12, vformat("%011o", p_size)) ||
+			!tar_put(h, 136, 12, vformat("%011o", p_mtime)) ||
+			!tar_put(h, 148, 8, "        ") || !tar_put(h, 156, 1, String::chr(p_kind)) ||
+			!tar_put(h, 257, 6, "ustar") || !tar_put(h, 263, 2, "00")) return false;
+	int sum = 0;
+	for (int k = 0; k < TAR_BLOCK; k++) sum += h[k];
+	tar_put(h, 148, 6, vformat("%06o", sum));
+	h[154] = 0;
+	h[155] = 32;
+	const int64_t pad = (TAR_BLOCK - p_size % TAR_BLOCK) % TAR_BLOCK;
+	const int64_t at = r_out.size();
+	if (p_size > INT64_MAX - at - TAR_BLOCK - pad || r_out.resize(at + TAR_BLOCK + p_size + pad) != OK) return false;
+	memcpy(r_out.ptrw() + at, h, TAR_BLOCK);
+	if (p_size > 0) memcpy(r_out.ptrw() + at + TAR_BLOCK, p_body, p_size);
+	if (pad > 0) memset(r_out.ptrw() + at + TAR_BLOCK + p_size, 0, pad);
+	return true;
+}
+
+// Parse one decimal PAX integer, allowing a fractional timestamp suffix.
+bool tar_pax_number(const String &p_text, bool p_fraction, int64_t &r_value) {
+	if (p_text.is_empty()) return false;
+	const bool negative = p_text[0] == '-';
+	int at = negative ? 1 : 0;
+	if (at == p_text.length()) return false;
+	const uint64_t limit = negative ? uint64_t(INT64_MAX) + 1 : uint64_t(INT64_MAX);
+	uint64_t value = 0;
+	bool digits = false;
+	for (; at < p_text.length() && p_text[at] != '.'; at++) {
+		const char32_t c = p_text[at];
+		if (c < '0' || c > '9' || value > (limit - (c - '0')) / 10) return false;
+		value = value * 10 + c - '0';
+		digits = true;
+	}
+	if (!digits) return false;
+	bool fraction = false;
+	if (at < p_text.length()) {
+		if (!p_fraction || ++at == p_text.length()) return false;
+		for (; at < p_text.length(); at++) {
+			if (p_text[at] < '0' || p_text[at] > '9') return false;
+			fraction |= p_text[at] != '0';
+		}
+	}
+	if (negative && fraction) {
+		if (value == uint64_t(INT64_MAX) + 1) return false;
+		value++;
+	}
+	r_value = negative ? (value == uint64_t(INT64_MAX) + 1 ? INT64_MIN : -int64_t(value)) : int64_t(value);
+	return true;
+}
+
+// Read length-prefixed PAX attributes without accepting truncated or ambiguous records.
+bool tar_pax_read(const uint8_t *p_data, int64_t p_size, Dictionary &r_fields) {
+	if (p_size > INT_MAX) return false; // Field conversion uses signed text widths.
+	int64_t at = 0;
+	while (at < p_size) {
+		int64_t length = 0;
+		int64_t end = at;
+		while (end < p_size && p_data[end] >= '0' && p_data[end] <= '9') {
+			if (length > (INT64_MAX - 9) / 10) return false;
+			length = length * 10 + p_data[end++] - '0';
+		}
+		if (end == at || end >= p_size || p_data[end] != ' ' || length <= end - at + 2 || length > p_size - at) return false;
+		const int64_t stop = at + length;
+		if (p_data[stop - 1] != '\n') return false;
+		const int64_t key_at = end + 1;
+		int64_t eq = key_at;
+		while (eq < stop - 1 && p_data[eq] != '=') eq++;
+		if (eq == key_at || eq == stop - 1 || !tar_utf8_ok(p_data + key_at, stop - key_at - 2) ||
+				memchr(p_data + key_at, 0, stop - key_at - 2) != nullptr) return false;
+		String key, value;
+		if (!tar_get(p_data, key_at, eq - key_at, p_size, key) ||
+				!tar_get(p_data, eq + 1, stop - eq - 2, p_size, value)) return false;
+		r_fields[key] = value;
+		at = stop;
+	}
+	return true;
 }
 
 // Validate archive names against relative-path rules and native destination semantics.
@@ -1401,10 +1517,10 @@ String tar_win_final(const String &p_path) {
 }
 
 // Pin the extraction root and verify that reparsing did not redirect it from the validated path.
-HANDLE tar_win_root(const String &p_root, Ref<R> &r_error) {
-	const Ref<R> made = Os::ensure_dir(p_root);
-	if (made->get_e().is_valid()) {
-		r_error = made;
+HANDLE tar_win_root(const String &p_root, Ref<Err> &r_error) {
+	const VariantPair made = Os::ensure_dir(p_root);
+	if (Ref<Err>(made.error).is_valid()) {
+		r_error = made.error;
 		return INVALID_HANDLE_VALUE;
 	}
 	SourceError::clear();
@@ -1463,12 +1579,12 @@ HANDLE tar_win_root(const String &p_root, Ref<R> &r_error) {
 }
 
 // Traverse Windows extraction paths by parent handles so archive names cannot escape through reparse points.
-Ref<R> tar_unpack_windows(const Array &p_items, const LocalVector<String> &p_names, const String &p_root) {
+VariantPair tar_unpack_windows(const Array &p_items, const LocalVector<String> &p_names, const String &p_root) {
 	for (int i = 0; i < p_items.size(); i++) {
-		Ref<R> root_error;
+		Ref<Err> root_error;
 		HANDLE parent = tar_win_root(p_root, root_error);
 		if (parent == INVALID_HANDLE_VALUE) {
-			return root_error;
+			return { Variant(), root_error };
 		}
 		const Vector<String> parts = p_names[i].split("/", true);
 		const bool is_dir = (bool)((Dictionary)p_items[i]).get("is_dir", false);
@@ -1491,7 +1607,7 @@ Ref<R> tar_unpack_windows(const Array &p_items, const LocalVector<String> &p_nam
 				failed_name += "/" + parts[k];
 			}
 			const String path = tar_output_path(p_root, failed_name);
-			return SourceError::path(path, "openat", ERR_FILE_BAD_PATH, vformat("cannot open tar directory %s", failed_name));
+			return { Variant(), SourceError::path(path, "openat", ERR_FILE_BAD_PATH, vformat("cannot open tar directory %s", failed_name)) };
 		}
 		if (is_dir) {
 			CloseHandle(parent);
@@ -1510,7 +1626,7 @@ Ref<R> tar_unpack_windows(const Array &p_items, const LocalVector<String> &p_nam
 				CloseHandle(file);
 			}
 			const String path = tar_output_path(p_root, p_names[i]);
-			return SourceError::path(path, "write", ERR_FILE_CANT_WRITE, vformat("cannot write tar file %s", p_names[i]));
+			return { Variant(), SourceError::path(path, "write", ERR_FILE_CANT_WRITE, vformat("cannot write tar file %s", p_names[i])) };
 		}
 		int64_t at = 0;
 		while (at < body.size()) {
@@ -1521,118 +1637,100 @@ Ref<R> tar_unpack_windows(const Array &p_items, const LocalVector<String> &p_nam
 				SourceError::win32(done ? ERROR_WRITE_FAULT : GetLastError());
 				CloseHandle(file);
 				const String path = tar_output_path(p_root, p_names[i]);
-				return SourceError::path(path, "write", ERR_FILE_CANT_WRITE, vformat("cannot write tar file %s", p_names[i]));
+				return { Variant(), SourceError::path(path, "write", ERR_FILE_CANT_WRITE, vformat("cannot write tar file %s", p_names[i])) };
 			}
 			at += wrote;
 		}
 		CloseHandle(file);
 	}
-	return R::ok(p_items.size());
+	return tar_ok(p_items.size());
 }
 #endif
 
 } // namespace
 
 // Encode entries as a TAR archive.
-Ref<R> Tar::pack(const Array &p_entries) {
+VariantPair Tar::pack(const Array &p_entries) {
 	PackedByteArray out;
 	for (int i = 0; i < p_entries.size(); i++) {
-		if (p_entries[i].get_type() != Variant::DICTIONARY) return R::err("tar entry must be a dictionary", Err::INVALID_DATA);
+		if (p_entries[i].get_type() != Variant::DICTIONARY) return tar_fail("tar entry must be a dictionary", Err::INVALID_DATA);
 		const Dictionary e = p_entries[i];
 		// Validate dynamic fields before native conversions can discard their values.
 		if ((e.get("name", "").get_type() != Variant::STRING && e.get("name", "").get_type() != Variant::STRING_NAME) ||
 				e.get("body", PackedByteArray()).get_type() != Variant::PACKED_BYTE_ARRAY ||
 				e.get("is_dir", false).get_type() != Variant::BOOL || e.get("mode", 420).get_type() != Variant::INT ||
 				e.get("mtime", 0).get_type() != Variant::INT) {
-			return R::err(vformat("tar entry %d has invalid field types", i), Err::INVALID_DATA);
+			return tar_fail(vformat("tar entry %d has invalid field types", i), Err::INVALID_DATA);
 		}
 		const String name = Pool::text(e.get("name", ""));
 		const bool is_dir = e.get("is_dir", false);
 		// Reject unnamed entries that cannot be addressed by extractors.
-		if (name.is_empty()) {
-			return R::err(vformat("tar entry %d has no name", i), Err::INVALID_DATA);
+		if (name.is_empty() || name.contains_char(0)) {
+			return tar_fail(vformat("tar entry %d has invalid name", i), Err::INVALID_DATA);
 		}
 		const PackedByteArray body = e.get("body", PackedByteArray());
 		const int64_t mode = e.get("mode", 420);
 		const int64_t mtime = e.get("mtime", 0);
-		uint8_t h[TAR_BLOCK];
-		memset(h, 0, TAR_BLOCK);
-		const bool fields_ok = tar_put_name(h, name) &&
-				tar_put(h, 100, 8, vformat("%07o", mode)) &&
-				tar_put(h, 108, 8, "0000000") && // Owner ID.
-				tar_put(h, 116, 8, "0000000") && // Group ID.
-				tar_put(h, 124, 12, vformat("%011o", is_dir ? 0 : body.size())) &&
-				tar_put(h, 136, 12, vformat("%011o", mtime)) &&
-				tar_put(h, 148, 8, "        ") && // Fill the checksum field with spaces before computing the sum.
-				tar_put(h, 156, 1, is_dir ? "5" : "0") &&
-				tar_put(h, 257, 6, "ustar") && tar_put(h, 263, 2, "00");
-		if (!fields_ok) {
-			return R::err(vformat("tar entry %d cannot be represented by ustar", i), Err::INVALID_DATA);
+		if (mode < 0 || mode > 07777777) return tar_fail(vformat("tar entry %d has invalid mode", i), Err::INVALID_DATA);
+		uint8_t probe[TAR_BLOCK] = {};
+		const bool long_name = !tar_put_name(probe, name);
+		const bool long_time = mtime < 0 || mtime > 077777777777;
+		const bool long_size = body.size() > 077777777777;
+		if (long_name || long_time || long_size) {
+			LocalVector<uint8_t> records;
+			if (long_name) tar_pax_record(records, "path", name);
+			if (long_time) tar_pax_record(records, "mtime", String::num_int64(mtime));
+			if (long_size) tar_pax_record(records, "size", String::num_int64(body.size()));
+			if (!tar_append(out, "PaxHeaders.X", 'x', 420, 0, records.ptr(), records.size())) return tar_fail("cannot allocate PAX header", Err::LIMITED);
 		}
-
-		// Sum every header byte for the checksum.
-		int sum = 0;
-		for (int k = 0; k < TAR_BLOCK; k++) {
-			sum += h[k];
+		if (!tar_append(out, long_name ? "PaxEntry" : name, is_dir ? '5' : '0', mode,
+				long_time ? 0 : mtime, is_dir ? nullptr : body.ptr(), is_dir || long_size ? 0 : body.size())) {
+			return tar_fail("cannot allocate tar output", Err::LIMITED);
 		}
-		tar_put(h, 148, 6, vformat("%06o", sum));
-		h[154] = 0;
-		h[155] = 32;
-
-		const int64_t at = out.size();
-		if (out.resize(at + TAR_BLOCK) != OK) {
-			return R::err("cannot allocate tar output", Err::LIMITED);
-		}
-		memcpy(out.ptrw() + at, h, TAR_BLOCK);
-
-		if (!is_dir) {
-			const int64_t bat = out.size();
+		if (!is_dir && long_size) {
 			const int64_t pad = (TAR_BLOCK - body.size() % TAR_BLOCK) % TAR_BLOCK;
-			if (out.resize(bat + body.size() + pad) != OK) {
-				return R::err("cannot allocate tar output", Err::LIMITED);
-			}
-			if (body.size() > 0) {
-				memcpy(out.ptrw() + bat, body.ptr(), body.size());
-			}
-			if (pad > 0) {
-				memset(out.ptrw() + bat + body.size(), 0, pad);
-			}
+			const int64_t at = out.size();
+			if (body.size() > INT64_MAX - at - pad || out.resize(at + body.size() + pad) != OK) return tar_fail("cannot allocate tar output", Err::LIMITED);
+			memcpy(out.ptrw() + at, body.ptr(), body.size());
+			if (pad > 0) memset(out.ptrw() + at + body.size(), 0, pad);
 		}
 	}
 	// Terminate the archive with two empty blocks.
 	const int64_t at = out.size();
 	if (out.resize(at + TAR_BLOCK * 2) != OK) {
-		return R::err("cannot allocate tar output", Err::LIMITED);
+		return tar_fail("cannot allocate tar output", Err::LIMITED);
 	}
 	memset(out.ptrw() + at, 0, TAR_BLOCK * 2);
-	return R::ok(out);
+	return tar_ok(out);
 }
 
 // Validate TAR structure and return entry dictionaries.
-Ref<R> Tar::unpack(const PackedByteArray &p_data) {
+VariantPair Tar::unpack(const PackedByteArray &p_data) {
 	Array out;
 	const uint8_t *d = p_data.ptr();
 	const int64_t total = p_data.size();
 	// Reject archives not aligned to complete blocks.
 	// Returning empty would misreport a truncated archive as successful with no content.
 	if (total == 0 || total % TAR_BLOCK != 0) {
-		return R::err(vformat("tar size %d is not a multiple of %d", total, TAR_BLOCK), Err::INVALID_DATA);
+		return tar_fail(vformat("tar size %d is not a multiple of %d", total, TAR_BLOCK), Err::INVALID_DATA);
 	}
 	int64_t at = 0;
 	bool ended = false;
+	Dictionary global_pax;
+	Dictionary local_pax;
 	while (at + TAR_BLOCK <= total) {
 		String name;
 		if (!tar_get(d, at, TAR_NAME, total, name)) {
-			return R::err("tar name is not valid UTF-8", Err::INVALID_DATA);
+			return tar_fail("tar name is not valid UTF-8", Err::INVALID_DATA);
 		}
 		if (name.is_empty()) {
 			if (at + TAR_BLOCK * 2 > total) {
-				return R::err("tar end marker is incomplete", Err::INVALID_DATA);
+				return tar_fail("tar end marker is incomplete", Err::INVALID_DATA);
 			}
 			// Reject additional archives hidden after the terminator.
 			for (int64_t i = at; i < total; i++) {
 				if (d[i] != 0) {
-					return R::err("tar has data after its end", Err::INVALID_DATA);
+					return tar_fail("tar has data after its end", Err::INVALID_DATA);
 				}
 			}
 			ended = true;
@@ -1640,7 +1738,7 @@ Ref<R> Tar::unpack(const PackedByteArray &p_data) {
 		}
 		String prefix;
 		if (!tar_get(d, at + 345, 155, total, prefix)) {
-			return R::err("tar prefix is not valid UTF-8", Err::INVALID_DATA);
+			return tar_fail("tar prefix is not valid UTF-8", Err::INVALID_DATA);
 		}
 		if (!prefix.is_empty()) {
 			name = prefix + "/" + name;
@@ -1648,64 +1746,99 @@ Ref<R> Tar::unpack(const PackedByteArray &p_data) {
 		int64_t size = 0, mode = 0, mtime = 0, stored_sum = 0;
 		if (!tar_octal(d, at + 124, 12, size) || !tar_octal(d, at + 100, 8, mode) ||
 				!tar_octal(d, at + 136, 12, mtime) || !tar_octal(d, at + 148, 8, stored_sum)) {
-			return R::err(vformat("invalid tar number at \"%s\"", name), Err::INVALID_DATA);
+			return tar_fail(vformat("invalid tar number at \"%s\"", name), Err::INVALID_DATA);
 		}
 		int64_t sum = 0;
 		for (int i = 0; i < TAR_BLOCK; i++) {
 			sum += (i >= 148 && i < 156) ? 32 : d[at + i];
 		}
 		if (sum != stored_sum) {
-			return R::err(vformat("tar checksum mismatch at \"%s\"", name), Err::INVALID_DATA);
+			return tar_fail(vformat("tar checksum mismatch at \"%s\"", name), Err::INVALID_DATA);
 		}
 		String kind;
 		if (!tar_get(d, at + 156, 1, total, kind)) {
-			return R::err(vformat("tar kind is not valid UTF-8 at \"%s\"", name), Err::INVALID_DATA);
+			return tar_fail(vformat("tar kind is not valid UTF-8 at \"%s\"", name), Err::INVALID_DATA);
 		}
+		if (kind != "" && kind != "0" && kind != "5" && kind != "x" && kind != "g") {
+			return tar_fail(vformat("unsupported tar kind at \"%s\"", name), Err::INVALID_DATA);
+		}
+		at += TAR_BLOCK;
+		if (size > total - at) {
+			return tar_fail(vformat("truncated tar at \"%s\"", name), Err::INVALID_DATA);
+		}
+		const int64_t pad = (TAR_BLOCK - size % TAR_BLOCK) % TAR_BLOCK;
+		if (pad > total - at - size) return tar_fail(vformat("truncated tar padding at \"%s\"", name), Err::INVALID_DATA);
+		const int64_t next = at + size + pad;
+		if (kind == "x" || kind == "g") {
+			Dictionary fields;
+			if (!tar_pax_read(d + at, size, fields)) return tar_fail("invalid PAX records", Err::INVALID_DATA);
+			if (kind == "x") {
+				local_pax = fields;
+			} else {
+				local_pax.clear();
+				for (const Variant &key : fields.keys()) global_pax[key] = fields[key];
+			}
+			at = next;
+			continue;
+		}
+		// Per-entry attributes override archive-wide attributes and the fixed header.
+		Dictionary pax = global_pax.duplicate();
+		for (const Variant &key : local_pax.keys()) pax[key] = local_pax[key];
+		local_pax.clear();
+		for (const Variant &key : pax.keys()) {
+			const String field = key;
+			if (field.begins_with("GNU.sparse.") || field == "SCHILY.realsize") {
+				return tar_fail("unsupported sparse TAR entry", Err::UNSUPPORTED);
+			}
+		}
+		if (pax.has("path")) name = pax["path"];
+		if (pax.has("size") && !tar_pax_number(pax["size"], false, size)) return tar_fail("invalid PAX size", Err::INVALID_DATA);
+		if (pax.has("mtime") && !tar_pax_number(pax["mtime"], true, mtime)) return tar_fail("invalid PAX mtime", Err::INVALID_DATA);
+		if (size < 0 || size > total - at) return tar_fail(vformat("truncated tar at \"%s\"", name), Err::INVALID_DATA);
+		const int64_t body_pad = (TAR_BLOCK - size % TAR_BLOCK) % TAR_BLOCK;
+		if (body_pad > total - at - size) return tar_fail(vformat("truncated tar padding at \"%s\"", name), Err::INVALID_DATA);
 		if (kind == "5" && size != 0) {
-			return R::err(vformat("tar directory has data at \"%s\"", name), Err::INVALID_DATA);
+			return tar_fail(vformat("tar directory has data at \"%s\"", name), Err::INVALID_DATA);
 		}
 		Dictionary e;
 		e["name"] = name;
 		e["mode"] = mode;
 		e["mtime"] = mtime;
 		e["is_dir"] = kind == "5";
-		at += TAR_BLOCK;
 		PackedByteArray body;
 		if (kind != "5" && size > 0) {
-			if (size > total - at) {
-				return R::err(vformat("truncated tar at \"%s\"", name), Err::INVALID_DATA);
-			}
 			if (body.resize(size) != OK) {
-				return R::err(vformat("cannot allocate tar body at \"%s\"", name), Err::LIMITED);
+				return tar_fail(vformat("cannot allocate tar body at \"%s\"", name), Err::LIMITED);
 			}
 			memcpy(body.ptrw(), d + at, size);
-			at += size + (TAR_BLOCK - size % TAR_BLOCK) % TAR_BLOCK;
 		}
+		at += size + body_pad;
 		e["body"] = body;
 		out.push_back(e);
 	}
 	if (!ended) {
-		return R::err("tar has no end marker", Err::INVALID_DATA);
+		return tar_fail("tar has no end marker", Err::INVALID_DATA);
 	}
-	return R::ok(out);
+	if (!local_pax.is_empty()) return tar_fail("PAX header has no entry", Err::INVALID_DATA);
+	return tar_ok(out);
 }
 
 // Archive a directory tree.
-Ref<R> Tar::pack_dir(const String &p_root) {
-	const Ref<R> listed = Os::walk(p_root, false, false);
-	if (listed->get_e().is_valid()) {
+VariantPair Tar::pack_dir(const String &p_root) {
+	const VariantPair listed = Os::walk(p_root, false, false);
+	if (Ref<Err>(listed.error).is_valid()) {
 		return listed;
 	}
-	const PackedStringArray files = listed->get_v();
+	const PackedStringArray files = listed.value;
 	Array entries;
 	for (const String &f : files) {
-		const Ref<R> got = Os::read_bytes(f);
-		if (got->get_e().is_valid()) {
+		const VariantPair got = Os::read_bytes(f);
+		if (Ref<Err>(got.error).is_valid()) {
 			return got;
 		}
 		Dictionary e;
 		e["name"] = f.trim_prefix(p_root).trim_prefix("/");
-		e["body"] = got->get_v();
+		e["body"] = got.value;
 		e["mode"] = 420; // Octal 0644.
 		e["mtime"] = 0;
 		e["is_dir"] = false;
@@ -1715,12 +1848,12 @@ Ref<R> Tar::pack_dir(const String &p_root) {
 }
 
 // Extract an archive into the selected directory.
-Ref<R> Tar::unpack_to(const PackedByteArray &p_data, const String &p_root) {
-	const Ref<R> got = unpack(p_data);
-	if (got->get_e().is_valid()) {
+VariantPair Tar::unpack_to(const PackedByteArray &p_data, const String &p_root) {
+	const VariantPair got = unpack(p_data);
+	if (got.error.get_type() != Variant::NIL) {
 		return got;
 	}
-	const Array items = got->get_v();
+	const Array items = got.value;
 	HashSet<String> destinations; // Reject archive names normalizing to the same destination.
 	HashSet<String> files; // File destinations that cannot be parents of other entries.
 	LocalVector<String> names;
@@ -1733,14 +1866,14 @@ Ref<R> Tar::unpack_to(const PackedByteArray &p_data, const String &p_root) {
 		const String name = Pool::text(e.get("name", ""));
 		const bool is_dir = e.get("is_dir", false);
 		if (!tar_extract_name_ok(name, is_dir)) {
-			return R::err(vformat("tar name is not portable \"%s\"", name), Err::INVALID_DATA);
+			return tar_fail(vformat("tar name is not portable \"%s\"", name), Err::INVALID_DATA);
 		}
 		const String local = is_dir && name.ends_with("/") ? name.trim_suffix("/") : name;
 		// Join validated components using only archive slash separators.
 		const String dst = tar_output_path(root, local);
 		const String key = tar_name_key(root, local, fs);
 		if (destinations.has(key)) {
-			return R::err(vformat("tar names share output \"%s\"", dst), Err::INVALID_DATA);
+			return tar_fail(vformat("tar names share output \"%s\"", dst), Err::INVALID_DATA);
 		}
 		destinations.insert(key);
 		if (!is_dir) {
@@ -1754,7 +1887,7 @@ Ref<R> Tar::unpack_to(const PackedByteArray &p_data, const String &p_root) {
 		while (slash >= 0) {
 			const String parent = tar_output_path(root, name.substr(0, slash));
 			if (files.has(tar_name_key(root, name.substr(0, slash), fs))) {
-				return R::err(vformat("tar file is also a parent \"%s\"", parent), Err::INVALID_DATA);
+				return tar_fail(vformat("tar file is also a parent \"%s\"", parent), Err::INVALID_DATA);
 			}
 			slash = name.rfind("/", slash - 1);
 		}
@@ -1770,8 +1903,8 @@ Ref<R> Tar::unpack_to(const PackedByteArray &p_data, const String &p_root) {
 		const Dictionary e = items[i];
 		const String dst = tar_output_path(root, names[i]);
 		if ((bool)e.get("is_dir", false)) {
-			const Ref<R> made = Os::ensure_dir(dst);
-			if (made->get_e().is_valid()) {
+			const VariantPair made = Os::ensure_dir(dst);
+			if (Ref<Err>(made.error).is_valid()) {
 				return made;
 			}
 		#ifdef LINUXBSD_ENABLED
@@ -1779,14 +1912,14 @@ Ref<R> Tar::unpack_to(const PackedByteArray &p_data, const String &p_root) {
 			for (const String &name : names[i].split("/", true)) {
 				part = tar_output_path(part, name);
 				if (tar_linux_alias(part, fs, written_names, written_ids)) {
-					return R::err(vformat("tar names share output \"%s\"", part), Err::INVALID_DATA);
+					return tar_fail(vformat("tar names share output \"%s\"", part), Err::INVALID_DATA);
 				}
 			}
 		#endif
 			continue;
 		}
-		const Ref<R> parent = Os::ensure_dir(dst.get_base_dir());
-		if (parent->get_e().is_valid()) {
+		const VariantPair parent = Os::ensure_dir(dst.get_base_dir());
+		if (Ref<Err>(parent.error).is_valid()) {
 			return parent;
 		}
 	#ifdef LINUXBSD_ENABLED
@@ -1795,19 +1928,19 @@ Ref<R> Tar::unpack_to(const PackedByteArray &p_data, const String &p_root) {
 		for (int k = 0; k < bits.size(); k++) {
 			part = tar_output_path(part, bits[k]);
 			if (tar_linux_alias(part, fs, written_names, written_ids)) {
-				return R::err(vformat("tar names share output \"%s\"", part), Err::INVALID_DATA);
+				return tar_fail(vformat("tar names share output \"%s\"", part), Err::INVALID_DATA);
 			}
 		}
 	#endif
-		const Ref<R> wrote = Os::write_bytes(dst, e.get("body", PackedByteArray()));
-		if (wrote->get_e().is_valid()) {
+		const VariantPair wrote = Os::write_bytes(dst, e.get("body", PackedByteArray()));
+		if (Ref<Err>(wrote.error).is_valid()) {
 			return wrote;
 		}
 	#ifdef LINUXBSD_ENABLED
 		tar_linux_remember(dst, fs, written_ids);
 	#endif
 	}
-	return R::ok(items.size());
+	return tar_ok(items.size());
 }
 
 // ---------------- Key derivation ----------------
@@ -1906,75 +2039,75 @@ bool hkdf_expand_into(const mbedtls_md_info_t *p_md, const PackedByteArray &p_ke
 } // namespace
 
 // Derive a key using PBKDF2-HMAC-SHA256.
-Ref<R> Hash::pbkdf2_sha256(const PackedByteArray &p_pass, const PackedByteArray &p_salt, int64_t p_rounds) {
+VariantPair Hash::pbkdf2_sha256(const PackedByteArray &p_pass, const PackedByteArray &p_salt, int64_t p_rounds) {
 	return pbkdf2("sha256", p_pass, p_salt, p_rounds, SHA256_LEN);
 }
 
 // Derive a PBKDF2 key with the selected hash and output length.
-Ref<R> Hash::pbkdf2(const String &p_hash, const PackedByteArray &p_pass, const PackedByteArray &p_salt, int64_t p_rounds, int64_t p_size) {
+VariantPair Hash::pbkdf2(const String &p_hash, const PackedByteArray &p_pass, const PackedByteArray &p_salt, int64_t p_rounds, int64_t p_size) {
 	const mbedtls_md_info_t *info = hash_info(p_hash);
 	if (!info) {
-		return R::err("unsupported hash", Err::UNSUPPORTED);
+		return { PackedByteArray(), Err::make("unsupported hash", Err::UNSUPPORTED) };
 	}
 	if (p_rounds > UINT_MAX || p_size < 1 || p_size > INT_MAX) {
-		return R::err("invalid PBKDF2 size or rounds", Err::INVALID_DATA);
+		return { PackedByteArray(), Err::make("invalid PBKDF2 size or rounds", Err::INVALID_DATA) };
 	}
 	PackedByteArray out;
 	if (out.resize(int(p_size)) != OK) {
-		return R::err("cannot allocate PBKDF2 key", Err::LIMITED);
+		return { PackedByteArray(), Err::make("cannot allocate PBKDF2 key", Err::LIMITED) };
 	}
 	const int e = mbedtls_pkcs5_pbkdf2_hmac_ext(mbedtls_md_get_type(info), p_pass.ptr(), p_pass.size(), p_salt.ptr(), p_salt.size(), uint32_t(MAX(p_rounds, int64_t(1))), uint32_t(p_size), out.ptrw());
-	return e == 0 ? R::ok(out) : R::err("cannot derive PBKDF2 key");
+	return e == 0 ? VariantPair{ out, Variant() } : VariantPair{ PackedByteArray(), Err::make("cannot derive PBKDF2 key", Err::NONE) };
 }
 
 // Derive an HKDF key from secret, salt, and context.
-Ref<R> Hash::hkdf(const String &p_hash, const PackedByteArray &p_secret, const PackedByteArray &p_salt, const PackedByteArray &p_info, int64_t p_size) {
+VariantPair Hash::hkdf(const String &p_hash, const PackedByteArray &p_secret, const PackedByteArray &p_salt, const PackedByteArray &p_info, int64_t p_size) {
 	const mbedtls_md_info_t *info = hash_info(p_hash);
 	if (!info) {
-		return R::err("unsupported hash", Err::UNSUPPORTED);
+		return { PackedByteArray(), Err::make("unsupported hash", Err::UNSUPPORTED) };
 	}
 	if (p_size < 0 || p_size > 255LL * mbedtls_md_get_size(info) || p_size > INT_MAX) {
-		return R::err("invalid HKDF size", Err::INVALID_DATA);
+		return { PackedByteArray(), Err::make("invalid HKDF size", Err::INVALID_DATA) };
 	}
 	PackedByteArray key;
 	if (key.resize(mbedtls_md_get_size(info)) != OK) {
-		return R::err("cannot allocate HKDF key", Err::LIMITED);
+		return { PackedByteArray(), Err::make("cannot allocate HKDF key", Err::LIMITED) };
 	}
 	if (mbedtls_hkdf_extract(info, p_salt.ptr(), p_salt.size(), p_secret.ptr(), p_secret.size(), key.ptrw()) != 0) {
 		key.fill(0);
-		return R::err("cannot extract HKDF key");
+		return { PackedByteArray(), Err::make("cannot extract HKDF key", Err::NONE) };
 	}
 	PackedByteArray out;
 	const bool made = hkdf_expand_into(info, key, p_info, int(p_size), out);
 	key.fill(0);
-	return made ? R::ok(out) : R::err("cannot derive HKDF key");
+	return made ? VariantPair{ out, Variant() } : VariantPair{ PackedByteArray(), Err::make("cannot derive HKDF key", Err::NONE) };
 }
 
 // Extract an HKDF pseudorandom key from secret and salt.
-Ref<R> Hash::hkdf_extract(const String &p_hash, const PackedByteArray &p_secret, const PackedByteArray &p_salt) {
+VariantPair Hash::hkdf_extract(const String &p_hash, const PackedByteArray &p_secret, const PackedByteArray &p_salt) {
 	const mbedtls_md_info_t *info = hash_info(p_hash);
 	if (!info) {
-		return R::err("unsupported hash", Err::UNSUPPORTED);
+		return { PackedByteArray(), Err::make("unsupported hash", Err::UNSUPPORTED) };
 	}
 	PackedByteArray out;
 	if (out.resize(mbedtls_md_get_size(info)) != OK) {
-		return R::err("cannot allocate HKDF key", Err::LIMITED);
+		return { PackedByteArray(), Err::make("cannot allocate HKDF key", Err::LIMITED) };
 	}
 	const int e = mbedtls_hkdf_extract(info, p_salt.ptr(), p_salt.size(), p_secret.ptr(), p_secret.size(), out.ptrw());
-	return e == 0 ? R::ok(out) : R::err("cannot extract HKDF key");
+	return e == 0 ? VariantPair{ out, Variant() } : VariantPair{ PackedByteArray(), Err::make("cannot extract HKDF key", Err::NONE) };
 }
 
 // Expand an HKDF pseudorandom key with context.
-Ref<R> Hash::hkdf_expand(const String &p_hash, const PackedByteArray &p_key, const PackedByteArray &p_info, int64_t p_size) {
+VariantPair Hash::hkdf_expand(const String &p_hash, const PackedByteArray &p_key, const PackedByteArray &p_info, int64_t p_size) {
 	const mbedtls_md_info_t *info = hash_info(p_hash);
 	if (!info) {
-		return R::err("unsupported hash", Err::UNSUPPORTED);
+		return { PackedByteArray(), Err::make("unsupported hash", Err::UNSUPPORTED) };
 	}
 	if (p_size < 0 || p_size > 255LL * mbedtls_md_get_size(info) || p_size > INT_MAX) {
-		return R::err("invalid HKDF size", Err::INVALID_DATA);
+		return { PackedByteArray(), Err::make("invalid HKDF size", Err::INVALID_DATA) };
 	}
 	PackedByteArray out;
-	return hkdf_expand_into(info, p_key, p_info, int(p_size), out) ? R::ok(out) : R::err("cannot expand HKDF key");
+	return hkdf_expand_into(info, p_key, p_info, int(p_size), out) ? VariantPair{ out, Variant() } : VariantPair{ PackedByteArray(), Err::make("cannot expand HKDF key", Err::NONE) };
 }
 
 // Compute SHA-224.
@@ -2023,16 +2156,16 @@ PackedByteArray Hash::sha1(const PackedByteArray &p_msg) {
 }
 
 // Compute HMAC using the selected hash.
-Ref<R> Hash::hmac(const String &p_hash, const PackedByteArray &p_key, const PackedByteArray &p_msg) {
+VariantPair Hash::hmac(const String &p_hash, const PackedByteArray &p_key, const PackedByteArray &p_msg) {
 	const mbedtls_md_info_t *info = hash_info(p_hash);
 	if (!info) {
-		return R::err("unsupported hash", Err::UNSUPPORTED);
+		return { PackedByteArray(), Err::make("unsupported hash", Err::UNSUPPORTED) };
 	}
 	PackedByteArray out;
 	if (out.resize(mbedtls_md_get_size(info)) != OK) {
-		return R::err("cannot allocate HMAC", Err::LIMITED);
+		return { PackedByteArray(), Err::make("cannot allocate HMAC", Err::LIMITED) };
 	}
-	return hmac_into(info, p_key, p_msg.ptr(), p_msg.size(), out.ptrw()) ? R::ok(out) : R::err("cannot compute HMAC");
+	return hmac_into(info, p_key, p_msg.ptr(), p_msg.size(), out.ptrw()) ? VariantPair{ out, Variant() } : VariantPair{ PackedByteArray(), Err::make("cannot compute HMAC", Err::NONE) };
 }
 
 // Compute HMAC-SHA256.

@@ -865,12 +865,13 @@ String js_string(const String &p_text, bool p_template, bool p_regexp, int64_t p
 
 // Convert Variant into a value safe in both executable scripts and structured data.
 String js_value(const Variant &p_value, int64_t p_max, bool &r_limited) {
-	const Ref<R> encoded = JsonData::encode(p_value, { { "deterministic", true }, { "max_bytes", INT_MAX - 1 } });
+	const VariantPair encoded = JsonData::encode(p_value, { { "deterministic", true }, { "max_bytes", INT_MAX - 1 } });
 	String raw;
-	if (encoded->get_ok()) {
-		const PackedByteArray bytes = encoded->get_v();
+	const Ref<Err> encode_error = encoded.error;
+	if (encode_error.is_null()) {
+		const PackedByteArray bytes = encoded.value;
 		raw = String::utf8((const char *)bytes.ptr(), bytes.size());
-	} else if (encoded->get_e()->is(Err::LIMITED)) {
+	} else if (encode_error->is(Err::LIMITED)) {
 		r_limited = true;
 		return String();
 	} else {

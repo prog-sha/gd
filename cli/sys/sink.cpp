@@ -152,7 +152,9 @@ void FileSink::drain_on_worker() {
 		String drop;
 		{
 			MutexLock lock(mutex);
-			if (close_error.is_valid() && why.is_null()) why = close_error;
+			if (close_error.is_valid()) {
+				why = Err::join(why, close_error);
+			}
 			queue.clear();
 			queued_bytes = 0;
 			closed = true;
@@ -221,7 +223,7 @@ void FileSink::abort(const String &p_drop_path) {
 		}
 	}
 	if (drop_later) {
-		GDFileCall::start([p_drop_path]() { return Os::remove(p_drop_path); });
+		GDPairCall::start([p_drop_path]() { return Os::remove(p_drop_path); }, false);
 	} else {
 		kick(); // Delegate file cleanup to the worker.
 	}

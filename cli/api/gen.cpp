@@ -151,14 +151,14 @@ String Datetime::to_http(int64_t p_unix) {
 }
 
 // Validate an RFC 3339 timestamp and convert it to Unix seconds.
-Ref<R> Datetime::parse_iso(const String &p_text) {
+VariantPair Datetime::parse_iso(const String &p_text) {
 	// Validate timestamp fields at their fixed RFC 3339 positions.
 	int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
 	if (p_text.length() < 20 || p_text[4] != '-' || p_text[7] != '-' || p_text[10] != 'T' || p_text[13] != ':' || p_text[16] != ':' ||
 			!decimal_at(p_text, 0, 4, 0, 9999, year) || !decimal_at(p_text, 5, 2, 1, 12, month) ||
 			!decimal_at(p_text, 8, 2, 1, days_in_month(year, month), day) || !decimal_at(p_text, 11, 2, 0, 23, hour) ||
 			!decimal_at(p_text, 14, 2, 0, 59, minute) || !decimal_at(p_text, 17, 2, 0, 59, second)) {
-		return R::err(vformat("invalid RFC 3339 datetime \"%s\"", p_text), Err::INVALID_DATA);
+		return { int64_t(0), Err::make(vformat("invalid RFC 3339 datetime \"%s\"", p_text), Err::INVALID_DATA) };
 	}
 	int at = 19;
 	if (at < p_text.length() && p_text[at] == '.') {
@@ -168,7 +168,7 @@ Ref<R> Datetime::parse_iso(const String &p_text) {
 			at++;
 		}
 		if (at == start) {
-			return R::err(vformat("invalid RFC 3339 fraction \"%s\"", p_text), Err::INVALID_DATA);
+			return { int64_t(0), Err::make(vformat("invalid RFC 3339 fraction \"%s\"", p_text), Err::INVALID_DATA) };
 		}
 	}
 	int offset = 0;
@@ -178,7 +178,7 @@ Ref<R> Datetime::parse_iso(const String &p_text) {
 		int zone_hour = 0, zone_minute = 0;
 		if (at + 6 != p_text.length() || (p_text[at] != '+' && p_text[at] != '-') || p_text[at + 3] != ':' ||
 				!decimal_at(p_text, at + 1, 2, 0, 23, zone_hour) || !decimal_at(p_text, at + 4, 2, 0, 59, zone_minute)) {
-			return R::err(vformat("invalid RFC 3339 timezone \"%s\"", p_text), Err::INVALID_DATA);
+			return { int64_t(0), Err::make(vformat("invalid RFC 3339 timezone \"%s\"", p_text), Err::INVALID_DATA) };
 		}
 		offset = (zone_hour * 60 + zone_minute) * 60;
 		if (p_text[at] == '-') {
@@ -193,7 +193,10 @@ Ref<R> Datetime::parse_iso(const String &p_text) {
 	box["hour"] = hour;
 	box["minute"] = minute;
 	box["second"] = second;
-	return at == p_text.length() ? R::ok(from_parts(box) - offset) : R::err("data after RFC 3339 datetime", Err::INVALID_DATA);
+	if (at != p_text.length()) {
+		return { int64_t(0), Err::make("data after RFC 3339 datetime", Err::INVALID_DATA) };
+	}
+	return { from_parts(box) - offset, Variant() };
 }
 
 // Add the selected time unit and saturate to the nearest boundary on overflow.
@@ -260,14 +263,18 @@ String Datetime::ago(int64_t p_unix, int64_t p_base) {
 namespace {
 
 const char *ULID_B32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"; // Crockford alphabet excluding I, L, O, and U.
-constexpr int ULID_TIME = 10;
-constexpr int ULID_RAND = 16;
+constexpr int ULID_TIME = 10; // Characters encoding the timestamp.
+constexpr int ULID_RAND = 16; // Characters encoding the random suffix.
+constexpr int64_t ULID_MAX_MS = (int64_t(1) << 48) - 1; // Largest representable millisecond timestamp.
 
 } // namespace
 
 // Generate a time-sortable ULID from milliseconds and random bytes.
 String Ulid::make(int64_t p_ms) {
-	const int64_t at = p_ms < 0 ? (int64_t)(GDClock::unix_time() * 1000.0) : p_ms;
+	const int64_t at = p_ms == -1 ? (int64_t)(GDClock::unix_time() * 1000.0) : p_ms;
+	if (at < 0 || at > ULID_MAX_MS) {
+		return String(); // An invalid timestamp cannot produce a sortable identifier.
+	}
 	if (at == last_ms && has_last) {
 		// Increment the random suffix within the same millisecond, carrying from the end.
 		for (int i = ULID_RAND - 1; i >= 0; i--) {
@@ -301,13 +308,14 @@ String Ulid::make(int64_t p_ms) {
 	return String::utf8(out, ULID_TIME + ULID_RAND);
 }
 
-// Validate ULID length and alphabet.
+// Validate ULID length, value range, and ASCII alphabet.
 bool Ulid::is_valid(const String &p_text) {
-	if (p_text.length() != ULID_TIME + ULID_RAND) {
+	if (p_text.length() != ULID_TIME + ULID_RAND || p_text[0] > '7') {
 		return false;
 	}
 	for (int i = 0; i < p_text.length(); i++) {
-		if (!strchr(ULID_B32, (int)p_text[i]) || p_text[i] == 0) {
+		const char32_t c = p_text[i];
+		if (c == 0 || c > 127 || !strchr(ULID_B32, int(c))) {
 			return false;
 		}
 	}
@@ -315,15 +323,15 @@ bool Ulid::is_valid(const String &p_text) {
 }
 
 // Extract the creation timestamp from a ULID prefix.
-Ref<R> Ulid::time_of(const String &p_text) {
+VariantPair Ulid::time_of(const String &p_text) {
 	if (!is_valid(p_text)) {
-		return R::err(vformat("invalid ulid \"%s\"", p_text), Err::INVALID_DATA);
+		return { int64_t(0), Err::make(vformat("invalid ulid \"%s\"", p_text), Err::INVALID_DATA) };
 	}
 	int64_t v = 0;
 	for (int i = 0; i < ULID_TIME; i++) {
 		v = v * 32 + (int64_t)(strchr(ULID_B32, (int)p_text[i]) - ULID_B32);
 	}
-	return R::ok(v);
+	return { v, Variant() };
 }
 
 // ---------------- UUID ----------------
@@ -382,9 +390,9 @@ bool Uuid::is_valid(const String &p_text) {
 }
 
 // Decode a UUID string into 16 bytes.
-Ref<R> Uuid::to_bytes(const String &p_text) {
+VariantPair Uuid::to_bytes(const String &p_text) {
 	if (!is_valid(p_text)) {
-		return R::err(vformat("invalid uuid \"%s\"", p_text), Err::INVALID_DATA);
+		return { PackedByteArray(), Err::make(vformat("invalid uuid \"%s\"", p_text), Err::INVALID_DATA) };
 	}
 	const String hex = p_text.replace("-", "");
 	PackedByteArray out;
@@ -393,20 +401,20 @@ Ref<R> Uuid::to_bytes(const String &p_text) {
 	for (int i = 0; i < 16; i++) {
 		w[i] = (uint8_t)hex.substr(i * 2, 2).hex_to_int();
 	}
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // Derive UUID v5 deterministically from namespace and name.
-Ref<R> Uuid::v5(const String &p_space, const String &p_name) {
-	const Ref<R> ns = to_bytes(p_space);
-	if (ns->get_e().is_valid()) {
-		return ns;
+VariantPair Uuid::v5(const String &p_space, const String &p_name) {
+	VariantPair ns = to_bytes(p_space);
+	if (ns.error.get_type() != Variant::NIL) {
+		return { String(), ns.error };
 	}
-	PackedByteArray raw = ns->get_v();
+	PackedByteArray raw = ns.value;
 	raw.append_array(p_name.to_utf8_buffer());
 	PackedByteArray digest = Hash::sha1(raw);
 	digest.resize(16);
-	return R::ok(uuid_stamp(digest.ptrw(), 5));
+	return { uuid_stamp(digest.ptrw(), 5), Variant() };
 }
 
 // Return the UUID version, or zero for malformed text.

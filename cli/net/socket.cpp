@@ -56,9 +56,13 @@ Dictionary address_of(const String &p_host, int p_port, const String &p_network)
 	return out;
 }
 
-// Convert an engine error to a standard result.
-Ref<R> socket_error(const String &p_message, Error p_error) {
-	return R::err(p_message, Err::of(p_error));
+// Keep the native connection cause searchable while applying the public error category.
+Ref<Err> dial_failure(const String &p_host, int p_port, Error p_error, int p_code) {
+	Dictionary info;
+	if (p_code) info["os_code"] = p_code;
+	if (GDNative::refused(p_code)) info["code"] = "ECONNREFUSED";
+	const Err::Kind kind = Err::of(p_code ? GDNative::failure(p_code) : p_error);
+	return Err::make(vformat("cannot connect to %s:%d", p_host, p_port), kind, info);
 }
 
 } // namespace
@@ -66,14 +70,21 @@ Ref<R> socket_error(const String &p_message, Error p_error) {
 // ---------------- TCP connections ----------------
 
 // Complete a TCP operation and deliver its result.
-void GDTCPCall::done(const Ref<R> &p_result) {
+void GDTCPCall::done(const VariantPair &p_result) {
 	if (self_hold.is_null()) {
 		return;
 	}
 	Ref<GDTCPCall> keep(this);
+	VariantPair result = p_result;
+	if (writing && result.error.get_type() != Variant::NIL) {
+		// Preserve bytes accepted before a write failed or was canceled.
+		const Ref<Err> error = result.error;
+		result.value = at;
+		result.error = error->with_partial(at);
+	}
 	owner = nullptr;
 	self_hold.unref(); // Commit completion before external callbacks to make reentrant cancel harmless.
-	emit_signal("finished", p_result);
+	Async::finish(this, SNAME("finished"), result.value, result.error);
 }
 
 // Cancel a TCP operation from its waiter.
@@ -86,7 +97,7 @@ void GDTCPCall::cancel() {
 // Register the TCP operation's completion signal.
 void GDTCPCall::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDTCPCall::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
 // Wrap an already-connected stream as a standard connection.
@@ -143,17 +154,18 @@ void GDTCPConn::arm_deadline() {
 
 // Start reading, suspending only this caller until bytes arrive.
 Signal GDTCPConn::read(int64_t p_max) {
+	if (upgrading) return Async::ready_pair({ Variant(), Err::make("connection is upgrading to TLS", Err::INTERRUPTED) });
 	if (p_max < 0) {
-		return Async::ready(R::err("read size must not be negative", Err::INVALID_DATA));
+		return Async::ready_pair({ Variant(), Err::make("read size must not be negative", Err::INVALID_DATA) });
 	}
 	if (!is_open()) {
-		return Async::ready(R::err("connection closed", Err::INTERRUPTED));
+		return Async::ready_pair({ Variant(), Err::make("connection closed", Err::INTERRUPTED) });
 	}
 	if (p_max == 0) {
-		return Async::ready(R::ok(PackedByteArray()));
+		return Async::ready_pair({ PackedByteArray(), Variant() });
 	}
 	if ((tls.is_valid() ? tls->read_eof() : native->read_eof())) {
-		return Async::ready(expired(read_due) ? R::err("read deadline exceeded", Err::TIMED_OUT) : R::ok(PackedByteArray()));
+		return Async::ready_pair(expired(read_due) ? VariantPair{ Variant(), Err::make("read deadline exceeded", Err::TIMED_OUT) } : VariantPair{ PackedByteArray(), Variant() });
 	}
 	Ref<GDTCPCall> call;
 	call.instantiate();
@@ -170,11 +182,12 @@ Signal GDTCPConn::read(int64_t p_max) {
 
 // Start writing, suspending only this caller until all bytes reach the kernel.
 Signal GDTCPConn::write(const PackedByteArray &p_data) {
+	if (upgrading) return Async::ready_pair({ Variant(), Err::make("connection is upgrading to TLS", Err::INTERRUPTED) });
 	if (!is_open()) {
-		return Async::ready(R::err("connection closed", Err::INTERRUPTED));
+		return Async::ready_pair({ Variant(), Err::make("connection closed", Err::INTERRUPTED) });
 	}
 	if (p_data.is_empty()) {
-		return Async::ready(R::ok(0));
+		return Async::ready_pair({ 0, Variant() });
 	}
 	Ref<GDTCPCall> call;
 	call.instantiate();
@@ -190,21 +203,26 @@ Signal GDTCPConn::write(const PackedByteArray &p_data) {
 	return out;
 }
 
+// Upgrade one idle plaintext connection through the shared TLS handshake path.
+Signal GDTCPConn::start_tls(const String &p_host, const Dictionary &p_opts) {
+	return GDTLSDialCall::start_on_conn(Ref<GDTCPConn>(this), p_host, p_opts);
+}
+
 // Advance TCP I/O within a fair scheduling turn.
 void GDTCPConn::step() {
 	Ref<GDTCPConn> keep(this); // Retain the connection even if a completion callback releases its last external owner.
 	if (native.is_null()) {
-		fail_all(R::err("connection closed", Err::INTERRUPTED));
+		fail_all({ Variant(), Err::make("connection closed", Err::INTERRUPTED) });
 		return;
 	}
-	if (native->wait_error().is_valid()) { fail_all(native->wait_error()); return; }
+	if (native->wait_error().is_valid()) { fail_all({ Variant(), native->wait_error() }); return; }
 	if (tls.is_valid()) {
 		tls->poll();
 	} else {
 		native->poll();
 	}
 	if (!is_open()) {
-		fail_all(R::err("connection closed", Err::INTERRUPTED));
+		fail_all({ Variant(), Err::make("connection closed", Err::INTERRUPTED) });
 		return;
 	}
 
@@ -213,7 +231,7 @@ void GDTCPConn::step() {
 		Ref<GDTCPCall> call = reads.front()->get();
 		if (expired(call->due)) {
 			reads.pop_front();
-			call->done(R::err("read deadline exceeded", Err::TIMED_OUT));
+			call->done({ Variant(), Err::make("read deadline exceeded", Err::TIMED_OUT) });
 			if (native.is_null()) {
 				return;
 			}
@@ -224,7 +242,7 @@ void GDTCPConn::step() {
 		PackedByteArray &data = call->data; // Retain caller-owned storage across EAGAIN waits.
 		if (data.size() != wanted && data.resize(wanted) != OK) {
 			reads.pop_front();
-			call->done(R::err("read buffer allocation failed", Err::LIMITED));
+			call->done({ Variant(), Err::make("read buffer allocation failed", Err::LIMITED) });
 			if (native.is_null()) {
 				return;
 			}
@@ -236,7 +254,7 @@ void GDTCPConn::step() {
 		if (err == ERR_FILE_EOF) {
 			data.resize(MAX(0, got));
 			reads.pop_front();
-			call->done(R::ok(data));
+			call->done({ data, Variant() });
 			if (!reads.is_empty()) {
 				Async::post(Ref<RefCounted>(this), callable_mp(this, &GDTCPConn::step)); // Deliver the continuation waiting for EOF.
 			}
@@ -244,7 +262,7 @@ void GDTCPConn::step() {
 		}
 		if (err != OK) {
 			reads.pop_front();
-			call->done(socket_error("read failed", err));
+			call->done({ Variant(), Err::make("read failed", Err::of(err)) });
 			if (native.is_null()) {
 				return;
 			}
@@ -255,7 +273,7 @@ void GDTCPConn::step() {
 			break;
 		}
 		reads.pop_front();
-		call->done(R::ok(data));
+		call->done({ data, Variant() });
 		break; // Yield execution to other connections.
 	}
 	// A completion callback may close the connection.
@@ -269,7 +287,7 @@ void GDTCPConn::step() {
 		if (expired(call->due)) {
 			writes.pop_front();
 			if (tls.is_valid()) tls->abort_write();
-			call->done(R::err("write deadline exceeded", Err::TIMED_OUT));
+			call->done({ Variant(), Err::make("write deadline exceeded", Err::TIMED_OUT) });
 			if (native.is_null()) {
 				return;
 			}
@@ -281,7 +299,7 @@ void GDTCPConn::step() {
 		if (err == ERR_BUSY) break;
 		if (err != OK) {
 			writes.pop_front();
-			call->done(socket_error("write failed", err));
+			call->done({ Variant(), Err::make("write failed", Err::of(err)) });
 			if (native.is_null()) {
 				return;
 			}
@@ -291,7 +309,7 @@ void GDTCPConn::step() {
 		if (call->at >= call->data.size()) {
 			const int64_t total = call->data.size();
 			writes.pop_front();
-			call->done(R::ok(total));
+			call->done({ total, Variant() });
 			if (native.is_null()) {
 				return; // The completion callback closed the connection.
 			}
@@ -316,7 +334,7 @@ void GDTCPConn::cancel_call(GDTCPCall *p_call) {
 			Ref<GDTCPCall> keep = e->get();
 			if (p_call->writing && e == writes.front() && tls.is_valid()) tls->abort_write();
 			queue.erase(e);
-			keep->done(R::err("operation canceled", Err::INTERRUPTED));
+			keep->done({ Variant(), Err::make("operation canceled", Err::INTERRUPTED) });
 			break;
 		}
 	}
@@ -325,7 +343,7 @@ void GDTCPConn::cancel_call(GDTCPCall *p_call) {
 }
 
 // Deliver the same closure reason to all TCP operations.
-void GDTCPConn::fail_all(const Ref<R> &p_result) {
+void GDTCPConn::fail_all(const VariantPair &p_result) {
 	while (!reads.is_empty()) {
 		Ref<GDTCPCall> call = reads.front()->get();
 		reads.pop_front();
@@ -341,37 +359,37 @@ void GDTCPConn::fail_all(const Ref<R> &p_result) {
 }
 
 // Set both I/O deadlines in seconds from now.
-Ref<R> GDTCPConn::set_deadline(double p_seconds) {
-	Ref<R> result = set_read_deadline(p_seconds);
-	return result->get_ok() ? set_write_deadline(p_seconds) : result;
+Ref<Err> GDTCPConn::set_deadline(double p_seconds) {
+	Ref<Err> error = set_read_deadline(p_seconds);
+	return error.is_valid() ? error : set_write_deadline(p_seconds);
 }
 
 // Set the read deadline, including reads already waiting.
-Ref<R> GDTCPConn::set_read_deadline(double p_seconds) {
+Ref<Err> GDTCPConn::set_read_deadline(double p_seconds) {
 	const uint64_t next = due_after(p_seconds);
 	if (next == UINT64_MAX) {
-		return R::err("read deadline must be a non-negative number of seconds", Err::INVALID_DATA);
+		return Err::make("read deadline must be a non-negative number of seconds", Err::INVALID_DATA);
 	}
 	read_due = next;
 	for (Ref<GDTCPCall> &call : reads) {
 		call->due = read_due;
 	}
 	arm_deadline();
-	return R::ok();
+	return Ref<Err>();
 }
 
 // Set the write deadline, including writes already waiting.
-Ref<R> GDTCPConn::set_write_deadline(double p_seconds) {
+Ref<Err> GDTCPConn::set_write_deadline(double p_seconds) {
 	const uint64_t next = due_after(p_seconds);
 	if (next == UINT64_MAX) {
-		return R::err("write deadline must be a non-negative number of seconds", Err::INVALID_DATA);
+		return Err::make("write deadline must be a non-negative number of seconds", Err::INVALID_DATA);
 	}
 	write_due = next;
 	for (Ref<GDTCPCall> &call : writes) {
 		call->due = write_due;
 	}
 	arm_deadline();
-	return R::ok();
+	return Ref<Err>();
 }
 
 // Return the local TCP address.
@@ -404,13 +422,14 @@ bool GDTCPConn::is_open() const {
 
 // Close the TCP stream and wake every pending operation.
 void GDTCPConn::close() {
+	upgrading = false;
 	if (tls.is_valid()) tls->close();
 	if (native.is_valid()) {
 		native->close();
 		native.unref();
 	}
 	tls.unref();
-	fail_all(R::err("connection closed", Err::INTERRUPTED));
+	fail_all({ Variant(), Err::make("connection closed", Err::INTERRUPTED) });
 }
 
 // Leave no pending waits when destroying a TCP stream.
@@ -424,6 +443,8 @@ void GDTCPConn::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("read_async", "max"), &GDTCPConn::read_async, DEFVAL(65536));
 	ClassDB::bind_method(D_METHOD("write", "data"), &GDTCPConn::write);
 	ClassDB::bind_method(D_METHOD("write_async", "data"), &GDTCPConn::write_async);
+	ClassDB::bind_method(D_METHOD("start_tls", "host", "opts"), &GDTCPConn::start_tls, DEFVAL(Dictionary()));
+	ClassDB::bind_method(D_METHOD("start_tls_async", "host", "opts"), &GDTCPConn::start_tls_async, DEFVAL(Dictionary()));
 	ClassDB::bind_method(D_METHOD("set_deadline", "seconds"), &GDTCPConn::set_deadline);
 	ClassDB::bind_method(D_METHOD("set_read_deadline", "seconds"), &GDTCPConn::set_read_deadline);
 	ClassDB::bind_method(D_METHOD("set_write_deadline", "seconds"), &GDTCPConn::set_write_deadline);
@@ -432,15 +453,15 @@ void GDTCPConn::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("connection_state"), &GDTCPConn::connection_state);
 	ClassDB::bind_method(D_METHOD("is_open"), &GDTCPConn::is_open);
 	ClassDB::bind_method(D_METHOD("close"), &GDTCPConn::close);
-	ADD_AWAIT("read", "R:PackedByteArray");
-	ADD_AWAIT("read_async", "R:PackedByteArray");
-	ADD_AWAIT("write", "R:int");
-	ADD_AWAIT("write_async", "R:int");
+	ADD_AWAIT("read", "Pair:PackedByteArray");
+	ADD_AWAIT("read_async", "Pair:PackedByteArray");
+	ADD_AWAIT("write", "Pair:int");
+	ADD_AWAIT("write_async", "Pair:int");
+	ADD_AWAIT("start_tls", "Pair:GDTCPConn");
+	ADD_AWAIT("start_tls_async", "Pair:GDTCPConn");
 	ADD_AUTO_WAIT("read");
 	ADD_AUTO_WAIT("write");
-	ADD_RESULT("set_deadline", "Variant");
-	ADD_RESULT("set_read_deadline", "Variant");
-	ADD_RESULT("set_write_deadline", "Variant");
+	ADD_AUTO_WAIT("start_tls");
 }
 
 // ---------------- TCP dialing ----------------
@@ -468,20 +489,20 @@ void GDTCPDialCall::arm_deadline() {
 }
 
 // Use the first candidate's family as primary and the other family as fallback.
-void GDTCPDialCall::resolved(const Ref<R> &p_result) {
+void GDTCPDialCall::resolved(const Variant &p_value, const Ref<Err> &p_error) {
 	lookup = Signal();
 	if (self_hold.is_null()) return;
 	if (Pool::is_stopping()) {
-		done(R::err("worker pool stopped", Err::INTERRUPTED));
+		done({ Variant(), Err::make("worker pool stopped", Err::INTERRUPTED) });
 		return;
 	}
-	if (p_result.is_null() || !p_result->get_ok()) {
-		done(p_result.is_valid() ? p_result : R::err("name resolution failed", Err::NOT_FOUND));
+	if (p_error.is_valid()) {
+		done({ Variant(), p_error });
 		return;
 	}
-	const PackedStringArray addresses = p_result->get_v();
+	const PackedStringArray addresses = p_value;
 	if (addresses.is_empty()) {
-		done(R::err("no address to connect", Err::NOT_FOUND));
+		done({ Variant(), Err::make("no address to connect", Err::NOT_FOUND) });
 		return;
 	}
 	const bool first_v6 = addresses[0].contains(":");
@@ -509,13 +530,13 @@ bool GDTCPDialCall::advance(Lane &p_lane) {
 			if (!expired(p_lane.due) && p_lane.peer->status() == GDStream::CONNECTED) {
 				Ref<GDStream> winner = p_lane.peer;
 				p_lane.peer.unref();
-				done(R::ok(GDTCPConn::take(winner)));
+				done({ GDTCPConn::take(winner), Variant() });
 				return true;
 			}
 			if (!expired(p_lane.due) && p_lane.peer->status() == GDStream::CONNECTING) return false;
 			if (p_lane.error.is_null()) {
-				p_lane.error = expired(p_lane.due) ? R::err("address connection timed out", Err::TIMED_OUT) :
-						R::err(vformat("cannot connect to %s:%d", host, port), Err::NOT_FOUND);
+				p_lane.error = expired(p_lane.due) ? Err::make("address connection timed out", Err::TIMED_OUT) :
+						dial_failure(p_lane.addresses[p_lane.next - 1], port, FAILED, p_lane.peer->get_dial_os_error());
 			}
 			p_lane.peer->close();
 			p_lane.peer.unref();
@@ -534,7 +555,7 @@ bool GDTCPDialCall::advance(Lane &p_lane) {
 		p_lane.peer.instantiate();
 		const Error error = p_lane.peer->dial(address, port);
 		if (error != OK && p_lane.error.is_null()) {
-			p_lane.error = socket_error(vformat("cannot connect to %s:%d", address, port), error);
+			p_lane.error = dial_failure(address, port, error, p_lane.peer->get_dial_os_error());
 		}
 	}
 }
@@ -543,7 +564,7 @@ bool GDTCPDialCall::advance(Lane &p_lane) {
 void GDTCPDialCall::step() {
 	if (self_hold.is_null()) return;
 	if (expired(due)) {
-		done(R::err(vformat("connection to %s:%d timed out", host, port), Err::TIMED_OUT));
+		done({ Variant(), Err::make(vformat("connection to %s:%d timed out", host, port), Err::TIMED_OUT) });
 		return;
 	}
 	if (prepared) {
@@ -552,7 +573,7 @@ void GDTCPDialCall::step() {
 		if (fallback && (primary_done || expired(fallback))) fallback = 0;
 		if (!fallback && advance(lanes[1])) return;
 		if (primary_done && lanes[1].peer.is_null() && lanes[1].next >= lanes[1].addresses.size()) {
-			done(lanes[0].error.is_valid() ? lanes[0].error : R::err("no address to connect", Err::NOT_FOUND));
+			done({ Variant(), lanes[0].error.is_valid() ? lanes[0].error : Err::make("no address to connect", Err::NOT_FOUND) });
 			return;
 		}
 	}
@@ -561,7 +582,7 @@ void GDTCPDialCall::step() {
 }
 
 // Close losing connections and invalidate late DNS completion.
-void GDTCPDialCall::done(const Ref<R> &p_result) {
+void GDTCPDialCall::done(const VariantPair &p_result) {
 	if (self_hold.is_null()) return;
 	Ref<GDTCPDialCall> keep(this);
 	self_hold.unref(); // Commit completion before resolver cancellation can invoke callbacks.
@@ -574,7 +595,7 @@ void GDTCPDialCall::done(const Ref<R> &p_result) {
 		lane.peer.unref();
 	}
 	tcp_dials.erase(this);
-	emit_signal("finished", p_result);
+	Async::finish(this, SNAME("finished"), p_result.value, p_result.error);
 }
 
 // Cancel all pending connections at shutdown, including those with completed DNS.
@@ -584,7 +605,7 @@ void GDTCPDialCall::shutdown_all() {
 		calls.push_back(Ref<GDTCPDialCall>(call));
 	}
 	for (const Ref<GDTCPDialCall> &call : calls) {
-		call->done(R::err("worker pool stopped", Err::INTERRUPTED));
+		call->done({ Variant(), Err::make("worker pool stopped", Err::INTERRUPTED) });
 	}
 }
 
@@ -593,7 +614,7 @@ Signal GDTCPDialCall::start(const String &p_host, int64_t p_port, const Dictiona
 	const double timeout = p_opts.get("timeout", 0.0);
 	const uint64_t due = due_after(timeout);
 	if (p_host.is_empty() || p_port < 1 || p_port > 65535 || due == UINT64_MAX) {
-		return Async::ready(R::err("dial requires a host, a valid port, and a non-negative timeout", Err::INVALID_DATA));
+		return Async::ready_pair({ Variant(), Err::make("dial requires a host, a valid port, and a non-negative timeout", Err::INVALID_DATA) });
 	}
 	Ref<GDTCPDialCall> call;
 	call.instantiate();
@@ -612,13 +633,13 @@ Signal GDTCPDialCall::start(const String &p_host, int64_t p_port, const Dictiona
 
 // Cancel a pending TCP connection.
 void GDTCPDialCall::cancel() {
-	done(R::err("connection canceled", Err::INTERRUPTED));
+	done({ Variant(), Err::make("connection canceled", Err::INTERRUPTED) });
 }
 
 // Register the TCP dial completion signal.
 void GDTCPDialCall::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDTCPDialCall::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
 // ---------------- TLS dialing ----------------
@@ -633,16 +654,20 @@ void GDTLSDialCall::watch(bool p_on) {
 }
 
 // Retain worker-loaded trust settings and dial all TCP candidates within the remaining deadline.
-void GDTLSDialCall::prepared(const Ref<R> &p_result) {
+void GDTLSDialCall::prepared(const Variant &p_value, const Ref<Err> &p_error) {
 	if (self_hold.is_null()) return;
-	if (Pool::is_stopping()) { done(R::err("worker pool stopped", Err::INTERRUPTED)); return; }
-	if (p_result.is_null() || !p_result->get_ok()) {
-		done(p_result.is_valid() ? p_result : R::err("TLS preparation failed", Err::INVALID_DATA));
+	if (Pool::is_stopping()) { done({ Variant(), Err::make("worker pool stopped", Err::INTERRUPTED) }); return; }
+	if (p_error.is_valid()) {
+		done({ Variant(), p_error });
 		return;
 	}
 	if (expired(due)) { step(); return; }
-	const Array prepared = p_result->get_v();
+	const Array prepared = p_value;
 	ca = prepared[0]; identity = prepared[1];
+	if (source.is_valid()) {
+		connected(source, Ref<Err>());
+		return;
+	}
 	Dictionary opts;
 	opts["timeout"] = due ? double(due - GDClock::msec()) / 1000.0 : 0.0;
 	pending = GDTCPDialCall::start(host, port, opts);
@@ -650,19 +675,24 @@ void GDTLSDialCall::prepared(const Ref<R> &p_result) {
 }
 
 // Transfer the connected descriptor exclusively to the verified TLS setup.
-void GDTLSDialCall::connected(const Ref<R> &p_result) {
+void GDTLSDialCall::connected(const Variant &p_value, const Ref<Err> &p_error) {
 	pending = Signal();
 	if (self_hold.is_null()) return;
-	if (p_result.is_null() || !p_result->get_ok()) {
-		done(p_result.is_valid() ? p_result : R::err("TCP connection failed", Err::NOT_FOUND));
+	if (p_error.is_valid()) {
+		done({ Variant(), p_error });
 		return;
 	}
-	const Ref<GDTCPConn> conn = p_result->get_v();
+	const Ref<GDTCPConn> conn = p_value;
+	if (conn.is_null() || conn->native.is_null() || conn->tls.is_valid() || !conn->reads.is_empty() || !conn->writes.is_empty() || (source.is_valid() && !conn->upgrading)) {
+		done({ Variant(), Err::make("TLS upgrade requires an idle plaintext connection", Err::INVALID_DATA) });
+		return;
+	}
+	conn->watch(false);
 	peer = conn->native;
 	conn->native.unref(); // This connection has no application read or write waiters yet.
 	tls.instantiate();
 	if (tls->start(peer, server_name, ca, insecure, identity, protocols) != OK) {
-		done(R::err(tls->error(), Err::UNAUTHENTICATED));
+		done({ Variant(), Err::make(tls->error(), Err::UNAUTHENTICATED) });
 		return;
 	}
 	step();
@@ -671,26 +701,26 @@ void GDTLSDialCall::connected(const Ref<R> &p_result) {
 // Advance the handshake and trust verification within the TCP connection's overall deadline.
 void GDTLSDialCall::step() {
 	if (self_hold.is_null()) return;
-	if (peer.is_valid() && peer->wait_error().is_valid()) { done(peer->wait_error()); return; }
+	if (peer.is_valid() && peer->wait_error().is_valid()) { done({ Variant(), peer->wait_error() }); return; }
 	if (expired(due)) {
-		done(R::err(vformat("TLS connection to %s:%d timed out", host, port), Err::TIMED_OUT));
+		done({ Variant(), Err::make(vformat("TLS connection to %s:%d timed out", host, port), Err::TIMED_OUT) });
 		return;
 	}
 	if (tls.is_null()) return;
 	tls->poll();
 	if (tls->status() == GDTLS::READY) {
-		done(R::ok(GDTCPConn::take_tls(peer, tls, server_name)));
+		done({ GDTCPConn::take_tls(peer, tls, server_name), Variant() });
 		return;
 	}
 	if (tls->status() == GDTLS::BROKEN || tls->status() == GDTLS::CLOSED) {
-		done(R::err(tls->error(), Err::UNAUTHENTICATED));
+		done({ Variant(), Err::make(tls->error(), Err::UNAUTHENTICATED) });
 		return;
 	}
 	watch(true);
 }
 
 // Commit completion before external notification and cancel any TCP setup still in progress.
-void GDTLSDialCall::done(const Ref<R> &p_result) {
+void GDTLSDialCall::done(const VariantPair &p_result) {
 	if (self_hold.is_null()) return;
 	Ref<GDTLSDialCall> keep(this);
 	self_hold.unref();
@@ -698,15 +728,19 @@ void GDTLSDialCall::done(const Ref<R> &p_result) {
 	Async::drop_deadline(this, due);
 	if (Object *call = pending.get_object()) call->call("cancel");
 	pending = Signal();
-	const bool ok = p_result.is_valid() && p_result->get_ok();
+	const bool ok = p_result.error.get_type() == Variant::NIL;
 	if (!ok && tls.is_valid()) tls->close();
 	if (!ok && peer.is_valid()) peer->close();
 	tls.unref();
 	peer.unref();
 	ca.unref();
 	identity.unref();
+	if (source.is_valid()) {
+		if (!ok) source->close();
+		source.unref();
+	}
 	tls_dials.erase(this);
-	emit_signal("finished", p_result);
+	Async::finish(this, SNAME("finished"), p_result.value, p_result.error);
 }
 
 // Cancel all pending TLS connections at shutdown, including those with completed DNS.
@@ -716,12 +750,12 @@ void GDTLSDialCall::shutdown_all() {
 		calls.push_back(Ref<GDTLSDialCall>(call));
 	}
 	for (const Ref<GDTLSDialCall> &call : calls) {
-		call->done(R::err("worker pool stopped", Err::INTERRUPTED));
+		call->done({ Variant(), Err::make("worker pool stopped", Err::INTERRUPTED) });
 	}
 }
 
 // Validate TLS settings and start resolution and CA loading on a worker.
-Signal GDTLSDialCall::start(const String &p_host, int64_t p_port, const Dictionary &p_opts) {
+Signal GDTLSDialCall::start_with_source(const String &p_host, int64_t p_port, const Dictionary &p_opts, const Ref<GDTCPConn> &p_source) {
 	static const char *const known[] = { "timeout", "server_name", "insecure_skip_verify", "ca_file", "cert_file", "key_file", "next_protos", nullptr };
 	for (const KeyValue<Variant, Variant> &kv : p_opts) {
 		bool found = false;
@@ -729,7 +763,7 @@ Signal GDTLSDialCall::start(const String &p_host, int64_t p_port, const Dictiona
 			found = found || String(kv.key) == known[i];
 		}
 		if (!found) {
-			return Async::ready(R::err(vformat("unknown TLS option: %s", kv.key), Err::INVALID_DATA));
+			return Async::ready_pair({ Variant(), Err::make(vformat("unknown TLS option: %s", kv.key), Err::INVALID_DATA) });
 		}
 	}
 	const Variant timeout_value = p_opts.get("timeout", 0.0);
@@ -741,23 +775,23 @@ Signal GDTLSDialCall::start(const String &p_host, int64_t p_port, const Dictiona
 			(timeout_value.get_type() != Variant::INT && timeout_value.get_type() != Variant::FLOAT) ||
 			name_value.get_type() != Variant::STRING || insecure_value.get_type() != Variant::BOOL || ca_value.get_type() != Variant::STRING ||
 			cert_value.get_type() != Variant::STRING || key_value.get_type() != Variant::STRING || (protocols_value.get_type() != Variant::ARRAY && protocols_value.get_type() != Variant::PACKED_STRING_ARRAY)) {
-		return Async::ready(R::err("dial_tls requires a host, valid port, and typed options", Err::INVALID_DATA));
+		return Async::ready_pair({ Variant(), Err::make("dial_tls requires a host, valid port, and typed options", Err::INVALID_DATA) });
 	}
 	const String server_name = name_value;
 	const String cert_file = cert_value, key_file = key_value;
-	if (cert_file.is_empty() != key_file.is_empty()) return Async::ready(R::err("TLS cert_file and key_file must be provided together",Err::INVALID_DATA));
+	if (cert_file.is_empty() != key_file.is_empty()) return Async::ready_pair({ Variant(), Err::make("TLS cert_file and key_file must be provided together", Err::INVALID_DATA) });
 	PackedStringArray protocols;
 	const Array names = protocols_value;
 	int64_t encoded_size = 0;
 	for (const Variant &value : names) {
-		if (value.get_type() != Variant::STRING) return Async::ready(R::err("TLS next_protos requires strings",Err::INVALID_DATA));
+		if (value.get_type() != Variant::STRING) return Async::ready_pair({ Variant(), Err::make("TLS next_protos requires strings", Err::INVALID_DATA) });
 		const String name = value; const int64_t size = name.utf8().length();
-		if (size < 1 || size > 255 || encoded_size > 65535-size-1) return Async::ready(R::err("TLS next_protos exceeds encoded protocol-name widths",Err::INVALID_DATA));
+		if (size < 1 || size > 255 || encoded_size > 65535-size-1) return Async::ready_pair({ Variant(), Err::make("TLS next_protos exceeds encoded protocol-name widths", Err::INVALID_DATA) });
 		encoded_size += size+1; protocols.push_back(name);
 	}
 	const uint64_t due = due_after((double)timeout_value);
 	if (server_name.is_empty() || due == UINT64_MAX) {
-		return Async::ready(R::err("TLS server_name must not be empty and timeout must be non-negative", Err::INVALID_DATA));
+		return Async::ready_pair({ Variant(), Err::make("TLS server_name must not be empty and timeout must be non-negative", Err::INVALID_DATA) });
 	}
 	Ref<GDTLSDialCall> call;
 	call.instantiate();
@@ -766,6 +800,7 @@ Signal GDTLSDialCall::start(const String &p_host, int64_t p_port, const Dictiona
 	const Signal out(call.ptr(), "finished");
 	call->host = p_host;
 	call->port = (int)p_port;
+	call->source = p_source;
 	call->server_name = server_name;
 	call->insecure = insecure_value;
 	call->ca_file = ca_value;
@@ -776,42 +811,58 @@ Signal GDTLSDialCall::start(const String &p_host, int64_t p_port, const Dictiona
 	const String host = call->host;
 	const int port = call->port;
 	const String ca_file = call->ca_file;
-	Signal prepared = GDFileCall::start([host, port, ca_file, cert_file, key_file]() -> Ref<R> {
+	Signal prepared = GDPairCall::start([host, port, ca_file, cert_file, key_file]() -> VariantPair {
 		const String target = vformat("%s:%d", host, port);
 		if (!Perm::check(Perm::NET, target)) {
-			return R::err(vformat("net access to %s is not allowed", target), Err::PERMISSION_DENIED);
+			return { Variant(), Err::make(vformat("net access to %s is not allowed", target), Err::PERMISSION_DENIED) };
 		}
-		const Ref<R> roots = GDTrust::load(ca_file); if (!roots->get_ok()) return roots;
+		const VariantPair roots = GDTrust::load(ca_file); if (roots.error.get_type() != Variant::NIL) return { Variant(), roots.error };
 		Ref<GDTLSIdentity> identity;
-		if (!cert_file.is_empty()) {const Ref<R> credentials = GDTLSIdentity::load(cert_file,key_file); if (!credentials->get_ok()) return credentials; identity = credentials->get_v();}
-		Array values; values.push_back(roots->get_v()); values.push_back(identity); return R::ok(values);
-	});
+		if (!cert_file.is_empty()) {const VariantPair credentials = GDTLSIdentity::load(cert_file,key_file); if (credentials.error.get_type() != Variant::NIL) return { Variant(), credentials.error }; identity = credentials.value;}
+		Array values; values.push_back(roots.value); values.push_back(identity); return { values, Variant() };
+	}, false);
 	prepared.connect(callable_mp(call.ptr(), &GDTLSDialCall::prepared), Object::CONNECT_ONE_SHOT);
 	return out;
 }
 
+// Dial and then complete a verified TLS handshake.
+Signal GDTLSDialCall::start(const String &p_host, int64_t p_port, const Dictionary &p_opts) {
+	return start_with_source(p_host, p_port, p_opts, Ref<GDTCPConn>());
+}
+
+// Reuse a plaintext TCP connection after the application protocol approves upgrading it.
+Signal GDTLSDialCall::start_on_conn(const Ref<GDTCPConn> &p_conn, const String &p_host, const Dictionary &p_opts) {
+	if (p_conn.is_null() || !p_conn->is_open() || p_conn->upgrading || p_conn->tls.is_valid() || !p_conn->reads.is_empty() || !p_conn->writes.is_empty()) {
+		return Async::ready_pair({ Variant(), Err::make("TLS upgrade requires an idle plaintext connection", Err::INVALID_DATA) });
+	}
+	const Dictionary remote = p_conn->remote_addr();
+	const Signal result = start_with_source(p_host, remote.get("port", 0), p_opts, p_conn);
+	if (result.get_object() && Object::cast_to<GDTLSDialCall>(result.get_object())) p_conn->upgrading = true;
+	return result;
+}
+
 // Cancel a pending TLS connection.
 void GDTLSDialCall::cancel() {
-	done(R::err("TLS connection canceled", Err::INTERRUPTED));
+	done({ Variant(), Err::make("TLS connection canceled", Err::INTERRUPTED) });
 }
 
 // Register the TLS dial completion signal.
 void GDTLSDialCall::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDTLSDialCall::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
 // ---------------- TCP listeners ----------------
 
 // Complete an accept operation.
-void GDTCPAcceptCall::done(const Ref<R> &p_result) {
+void GDTCPAcceptCall::done(const VariantPair &p_result) {
 	if (self_hold.is_null()) {
 		return;
 	}
 	Ref<GDTCPAcceptCall> keep(this);
 	owner = nullptr;
 	self_hold.unref(); // Commit completion before external callbacks to make reentrant cancel harmless.
-	emit_signal("finished", p_result);
+	Async::finish(this, SNAME("finished"), p_result.value, p_result.error);
 }
 
 // Cancel a pending accept.
@@ -824,16 +875,16 @@ void GDTCPAcceptCall::cancel() {
 // Register the accept completion signal.
 void GDTCPAcceptCall::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDTCPAcceptCall::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
 // Open a TCP listener.
-Ref<R> GDTCPListener::listen(const String &p_host, int64_t p_port) {
+VariantPair GDTCPListener::listen(const String &p_host, int64_t p_port) {
 	if (p_host.is_empty() || p_port < 0 || p_port > 65535) {
-		return R::err("listen_tcp requires a host and a valid port", Err::INVALID_DATA);
+		return { Variant(), Err::make("listen_tcp requires a host and a valid port", Err::INVALID_DATA) };
 	}
 	if (p_port == 0 ? !Perm::check_net_any_port(p_host) : !Perm::check(Perm::NET, vformat("%s:%d", p_host, p_port))) {
-		return R::err("TCP listen address is not allowed", Err::PERMISSION_DENIED);
+		return { Variant(), Err::make("TCP listen address is not allowed", Err::PERMISSION_DENIED) };
 	}
 	Ref<GDTCPListener> out;
 	out.instantiate();
@@ -842,15 +893,15 @@ Ref<R> GDTCPListener::listen(const String &p_host, int64_t p_port) {
 	const Error err = out->server->listen(p_host, (int)p_port);
 	if (err != OK) {
 		out->server.unref();
-		return socket_error(vformat("cannot listen on %s:%d", p_host, p_port), err);
+		return { Variant(), Err::make(vformat("cannot listen on %s:%d", p_host, p_port), Err::of(err)) };
 	}
 	out->watch(false);
 	if (p_port == 0 && !Perm::check(Perm::NET, vformat("%s:%d", p_host, int(out->server->addr().get("port", 0))))) {
 		out->server->close();
 		out->server.unref();
-		return R::err("TCP listen address is not allowed", Err::PERMISSION_DENIED);
+		return { Variant(), Err::make("TCP listen address is not allowed", Err::PERMISSION_DENIED) };
 	}
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // Attach to the event loop only while accepts are pending.
@@ -884,7 +935,7 @@ void GDTCPListener::arm_deadline() {
 // Start accepting the next TCP connection.
 Signal GDTCPListener::accept() {
 	if (!is_open()) {
-		return Async::ready(R::err("listener closed", Err::INTERRUPTED));
+		return Async::ready_pair({ Variant(), Err::make("listener closed", Err::INTERRUPTED) });
 	}
 	Ref<GDTCPAcceptCall> call;
 	call.instantiate();
@@ -909,7 +960,7 @@ void GDTCPListener::step() {
 		Ref<GDTCPAcceptCall> call = accepts.front()->get();
 		if (expired(call->due)) {
 			accepts.pop_front();
-			call->done(R::err("accept deadline exceeded", Err::TIMED_OUT));
+			call->done({ Variant(), Err::make("accept deadline exceeded", Err::TIMED_OUT) });
 			if (server.is_null()) {
 				return;
 			}
@@ -920,12 +971,12 @@ void GDTCPListener::step() {
 		if (error == ERR_BUSY) break;
 		if (error != OK) {
 			accepts.pop_front();
-			call->done(socket_error("accept failed", error));
+			call->done({ Variant(), Err::make("accept failed", Err::of(error)) });
 			if (server.is_null()) return;
 			continue;
 		}
 		accepts.pop_front();
-		call->done(R::ok(GDTCPConn::take(peer)));
+		call->done({ GDTCPConn::take(peer), Variant() });
 		if (server.is_null()) {
 			return; // The completion callback closed the listener.
 		}
@@ -940,7 +991,7 @@ void GDTCPListener::cancel_call(GDTCPAcceptCall *p_call) {
 		if (e->get().ptr() == p_call) {
 			Ref<GDTCPAcceptCall> keep = e->get();
 			accepts.erase(e);
-			keep->done(R::err("accept canceled", Err::INTERRUPTED));
+			keep->done({ Variant(), Err::make("accept canceled", Err::INTERRUPTED) });
 			break;
 		}
 	}
@@ -949,17 +1000,17 @@ void GDTCPListener::cancel_call(GDTCPAcceptCall *p_call) {
 }
 
 // Set the accept deadline in seconds from now.
-Ref<R> GDTCPListener::set_deadline(double p_seconds) {
+Ref<Err> GDTCPListener::set_deadline(double p_seconds) {
 	const uint64_t next = due_after(p_seconds);
 	if (next == UINT64_MAX) {
-		return R::err("accept deadline must be a non-negative number of seconds", Err::INVALID_DATA);
+		return Err::make("accept deadline must be a non-negative number of seconds", Err::INVALID_DATA);
 	}
 	accept_due = next;
 	for (Ref<GDTCPAcceptCall> &call : accepts) {
 		call->due = accept_due;
 	}
 	arm_deadline();
-	return R::ok();
+	return Ref<Err>();
 }
 
 // Return the listen address.
@@ -974,7 +1025,7 @@ bool GDTCPListener::is_open() const {
 
 // Close the listener and wake all pending accepts.
 void GDTCPListener::close() {
-	const Ref<R> failed = server.is_valid() ? server->wait_error() : Ref<R>();
+	const Ref<Err> failed = server.is_valid() ? server->wait_error() : Ref<Err>();
 	if (server.is_valid()) {
 		server->close();
 		server.unref();
@@ -982,7 +1033,7 @@ void GDTCPListener::close() {
 	while (!accepts.is_empty()) {
 		Ref<GDTCPAcceptCall> call = accepts.front()->get();
 		accepts.pop_front();
-		call->done(failed.is_valid() ? failed : R::err("listener closed", Err::INTERRUPTED));
+		call->done({ Variant(), failed.is_valid() ? failed : Err::make("listener closed", Err::INTERRUPTED) });
 	}
 	arm_deadline();
 	watch(false);
@@ -1001,23 +1052,22 @@ void GDTCPListener::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("addr"), &GDTCPListener::addr);
 	ClassDB::bind_method(D_METHOD("is_open"), &GDTCPListener::is_open);
 	ClassDB::bind_method(D_METHOD("close"), &GDTCPListener::close);
-	ADD_AWAIT("accept", "R:GDTCPConn");
-	ADD_AWAIT("accept_async", "R:GDTCPConn");
+	ADD_AWAIT("accept", "Pair:GDTCPConn");
+	ADD_AWAIT("accept_async", "Pair:GDTCPConn");
 	ADD_AUTO_WAIT("accept");
-	ADD_RESULT("set_deadline", "Variant");
 }
 
 // ---------------- UDP endpoints ----------------
 
 // Complete a UDP operation.
-void GDUDPCall::done(const Ref<R> &p_result) {
+void GDUDPCall::done(const VariantPair &p_result) {
 	if (self_hold.is_null()) {
 		return;
 	}
 	Ref<GDUDPCall> keep(this);
 	owner = nullptr;
 	self_hold.unref(); // Commit completion before external callbacks to make reentrant cancel harmless.
-	emit_signal("finished", p_result);
+	Async::finish(this, SNAME("finished"), p_result.value, p_result.error);
 }
 
 // Cancel a UDP operation.
@@ -1030,16 +1080,16 @@ void GDUDPCall::cancel() {
 // Register the UDP operation completion signal.
 void GDUDPCall::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDUDPCall::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
 // Open a UDP endpoint.
-Ref<R> GDUDPPacketConn::listen(const String &p_host, int64_t p_port, int64_t p_buffer) {
+VariantPair GDUDPPacketConn::listen(const String &p_host, int64_t p_port, int64_t p_buffer) {
 	if (p_host.is_empty() || p_port < 0 || p_port > 65535 || p_buffer < 0 || p_buffer > INT_MAX) {
-		return R::err("listen_udp requires a host, a valid port, and a non-negative buffer", Err::INVALID_DATA);
+		return { Variant(), Err::make("listen_udp requires a host, a valid port, and a non-negative buffer", Err::INVALID_DATA) };
 	}
 	if (p_port == 0 ? !Perm::check_net_any_port(p_host) : !Perm::check(Perm::NET, vformat("%s:%d", p_host, p_port))) {
-		return R::err("UDP listen address is not allowed", Err::PERMISSION_DENIED);
+		return { Variant(), Err::make("UDP listen address is not allowed", Err::PERMISSION_DENIED) };
 	}
 	Ref<GDUDPPacketConn> out;
 	out.instantiate();
@@ -1048,15 +1098,15 @@ Ref<R> GDUDPPacketConn::listen(const String &p_host, int64_t p_port, int64_t p_b
 	const Error err = out->peer->open(p_host, (int)p_port, (int)p_buffer);
 	if (err != OK) {
 		out->peer.unref();
-		return socket_error(vformat("cannot listen on %s:%d", p_host, p_port), err);
+		return { Variant(), Err::make(vformat("cannot listen on %s:%d", p_host, p_port), Err::of(err)) };
 	}
 	out->watch(false);
 	if (p_port == 0 && !Perm::check(Perm::NET, vformat("%s:%d", p_host, out->peer->port()))) {
 		out->peer->close();
 		out->peer.unref();
-		return R::err("UDP listen address is not allowed", Err::PERMISSION_DENIED);
+		return { Variant(), Err::make("UDP listen address is not allowed", Err::PERMISSION_DENIED) };
 	}
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // Attach to the event loop only while UDP operations are pending.
@@ -1095,10 +1145,10 @@ void GDUDPPacketConn::arm_deadline() {
 // Start receiving the next UDP packet.
 Signal GDUDPPacketConn::read_from(int64_t p_max) {
 	if (p_max < 0 || p_max > INT_MAX) {
-		return Async::ready(R::err("packet read size is outside the native buffer range", Err::INVALID_DATA));
+		return Async::ready_pair({ Variant(), Err::make("packet read size is outside the native buffer range", Err::INVALID_DATA) });
 	}
 	if (!is_open()) {
-		return Async::ready(R::err("packet connection closed", Err::INTERRUPTED));
+		return Async::ready_pair({ Variant(), Err::make("packet connection closed", Err::INTERRUPTED) });
 	}
 	Ref<GDUDPCall> call;
 	call.instantiate();
@@ -1116,16 +1166,16 @@ Signal GDUDPPacketConn::read_from(int64_t p_max) {
 // Start sending a UDP packet to an IP address.
 Signal GDUDPPacketConn::write_to(const PackedByteArray &p_data, const String &p_host, int64_t p_port) {
 	if (!GDDatagram::is_ip(p_host) || p_port < 1 || p_port > 65535) {
-		return Async::ready(R::err("write_to requires a resolved IP address and a valid port", Err::INVALID_DATA));
+		return Async::ready_pair({ Variant(), Err::make("write_to requires a resolved IP address and a valid port", Err::INVALID_DATA) });
 	}
 	if (p_data.size() > INT_MAX) {
-		return Async::ready(R::err("packet exceeds the native send size", Err::LIMITED));
+		return Async::ready_pair({ Variant(), Err::make("packet exceeds the native send size", Err::LIMITED) });
 	}
 	if (!Perm::check(Perm::NET, vformat("%s:%d", p_host, p_port))) {
-		return Async::ready(R::err("packet destination is not allowed", Err::PERMISSION_DENIED));
+		return Async::ready_pair({ Variant(), Err::make("packet destination is not allowed", Err::PERMISSION_DENIED) });
 	}
 	if (!is_open()) {
-		return Async::ready(R::err("packet connection closed", Err::INTERRUPTED));
+		return Async::ready_pair({ Variant(), Err::make("packet connection closed", Err::INTERRUPTED) });
 	}
 	Ref<GDUDPCall> call;
 	call.instantiate();
@@ -1146,16 +1196,16 @@ Signal GDUDPPacketConn::write_to(const PackedByteArray &p_data, const String &p_
 // Advance UDP receiving and sending by one packet each.
 void GDUDPPacketConn::step() {
 	Ref<GDUDPPacketConn> keep(this); // Retain the endpoint throughout packet completion callbacks.
-	if (peer.is_valid() && peer->wait_error().is_valid()) { fail_all(peer->wait_error()); return; }
+	if (peer.is_valid() && peer->wait_error().is_valid()) { fail_all({ Variant(), peer->wait_error() }); return; }
 	if (!is_open()) {
-		fail_all(R::err("packet connection closed", Err::INTERRUPTED));
+		fail_all({ Variant(), Err::make("packet connection closed", Err::INTERRUPTED) });
 		return;
 	}
 	while (!reads.is_empty()) {
 		Ref<GDUDPCall> call = reads.front()->get();
 		if (expired(call->due)) {
 			reads.pop_front();
-			call->done(R::err("packet read deadline exceeded", Err::TIMED_OUT));
+			call->done({ Variant(), Err::make("packet read deadline exceeded", Err::TIMED_OUT) });
 			if (peer.is_null()) {
 				return;
 			}
@@ -1168,14 +1218,14 @@ void GDUDPPacketConn::step() {
 		}
 		if (err != OK) {
 			reads.pop_front();
-			call->done(socket_error("packet read failed", err));
+			call->done({ Variant(), Err::make("packet read failed", Err::of(err)) });
 			if (peer.is_null()) {
 				return;
 			}
 			continue;
 		}
 		reads.pop_front();
-		call->done(R::ok(out));
+		call->done({ out, Variant() });
 		break;
 	}
 	// A completion callback may close the endpoint.
@@ -1187,7 +1237,7 @@ void GDUDPPacketConn::step() {
 		Ref<GDUDPCall> call = writes.front()->get();
 		if (expired(call->due)) {
 			writes.pop_front();
-			call->done(R::err("packet write deadline exceeded", Err::TIMED_OUT));
+			call->done({ Variant(), Err::make("packet write deadline exceeded", Err::TIMED_OUT) });
 			if (peer.is_null()) {
 				return;
 			}
@@ -1198,7 +1248,7 @@ void GDUDPPacketConn::step() {
 			break;
 		}
 		writes.pop_front();
-		call->done(err == OK ? R::ok(call->data.size()) : socket_error("packet write failed", err));
+		call->done(err == OK ? VariantPair{ call->data.size(), Variant() } : VariantPair{ Variant(), Err::make("packet write failed", Err::of(err)) });
 		if (peer.is_null()) {
 			return; // The completion callback closed the endpoint.
 		}
@@ -1215,7 +1265,7 @@ void GDUDPPacketConn::cancel_call(GDUDPCall *p_call) {
 		if (e->get().ptr() == p_call) {
 			Ref<GDUDPCall> keep = e->get();
 			queue.erase(e);
-			keep->done(R::err("packet operation canceled", Err::INTERRUPTED));
+			keep->done({ Variant(), Err::make("packet operation canceled", Err::INTERRUPTED) });
 			break;
 		}
 	}
@@ -1224,7 +1274,7 @@ void GDUDPPacketConn::cancel_call(GDUDPCall *p_call) {
 }
 
 // Deliver the same closure reason to all UDP operations.
-void GDUDPPacketConn::fail_all(const Ref<R> &p_result) {
+void GDUDPPacketConn::fail_all(const VariantPair &p_result) {
 	while (!reads.is_empty()) {
 		Ref<GDUDPCall> call = reads.front()->get();
 		reads.pop_front();
@@ -1240,37 +1290,37 @@ void GDUDPPacketConn::fail_all(const Ref<R> &p_result) {
 }
 
 // Set both UDP receive and send deadlines.
-Ref<R> GDUDPPacketConn::set_deadline(double p_seconds) {
-	Ref<R> result = set_read_deadline(p_seconds);
-	return result->get_ok() ? set_write_deadline(p_seconds) : result;
+Ref<Err> GDUDPPacketConn::set_deadline(double p_seconds) {
+	Ref<Err> error = set_read_deadline(p_seconds);
+	return error.is_valid() ? error : set_write_deadline(p_seconds);
 }
 
 // Apply the UDP receive deadline to existing waits too.
-Ref<R> GDUDPPacketConn::set_read_deadline(double p_seconds) {
+Ref<Err> GDUDPPacketConn::set_read_deadline(double p_seconds) {
 	const uint64_t next = due_after(p_seconds);
 	if (next == UINT64_MAX) {
-		return R::err("packet read deadline must be a non-negative number of seconds", Err::INVALID_DATA);
+		return Err::make("packet read deadline must be a non-negative number of seconds", Err::INVALID_DATA);
 	}
 	read_due = next;
 	for (Ref<GDUDPCall> &call : reads) {
 		call->due = read_due;
 	}
 	arm_deadline();
-	return R::ok();
+	return Ref<Err>();
 }
 
 // Apply the UDP send deadline to existing waits too.
-Ref<R> GDUDPPacketConn::set_write_deadline(double p_seconds) {
+Ref<Err> GDUDPPacketConn::set_write_deadline(double p_seconds) {
 	const uint64_t next = due_after(p_seconds);
 	if (next == UINT64_MAX) {
-		return R::err("packet write deadline must be a non-negative number of seconds", Err::INVALID_DATA);
+		return Err::make("packet write deadline must be a non-negative number of seconds", Err::INVALID_DATA);
 	}
 	write_due = next;
 	for (Ref<GDUDPCall> &call : writes) {
 		call->due = write_due;
 	}
 	arm_deadline();
-	return R::ok();
+	return Ref<Err>();
 }
 
 // Return the UDP endpoint's listen address.
@@ -1290,7 +1340,7 @@ void GDUDPPacketConn::close() {
 	if (old.is_valid()) {
 		old->close();
 	}
-	fail_all(R::err("packet connection closed", Err::INTERRUPTED));
+	fail_all({ Variant(), Err::make("packet connection closed", Err::INTERRUPTED) });
 }
 
 // Leave no pending waits when destroying a UDP endpoint.
@@ -1310,13 +1360,10 @@ void GDUDPPacketConn::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("addr"), &GDUDPPacketConn::addr);
 	ClassDB::bind_method(D_METHOD("is_open"), &GDUDPPacketConn::is_open);
 	ClassDB::bind_method(D_METHOD("close"), &GDUDPPacketConn::close);
-	ADD_AWAIT("read_from", "R:Dictionary");
-	ADD_AWAIT("read_from_async", "R:Dictionary");
-	ADD_AWAIT("write_to", "R:int");
-	ADD_AWAIT("write_to_async", "R:int");
+	ADD_AWAIT("read_from", "Pair:Dictionary");
+	ADD_AWAIT("read_from_async", "Pair:Dictionary");
+	ADD_AWAIT("write_to", "Pair:int");
+	ADD_AWAIT("write_to_async", "Pair:int");
 	ADD_AUTO_WAIT("read_from");
 	ADD_AUTO_WAIT("write_to");
-	ADD_RESULT("set_deadline", "Variant");
-	ADD_RESULT("set_read_deadline", "Variant");
-	ADD_RESULT("set_write_deadline", "Variant");
 }

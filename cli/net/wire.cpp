@@ -29,6 +29,7 @@ bool Wire::guard_of(const Variant &p_value, Guard &r_out) {
 		r_out = NONE;
 		return true;
 	}
+	if (p_value.get_type() != Variant::STRING && p_value.get_type() != Variant::STRING_NAME) return false;
 	const String s = String(p_value).to_lower();
 	// Reject an empty mode instead of silently treating an omitted setting as plaintext.
 	if (s == "disable") {
@@ -55,14 +56,14 @@ Variant Wire::default_guard(const String &p_host) {
 }
 
 // Prepare connection resolution settings and CA-file loading as one I/O job.
-Ref<R> Wire::prepare(const String &p_host, const String &p_ca_path) {
-	const Ref<R> loaded = GDTrust::load(p_ca_path);
-	if (!loaded->get_ok()) return loaded;
-	const Ref<GDTrust> ca = loaded->get_v();
+VariantPair Wire::prepare(const String &p_host, const String &p_ca_path) {
+	const VariantPair loaded = GDTrust::load(p_ca_path);
+	if (loaded.error.get_type() != Variant::NIL) return loaded;
+	const Ref<GDTrust> ca = loaded.value;
 	Dictionary out;
 	out["address"] = p_host; // Delegate DNS aggregation and candidate racing to the shared dialer.
 	out["ca"] = ca;
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // Apply TCP and TLS readiness directions to the shared poller.
@@ -114,21 +115,21 @@ Error Wire::open(const String &p_addr, int p_port, uint64_t p_due) {
 }
 
 // Transfer a connection to an uncancelled Wire and resume its database operation.
-void GDWireDial::connected(const Ref<R> &p_result) {
+void GDWireDial::connected(const Variant &p_value, const Ref<Err> &p_error) {
 	Ref<GDWireDial> keep(this);
 	pending = Signal();
 	if (!owner) return;
 	Wire *wire = owner;
 	owner = nullptr;
 	wire->dial.unref();
-	if (p_result.is_valid() && p_result->get_ok()) {
-		const Ref<GDTCPConn> conn = p_result->get_v();
+	if (p_error.is_null()) {
+		const Ref<GDTCPConn> conn = p_value;
 		wire->tcp = conn->native;
 		conn->native.unref();
 		wire->read_on = true;
 		wire->watch();
 	} else {
-		wire->failed(p_result.is_valid() ? p_result->get_e() : Err::make("invalid TCP connection result", Err::INVALID_DATA));
+		wire->failed(p_error);
 	}
 	if (wire->wait_callback.is_valid()) Async::post(keep, wire->wait_callback);
 }
@@ -168,7 +169,7 @@ Wire::State Wire::state() const {
 	if (dial.is_valid()) return LINKING;
 	if (tcp.is_null()) return fail_why.is_empty() ? CLOSED : FAILED;
 	if (tcp->wait_error().is_valid()) {
-		failed(tcp->wait_error()->get_e());
+		failed(tcp->wait_error());
 		return FAILED;
 	}
 	if (tls.is_valid()) {

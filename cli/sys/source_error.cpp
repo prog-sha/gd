@@ -131,10 +131,10 @@ Error SourceError::put(Dictionary &r_info, Error p_fallback) {
 }
 
 // Normalize path-operation failures to one result shape.
-Ref<R> SourceError::path(const String &p_path, const char *p_op, Error p_fallback, const String &p_msg) {
+Ref<Err> SourceError::path(const String &p_path, const char *p_op, Error p_fallback, const String &p_msg) {
 	Dictionary info;
 	info["op"] = p_op;
 	info["path"] = p_path;
 	const Error err = put(info, p_fallback);
-	return R::err(Err::make(p_msg, Err::of(err), info));
+	return Err::make(p_msg, Err::of(err), info);
 }

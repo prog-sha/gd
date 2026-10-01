@@ -7,6 +7,7 @@
 // Implement remote SQL connections declared in pg.h.
 
 #include "cli/db/pg.h"
+#include "cli/db/options.h"
 #include "cli/sys/system.h"
 #include "cli/sys/clock.h"
 #include "cli/data/utf8.h"
@@ -33,7 +34,30 @@ namespace {
 
 HashSet<GDPostgresClient *> postgres_clients; // Connections requiring shutdown cleanup.
 
-constexpr uint64_t WAIT_MS = 15000; // Default timeout in milliseconds.
+// Validate authentication settings before the connection uses typed values.
+bool pg_credentials(const Dictionary &p_opts) {
+	String value;
+	if (!DbOption::text(p_opts, "user", "postgres", value) || !DbOption::text(p_opts, "database", "postgres", value) ||
+			!DbOption::text(p_opts, "password", "", value)) return false;
+	return p_opts.get("allow_cleartext_password", false).get_type() == Variant::BOOL;
+}
+
+// Build a native success with separate result slots.
+VariantPair pg_ok(const Variant &p_value = Variant()) {
+	return { p_value, Variant() };
+}
+
+// Keep completed work on an error without allocating a result object.
+VariantPair pg_fail(const Variant &p_reason, Err::Kind p_kind = Err::NONE, const Variant &p_value = Variant()) {
+	const Ref<Err> error = Err::from(p_reason, p_kind);
+	return { p_value, error->with_partial(p_value) };
+}
+
+// Read the failure slot of an internal result.
+Ref<Err> pg_result_error(const VariantPair &p_result) {
+	return p_result.error;
+}
+
 constexpr int STMT_MAX = 512; // Default statement-cache capacity.
 constexpr int SPARE_MAX = 64; // Reusable operation objects retained in reserve.
 constexpr int PARAM_MAX = 65535; // Maximum bind count representable by the protocol's uint16 field.
@@ -54,16 +78,18 @@ constexpr int SCRAM_MIN_ITERS = 4096; // Minimum key-derivation iterations requi
 constexpr int SCRAM_MAX_ITERS = 10000000; // CPU-work ceiling for untrusted server iteration counts.
 
 // Return a remote SQL MD5 authentication value only when both digest stages succeed.
-Ref<R> md5_password(const String &p_password, const String &p_user, const uint8_t *p_salt) {
-	const Ref<R> first = GDDigest::md5((p_password + p_user).to_utf8_buffer());
-	if (!first->get_ok()) return first;
-	const CharString inner = Encoding::hex_encode(first->get_v()).utf8();
+VariantPair md5_password(const String &p_password, const String &p_user, const uint8_t *p_salt) {
+	PackedByteArray first;
+	const Ref<Err> first_error = GDDigest::md5((p_password + p_user).to_utf8_buffer(), first);
+	if (first_error.is_valid()) return { Variant(), first_error };
+	const CharString inner = Encoding::hex_encode(first).utf8();
 	PackedByteArray input;
-	if (input.resize(inner.length() + 4) != OK) return R::err("cannot allocate MD5 authentication input", Err::LIMITED);
+	if (input.resize(inner.length() + 4) != OK) return { Variant(), Err::make("cannot allocate MD5 authentication input", Err::LIMITED) };
 	memcpy(input.ptrw(), inner.get_data(), inner.length());
 	memcpy(input.ptrw() + inner.length(), p_salt, 4);
-	const Ref<R> last = GDDigest::md5(input);
-	return last->get_ok() ? R::ok("md5" + Encoding::hex_encode(last->get_v())) : last;
+	PackedByteArray last;
+	const Ref<Err> last_error = GDDigest::md5(input, last);
+	return last_error.is_valid() ? VariantPair{ Variant(), last_error } : VariantPair{ "md5" + Encoding::hex_encode(last), Variant() };
 }
 
 // Append directly to the shared buffer instead of allocating a small container
@@ -405,6 +431,7 @@ String not_null_column(const String &p_msg) {
 // Convert remote SQL errors into inspectable Err values without exposing data values.
 Ref<Err> query_error(const PgError &p_error) {
 	Dictionary info;
+	info["source"] = "postgres";
 	if (!p_error.code.is_empty()) {
 		info["code"] = p_error.code;
 	}
@@ -434,9 +461,12 @@ Ref<Err> query_error(const PgError &p_error) {
 		}
 		info["columns"] = columns;
 	}
-	const Err::Kind kind = violation == "duplicate" ? Err::ALREADY_EXISTS : Err::INVALID_DATA;
+	const Err::Kind kind = violation == "duplicate" ? Err::ALREADY_EXISTS : Err::NONE;
 	return Err::make(p_error.msg, kind, info);
 }
+
+// Convert scalar values for standalone columns and array elements.
+Variant convert(const String &p_raw, int p_oid);
 
 // Decode quoted array elements and dimensions without losing nulls or explicit lower bounds.
 Variant array_value(const String &p_raw, int p_oid) {
@@ -493,10 +523,14 @@ Variant array_value(const String &p_raw, int p_oid) {
 				} else if (p_oid == 1000) {
 					if (text != "t" && text != "f") return p_raw;
 					value = text == "t";
+				} else if (p_oid == 1021 || p_oid == 1022) {
+					value = convert(text, p_oid == 1021 ? 700 : 701);
+				} else if (p_oid == 1231) {
+					value = convert(text, 1700);
 				} else {
 					if (!text.is_valid_int()) return p_raw;
 					const int64_t number = text.to_int();
-					if (String::num_int64(number) != text || (p_oid == 1007 && (number < INT32_MIN || number > INT32_MAX))) return p_raw;
+					if (String::num_int64(number) != text || (p_oid == 1005 && (number < INT16_MIN || number > INT16_MAX)) || (p_oid == 1007 && (number < INT32_MIN || number > INT32_MAX))) return p_raw;
 					value = number;
 				}
 			}
@@ -519,7 +553,6 @@ Variant convert(const String &p_raw, int p_oid) {
 			return p_raw.to_int();
 		case 700: // float4
 		case 701: // float8
-		case 1700: // numeric
 			// Recognize NaN and infinity before to_float would collapse them to zero.
 			if (p_raw == "NaN") {
 				return Math::NaN;
@@ -531,24 +564,66 @@ Variant convert(const String &p_raw, int p_oid) {
 				return -Math::INF;
 			}
 			return p_raw.to_float();
+		case 1700: // numeric
+			return p_raw; // Preserve exact decimal digits because Variant has no decimal type.
 		case 16: // bool
 			return p_raw == "t";
 		case 114: // json
 		case 3802: { // jsonb
 			// Preserve exact scalar values, retaining source text when it cannot be represented unambiguously.
-			const Ref<R> json = JsonData::decode(p_raw.to_utf8_buffer());
-			return json->get_ok() ? json->get_v() : Variant(p_raw);
+			const VariantPair json = JsonData::decode(p_raw.to_utf8_buffer());
+			return json.error.get_type() == Variant::NIL ? json.value : Variant(p_raw);
 		}
 		case 1000: // Array types.
+		case 1005:
 		case 1007:
 		case 1009:
-		case 1016: {
+		case 1016:
+		case 1021:
+		case 1022:
+		case 1231: {
 			return array_value(p_raw, p_oid);
 		}
 		default:
 			break;
 	}
 	return p_raw;
+}
+
+// Decode the two server output forms of a binary SQL value into its original octets.
+bool bytea_value(const uint8_t *p_data, int p_len, PackedByteArray &r_value) {
+	auto hex = [](uint8_t p_ch) -> int {
+		if (p_ch >= '0' && p_ch <= '9') return p_ch - '0';
+		if (p_ch >= 'a' && p_ch <= 'f') return p_ch - 'a' + 10;
+		if (p_ch >= 'A' && p_ch <= 'F') return p_ch - 'A' + 10;
+		return -1;
+	};
+	if (p_len >= 2 && p_data[0] == '\\' && p_data[1] == 'x') {
+		if ((p_len - 2) % 2 != 0) return false;
+		for (int i = 2; i < p_len; i += 2) {
+			const int hi = hex(p_data[i]);
+			const int lo = hex(p_data[i + 1]);
+			if (hi < 0 || lo < 0) return false;
+			r_value.push_back((hi << 4) | lo);
+		}
+		return true;
+	}
+	for (int i = 0; i < p_len; i++) {
+		if (p_data[i] != '\\') {
+			r_value.push_back(p_data[i]);
+			continue;
+		}
+		if (++i >= p_len) return false;
+		if (p_data[i] == '\\') {
+			r_value.push_back('\\');
+			continue;
+		}
+		if (i + 2 >= p_len || p_data[i] < '0' || p_data[i] > '3' ||
+				p_data[i + 1] < '0' || p_data[i + 1] > '7' || p_data[i + 2] < '0' || p_data[i + 2] > '7') return false;
+		r_value.push_back(((p_data[i] - '0') << 6) | ((p_data[i + 1] - '0') << 3) | (p_data[i + 2] - '0'));
+		i += 2;
+	}
+	return true;
 }
 
 // Append a text-format bind value directly to the send buffer.
@@ -619,6 +694,7 @@ int64_t param_bound(const Variant &p_v, int p_depth = 0) {
 		case Variant::OBJECT:
 			return 64; // Invoke callbacks only when finalizing wire values, not during estimation.
 		case Variant::STRING:
+		case Variant::STRING_NAME:
 			return int64_t(Pool::text(p_v).length()) * (p_depth > 0 ? 8 : 4) + 2;
 		case Variant::PACKED_BYTE_ARRAY:
 			return int64_t(PackedByteArray(p_v).size()) * (p_depth > 0 ? 6 : 2) + 32;
@@ -659,7 +735,7 @@ int64_t param_bound(const Variant &p_v, int p_depth = 0) {
 			return bytes;
 		}
 		default:
-			return int64_t(Pool::text(p_v).length()) * 4;
+			return -1;
 	}
 }
 
@@ -811,7 +887,7 @@ void GDPostgresCallInternal::set_due(uint64_t p_wait) {
 }
 
 // Deliver asynchronous failures on the next event-loop turn.
-void GDPostgresCallInternal::fail_later(const Ref<R> &p_out) {
+void GDPostgresCallInternal::fail_later(const VariantPair &p_out) {
 	if (self_hold.is_null()) {
 		return; // Do not reschedule an already completed operation.
 	}
@@ -830,6 +906,7 @@ void GDPostgresCallInternal::fail_later(const Ref<R> &p_out) {
 		return;
 	}
 	pending = p_out;
+	pending_ready = true;
 	if (!pending_posted) {
 		pending_posted = true;
 		Async::post(Ref<RefCounted>(this), callable_mp(this, &GDPostgresCallInternal::deliver_pending).bind(generation));
@@ -853,7 +930,7 @@ void GDPostgresCallInternal::step() {
 		return; // Do not advance completed objects from stale completion entries.
 	}
 	// Close sockets and watched descriptors on connection or authentication failure.
-	auto stop = [&](const Ref<R> &p_out) {
+	auto stop = [&](const VariantPair &p_out) {
 		Ref<GDPostgresClient> owner = db;
 		if (owner.is_valid()) {
 			if (owner->opening.ptr() == this) {
@@ -863,10 +940,11 @@ void GDPostgresCallInternal::step() {
 		}
 		done(p_out);
 	};
-	if (pending.is_valid()) {
+	if (pending_ready) {
 		pending_posted = false;
-		const Ref<R> out = pending;
-		pending.unref();
+		const VariantPair out = pending;
+		pending = VariantPair();
+		pending_ready = false;
 		if (dropped) {
 			// Notify cancellation but retain queue position because the reply is still expected.
 			notify(out);
@@ -879,7 +957,7 @@ void GDPostgresCallInternal::step() {
 		return;
 	}
 	if (due > 0 && GDClock::msec() >= due) {
-		const Ref<R> expired = R::err("postgres did not answer in time", Err::TIMED_OUT);
+		const VariantPair expired = pg_fail("postgres did not answer in time", Err::TIMED_OUT);
 		if (shared && mode == QUERYING) interrupt(expired);
 		else stop(expired);
 		return;
@@ -892,7 +970,7 @@ void GDPostgresCallInternal::step() {
 		const Wire::State st = db->sock.state();
 		if (st == Wire::FAILED || st == Wire::CLOSED) {
 			// Propagate the transport cause without reclassifying encrypted connections.
-			stop(sock_error(db->sock, "connection closed"));
+			stop(pg_fail(sock_error(db->sock, "connection closed")));
 			return;
 		}
 		if (st != Wire::READY) {
@@ -906,7 +984,7 @@ void GDPostgresCallInternal::step() {
 			put32(db->out_buf, 8); // SSLRequest message length.
 			put32(db->out_buf, 80877103); // SSLRequest protocol code.
 			if (!sock_flush(db->sock, db->out_buf)) {
-				stop(sock_error(db->sock, "tls request send failed"));
+				stop(pg_fail(sock_error(db->sock, "tls request send failed")));
 				return;
 			}
 			db->tls_at = GDPostgresClient::TLS_WAIT;
@@ -915,7 +993,7 @@ void GDPostgresCallInternal::step() {
 		if (db->tls_at == GDPostgresClient::TLS_WAIT) {
 			if (!db->out_buf.is_empty()) {
 				if (!sock_flush(db->sock, db->out_buf)) {
-					stop(sock_error(db->sock, "tls request send failed"));
+					stop(pg_fail(sock_error(db->sock, "tls request send failed")));
 				}
 				return; // Finish sending the request before reading the response.
 			}
@@ -927,16 +1005,16 @@ void GDPostgresCallInternal::step() {
 			const Error read = db->sock.read(&answer, 1, got);
 			if (read == ERR_BUSY) return;
 			if (read != OK || got != 1) {
-				stop(sock_error(db->sock, "tls request read failed"));
+				stop(pg_fail(sock_error(db->sock, "tls request read failed")));
 				return;
 			}
 			if (answer != 'S') {
-				stop(R::err(vformat("the server refused tls (answered '%c')", (char)answer), Err::PERMISSION_DENIED));
+				stop(pg_fail(vformat("the server refused tls (answered '%c')", (char)answer), Err::PERMISSION_DENIED));
 				return;
 			}
 			db->tls_at = GDPostgresClient::TLS_ON;
 			if (db->sock.wrap(db->host, db->guard, db->ca) != OK) {
-				stop(sock_error(db->sock, "TLS setup failed", Err::NONE));
+				stop(pg_fail(sock_error(db->sock, "TLS setup failed", Err::NONE)));
 			}
 			return; // Continue the handshake on the next turn.
 		}
@@ -953,16 +1031,16 @@ void GDPostgresCallInternal::step() {
 		put_cstr(body, "UTF8");
 		body.push_back(0); // Terminate the parameter sequence.
 		if (db->send(String(), body) != OK) {
-			stop(R::err("startup send failed", Err::INVALID_DATA));
+			stop(pg_fail("startup send failed", Err::INVALID_DATA));
 			return;
 		}
 		mode = HANDSHAKE;
 		return;
 	}
 
-	const Ref<R> got = db->fill(PG_READ_CHUNK);
-	if (got->get_e().is_valid()) {
-		stop(got);
+	const Ref<Err> got = db->fill(PG_READ_CHUNK);
+	if (got.is_valid()) {
+		stop(pg_fail(got));
 		return;
 	}
 	char kind = 0;
@@ -971,14 +1049,14 @@ void GDPostgresCallInternal::step() {
 	while (db->next_msg(kind, at, len)) {
 		const int message_bytes = len + 4;
 		if (message_bytes > SEND_BYTES_MAX) {
-			stop(R::err("postgres authentication message exceeds the protocol maximum", Err::LIMITED));
+			stop(pg_fail("postgres authentication message exceeds the protocol maximum", Err::LIMITED));
 			return;
 		}
 		Ref<GDPostgresClient> owner = db;
 		if (kind == 'S') {
 			const Ref<Err> error = status_error(db->buf.ptr() + at, len);
 			if (error.is_valid()) {
-				stop(R::err(error));
+				stop(pg_fail(error));
 				return;
 			}
 		}
@@ -991,14 +1069,14 @@ void GDPostgresCallInternal::step() {
 	}
 	const int64_t waiting_bytes = db->next_msg_size();
 	if (waiting_bytes < 0 || waiting_bytes > int64_t(SEND_BYTES_MAX) + 1) {
-		stop(R::err("postgres authentication message exceeds the protocol maximum", Err::LIMITED));
+		stop(pg_fail("postgres authentication message exceeds the protocol maximum", Err::LIMITED));
 	} else if (db->sock.available() > 0) {
 		schedule(); // Continue ready input beyond this read chunk in the next time slice.
 	}
 }
 
 // Deliver a query result once to its direct waiter or pool operation.
-void GDPostgresCallInternal::notify(const Ref<R> &p_out) {
+void GDPostgresCallInternal::notify(const VariantPair &p_out) {
 	if (notified) {
 		return;
 	}
@@ -1008,32 +1086,33 @@ void GDPostgresCallInternal::notify(const Ref<R> &p_out) {
 		target->answered(p_out);
 		return;
 	}
-	emit_signal("finished", p_out);
+	const Ref<Err> error = pg_result_error(p_out);
+	Async::finish(this, SNAME("finished"), p_out.value, error.is_valid() ? Variant(error->with_partial(p_out.value)) : Variant());
 }
 
 // Receive worker-resolved addresses and proceed to socket connection.
-void GDPostgresClient::resolved(const Ref<R> &p_result, const Ref<GDPostgresCallInternal> &p_call) {
+void GDPostgresClient::resolved(const Variant &p_value, const Ref<Err> &p_error, const Ref<GDPostgresCallInternal> &p_call) {
 	if (p_call.is_null() || opening.ptr() != p_call.ptr() || p_call->self_hold.is_null() || p_call->db.ptr() != this || p_call->mode != GDPostgresCallInternal::RESOLVING) {
 		return;
 	}
 	if (Pool::is_stopping()) {
-		p_call->fail_later(R::err("worker pool stopped", Err::INTERRUPTED));
+		p_call->fail_later(pg_fail("worker pool stopped", Err::INTERRUPTED));
 		return;
 	}
-	if (p_result.is_null() || !p_result->get_ok()) {
-		p_call->fail_later(p_result.is_valid() ? p_result : R::err(vformat("cannot prepare \"%s\"", host), Err::NOT_FOUND));
+	if (p_error.is_valid()) {
+		p_call->fail_later(pg_fail(p_error));
 		return;
 	}
-	const Dictionary prepared = p_result->get_v();
+	const Dictionary prepared = p_value;
 	const String addr = prepared.get("address", "");
 	ca = prepared.get("ca", Variant());
 	if (addr.is_empty()) {
-		p_call->fail_later(R::err(vformat("cannot resolve \"%s\"", host), Err::NOT_FOUND));
+		p_call->fail_later(pg_fail(vformat("cannot resolve \"%s\"", host), Err::NOT_FOUND));
 		return;
 	}
 	p_call->mode = GDPostgresCallInternal::CONNECTING;
 	if (sock.open(addr, port, p_call->due) != OK) {
-		p_call->fail_later(R::err(vformat("cannot reach %s:%d", host, port), Err::NOT_FOUND));
+		p_call->fail_later(pg_fail(vformat("cannot reach %s:%d", host, port), Err::NOT_FOUND));
 	} else {
 		p_call->schedule();
 	}
@@ -1044,27 +1123,27 @@ bool GDPostgresCallInternal::take(char p_kind, const uint8_t *p_body, int p_len)
 	if (mode == HANDSHAKE) {
 		if (p_kind == 'R') { // Authentication request.
 			if (p_len < 4) {
-				done(R::err("short auth message", Err::INVALID_DATA));
+				done(pg_fail("short auth message", Err::INVALID_DATA));
 				return true; // Do not read an authentication code without four bytes.
 			}
 			const int code = read32p(p_body, 0);
 			if (db->auth_ok || (db->scram_pending && code != 11 && code != 12) || (db->scram_done && code != 0)) {
-				done(R::err("unexpected authentication message", Err::PERMISSION_DENIED));
+				done(pg_fail("unexpected authentication message", Err::PERMISSION_DENIED));
 				return true;
 			}
-			Ref<R> step_out;
+			Ref<Err> step_out;
 			switch (code) {
 				case 0: // Authentication success.
 					if (p_len != 4) {
-						done(R::err("invalid authentication success message", Err::INVALID_DATA));
+						done(pg_fail("invalid authentication success message", Err::INVALID_DATA));
 						return true;
 					}
 					if (String(opts.get("auth", "any")) == "scram" && !db->scram_done) {
-						done(R::err("server did not use SCRAM authentication", Err::PERMISSION_DENIED));
+						done(pg_fail("server did not use SCRAM authentication", Err::PERMISSION_DENIED));
 						return true;
 					}
 					if (String(opts.get("auth", "any")) == "md5" && !db->md5_done) {
-						done(R::err("server did not use MD5 authentication", Err::PERMISSION_DENIED));
+						done(pg_fail("server did not use MD5 authentication", Err::PERMISSION_DENIED));
 						return true;
 					}
 					db->auth_ok = true;
@@ -1075,15 +1154,15 @@ bool GDPostgresCallInternal::take(char p_kind, const uint8_t *p_body, int p_len)
 					// mode only when the caller explicitly enables it.
 					const String required = opts.get("auth", "any");
 					if (required == "scram") {
-						done(R::err("server did not use SCRAM authentication", Err::PERMISSION_DENIED));
+						done(pg_fail("server did not use SCRAM authentication", Err::PERMISSION_DENIED));
 						return true;
 					}
 					if (required == "md5") {
-						done(R::err("server did not use MD5 authentication", Err::PERMISSION_DENIED));
+						done(pg_fail("server did not use MD5 authentication", Err::PERMISSION_DENIED));
 						return true;
 					}
 					if (!(bool)opts.get("allow_cleartext_password", false)) {
-						done(R::err("server asked for a cleartext password; pass allow_cleartext_password=true to permit it", Err::PERMISSION_DENIED));
+						done(pg_fail("server asked for a cleartext password; pass allow_cleartext_password=true to permit it", Err::PERMISSION_DENIED));
 						return true;
 					}
 					ByteBuf pass;
@@ -1093,27 +1172,27 @@ bool GDPostgresCallInternal::take(char p_kind, const uint8_t *p_body, int p_len)
 				}
 				case 5: { // MD5 password authentication.
 					if (p_len != 8) {
-						done(R::err("invalid MD5 authentication message", Err::INVALID_DATA));
+						done(pg_fail("invalid MD5 authentication message", Err::INVALID_DATA));
 						return true;
 					}
 					if (String(opts.get("auth", "any")) == "scram") {
-						done(R::err("server did not use SCRAM authentication", Err::PERMISSION_DENIED));
+						done(pg_fail("server did not use SCRAM authentication", Err::PERMISSION_DENIED));
 						return true;
 					}
-					const Ref<R> password = md5_password(opts.get("password", ""), opts.get("user", "postgres"), p_body + 4);
-					if (!password->get_ok()) {
-						done(password); // Do not send authentication data after digest failure; return to connection cleanup.
+					const VariantPair password = md5_password(opts.get("password", ""), opts.get("user", "postgres"), p_body + 4);
+					if (password.error.get_type() != Variant::NIL) {
+						done(pg_fail(password.error)); // Do not send authentication data after digest failure; return to connection cleanup.
 						return true;
 					}
 					ByteBuf pass;
-					put_cstr(pass, password->get_v());
+					put_cstr(pass, password.value);
 					db->send("p", pass);
 					db->md5_done = true;
 					return false;
 				}
 				case 10: // Start SASL authentication.
 					if (String(opts.get("auth", "any")) == "md5") {
-						done(R::err("server did not use MD5 authentication", Err::PERMISSION_DENIED));
+						done(pg_fail("server did not use MD5 authentication", Err::PERMISSION_DENIED));
 						return true;
 					}
 					db->scram_pending = true;
@@ -1124,36 +1203,36 @@ bool GDPostgresCallInternal::take(char p_kind, const uint8_t *p_body, int p_len)
 					break;
 				case 12: // Finish SASL authentication and verify the signature.
 					step_out = db->sasl_final(_slice(p_body, p_len));
-					if (step_out->get_ok()) {
+					if (step_out.is_null()) {
 						db->scram_pending = false; // Server proof has been verified.
 						db->scram_done = true;
 					}
 					break;
 				default:
-					done(R::err(vformat("auth method %d is not supported", code), Err::UNSUPPORTED));
+					done(pg_fail(vformat("auth method %d is not supported", code), Err::UNSUPPORTED));
 					return true;
 			}
-			if (step_out->get_e().is_valid()) {
-				done(step_out);
+			if (step_out.is_valid()) {
+				done(pg_fail(step_out));
 				return true;
 			}
 			return false;
 		}
 		if (p_kind == 'E') {
-			done(R::err(pg_error(p_body, p_len).msg, Err::PERMISSION_DENIED));
+			done(pg_fail(pg_error(p_body, p_len).msg, Err::PERMISSION_DENIED));
 			return true;
 		}
 		if (p_kind == 'Z') { // ReadyForQuery.
 			if (!db->auth_ok) {
-				done(R::err("server skipped authentication completion", Err::PERMISSION_DENIED));
+				done(pg_fail("server skipped authentication completion", Err::PERMISSION_DENIED));
 				return true;
 			}
 			if (!db->ready_state(p_body, p_len)) {
-				done(R::err("invalid postgres transaction state", Err::INVALID_DATA));
+				done(pg_fail("invalid postgres transaction state", Err::INVALID_DATA));
 				return true;
 			}
 			db->ready = true;
-			done(R::ok());
+			done(pg_ok());
 			return true;
 		}
 		return false; // Skip parameter-status and backend-key messages.
@@ -1161,7 +1240,12 @@ bool GDPostgresCallInternal::take(char p_kind, const uint8_t *p_body, int p_len)
 	// Count completions before writing results so surplus replies cannot index beyond a batch.
 	if (p_kind == 'C' && want_n > 0) {
 		if (done_n >= want_n) {
-			failed = Err::make("too many query completions", Err::INVALID_DATA);
+			if (done_n == want_n) {
+				const Ref<Err> extra = Err::make("too many query completions", Err::INVALID_DATA);
+				if (failed.is_valid()) extra_failures.push_back(extra);
+				else failed = extra;
+			}
+			done_n++;
 			return false; // Drain the remaining synchronization boundaries before reporting failure.
 		}
 		done_n++;
@@ -1171,6 +1255,11 @@ bool GDPostgresCallInternal::take(char p_kind, const uint8_t *p_body, int p_len)
 		return false;
 	}
 	if (discard_many && p_kind == 'C') { // CommandComplete
+		return false;
+	}
+	if (p_kind == '1') { // ParseComplete validates a newly cached statement.
+		parse_pending = false;
+		if (db.is_valid()) db->stmt_pending.erase(stmt);
 		return false;
 	}
 
@@ -1187,8 +1276,11 @@ bool GDPostgresCallInternal::take(char p_kind, const uint8_t *p_body, int p_len)
 		if (stream) {
 			stream->postgres_columns(columns);
 		}
-		if (!db->torn.is_empty() && failed.is_null()) {
-			failed = Err::make(db->torn, Err::INVALID_DATA);
+		if (!db->torn.is_empty()) {
+			const Ref<Err> error = Err::make(db->torn, Err::INVALID_DATA);
+			if (failed.is_valid()) extra_failures.push_back(error);
+			else failed = error;
+			statement_failed = true;
 		}
 		if (!db->torn.is_empty()) return false; // Never cache malformed metadata for later queries.
 		oids = db->oids;
@@ -1235,9 +1327,12 @@ bool GDPostgresCallInternal::take(char p_kind, const uint8_t *p_body, int p_len)
 		if (first_only && result_rows > 0) {
 			return false; // Drain remaining rows to the protocol boundary without constructing values.
 		}
-		if (failed.is_null() && ((!first_only && max_rows > 0 && result_rows >= max_rows) || (max_bytes > 0 && result_bytes + p_len > max_bytes))) {
-			failed = Err::make("postgres result exceeds the limit", Err::LIMITED);
-		} else if (failed.is_null()) {
+		if (!statement_failed && ((!first_only && max_rows > 0 && result_rows >= max_rows) || (max_bytes > 0 && result_bytes + p_len > max_bytes))) {
+			const Ref<Err> error = Err::make("postgres result exceeds the limit", Err::LIMITED);
+			if (failed.is_valid()) extra_failures.push_back(error);
+			else failed = error;
+			statement_failed = true;
+		} else if (!statement_failed) {
 			db->torn = String();
 			Variant row;
 			if (flat_values) {
@@ -1255,7 +1350,10 @@ bool GDPostgresCallInternal::take(char p_kind, const uint8_t *p_body, int p_len)
 			result_bytes += p_len;
 			result_rows++;
 			if (!db->torn.is_empty()) {
-				failed = Err::make(db->torn, Err::INVALID_DATA);
+				const Ref<Err> error = Err::make(db->torn, Err::INVALID_DATA);
+				if (failed.is_valid()) extra_failures.push_back(error);
+				else failed = error;
+				statement_failed = true;
 			}
 		}
 	} else if (p_kind == 'C') { // Command completion.
@@ -1268,7 +1366,7 @@ bool GDPostgresCallInternal::take(char p_kind, const uint8_t *p_body, int p_len)
 				one["columns"] = columns;
 				one["rows"] = rows;
 				one["tag"] = tag;
-				batches[done_n - 1] = one;
+				batches[sync_n] = one;
 			}
 			rows = Array();
 		} else {
@@ -1277,39 +1375,47 @@ bool GDPostgresCallInternal::take(char p_kind, const uint8_t *p_body, int p_len)
 		}
 	} else if (p_kind == 'E') {
 		const PgError error = pg_error(p_body, p_len);
-		failed = query_error(error);
-		// Discard statements invalidated on the server so the next execution prepares them again.
-		// 0A000 denotes a changed result type; 26000 denotes a missing statement.
-		if (db.is_valid() && !sql.is_empty() && (error.code == "0A000" || error.code == "26000")) {
+		const Ref<Err> reason = query_error(error);
+		if (failed.is_valid()) extra_failures.push_back(reason);
+		else failed = reason;
+		statement_failed = true;
+		// Discard a statement whose Parse failed or whose server state was invalidated.
+		// Keep a successfully parsed statement after an execution error.
+		if (db.is_valid() && !sql.is_empty() && (parse_pending || error.code == "0A000" || error.code == "26000")) {
 			const String *current = db->stmts.getptr(sql);
 			// An older pending error must not invalidate a replacement prepared by another caller.
-			if (current && *current == stmt) db->forget(sql, error.code == "0A000");
+			if (current && *current == stmt) db->forget(sql, !parse_pending && error.code == "0A000");
 		}
 	} else if (p_kind == 'Z') { // Ready to accept another query.
 		// Defer notification to GDPostgresClient::pump after queue removal.
 		// Otherwise the callback would still count this completed operation as waiting.
+		statement_failed = false;
 		if (want_n > 0 && ++sync_n < want_n) {
 			// Drain every remaining individual boundary even after an intermediate error.
 			// Removing the operation early would assign its remaining replies to the next call.
 			return false;
 		}
+		if (temporary_stmt && !parse_pending && db.is_valid()) db->close_stmt(stmt);
 		if (dropped) return true;
+		outcome_ready = true;
 		if (failed.is_valid()) {
-			outcome = R::err(failed);
+			// Keep completed batch work alongside the first failure and later causes.
+			const Variant partial = want_n > 0 ? (discard_many ? Variant(done_n) : flat_values ? Variant(values) : Variant(batches)) : Variant();
+			outcome = pg_fail(all_failures(), Err::NONE, partial);
 			return true;
 		}
 		if (want_n > 0) {
 			// Reject mismatches between requested and returned query counts.
 			// Otherwise scripts iterating by expected count could silently process incomplete results.
 			if (done_n != want_n) {
-				outcome = R::err(vformat("asked %d, got %d", want_n, done_n), Err::INVALID_DATA);
+				outcome = pg_fail(vformat("asked %d, got %d", want_n, done_n), Err::INVALID_DATA);
 				return true;
 			}
-			outcome = discard_many ? R::ok(done_n) : (flat_values ? R::ok(values) : R::ok(batches));
+			outcome = discard_many ? pg_ok(done_n) : (flat_values ? pg_ok(values) : pg_ok(batches));
 			return true;
 		}
 		if (first_only) {
-			outcome = rows.is_empty() ? R::err("database query returned no rows", Err::NOT_FOUND) : R::ok(rows[0]);
+			outcome = rows.is_empty() ? pg_fail("database query returned no rows", Err::NOT_FOUND) : pg_ok(rows[0]);
 			return true;
 		}
 		Dictionary out;
@@ -1321,18 +1427,27 @@ bool GDPostgresCallInternal::take(char p_kind, const uint8_t *p_body, int p_len)
 			out["rows"] = rows;
 		}
 		out["tag"] = tag;
-		outcome = R::ok(out);
+		outcome = pg_ok(out);
 		return true;
 	}
 	return false;
 }
 
+// Combine each independent SQL failure only once when the batch completes.
+Ref<Err> GDPostgresCallInternal::all_failures() const {
+	if (extra_failures.is_empty()) return failed;
+	Array errors;
+	errors.push_back(failed);
+	for (const Ref<Err> &error : extra_failures) errors.push_back(error);
+	return Err::join(errors);
+}
+
 // Emit a result after removing its operation from the queue.
 void GDPostgresCallInternal::finish() {
 	if (stream_mode && stream) {
-		stream->postgres_done(failed, tag);
+		stream->postgres_done(all_failures(), tag);
 	}
-	done(outcome.is_valid() ? outcome : R::ok());
+	done(outcome_ready ? outcome : pg_ok());
 }
 
 // Reset private operation state after completion.
@@ -1340,14 +1455,18 @@ void GDPostgresCallInternal::reset() {
 	Async::drop_deadline(this, due);
 	mode = QUERYING;
 	due = 0;
-	pending.unref();
-	outcome.unref();
+	pending = VariantPair();
+	outcome = VariantPair();
+	pending_ready = false;
+	outcome_ready = false;
 	opts = Dictionary();
 	columns = PackedStringArray();
 	keys.clear();
 	oids.clear();
 	sql = String();
 	stmt = String();
+	parse_pending = false;
+	temporary_stmt = false;
 	// Replace result arrays instead of clearing them because scripts may retain
 	// the shared backing storage of previously delivered results.
 	rows = Array();
@@ -1360,6 +1479,7 @@ void GDPostgresCallInternal::reset() {
 	want_n = 0;
 	done_n = 0;
 	sync_n = 0;
+	statement_failed = false;
 	discard_many = false;
 	flat_many = false;
 	values_only = false;
@@ -1377,13 +1497,14 @@ void GDPostgresCallInternal::reset() {
 	values = Array();
 	fmts.clear();
 	failed.unref(); // Do not retain the previous error.
+	extra_failures.clear();
 	dropped = false;
 	shared = false;
 	notified = false;
 }
 
 // Finish the operation and deliver its result to the waiter.
-void GDPostgresCallInternal::done(const Ref<R> &p_out) {
+void GDPostgresCallInternal::done(const VariantPair &p_out) {
 	if (self_hold.is_null()) {
 		return;
 	}
@@ -1396,7 +1517,7 @@ void GDPostgresCallInternal::done(const Ref<R> &p_out) {
 	Ref<GDPostgresCallInternal> keep(this);
 	Ref<GDPostgresClient> owner = db;
 	if (stream_mode && stream) {
-		stream->postgres_done(p_out->get_e(), tag);
+		stream->postgres_done(pg_result_error(p_out), tag);
 	}
 	if (owner.is_valid() && owner->opening.ptr() == this) {
 		owner->opening.unref();
@@ -1406,12 +1527,13 @@ void GDPostgresCallInternal::done(const Ref<R> &p_out) {
 	Ref<GDPostgresPoolCall> target = pool_call ? Ref<GDPostgresPoolCall>(pool_call) : Ref<GDPostgresPoolCall>();
 	if (!notified && !dropped) {
 		notify(p_out);
-	} else if (!notified && pending.is_valid()) {
+	} else if (!notified && pending_ready) {
 		// Deliver any pending cancellation before returning the operation for reuse.
 		// A reply may arrive before scheduled cancellation and otherwise recycle
 		// the operation without notification, leaving its waiter suspended forever.
-		const Ref<R> late = pending;
-		pending.unref();
+		const VariantPair late = pending;
+		pending = VariantPair();
+		pending_ready = false;
 		notify(late);
 	}
 	// Return pool connections only after the protocol boundary; notify before caching
@@ -1472,7 +1594,7 @@ void GDPostgresCallInternal::deliver_cancel(uint64_t p_generation) {
 	if (self_hold.is_null() || !dropped) {
 		return;
 	}
-	const Ref<R> out = pending.is_valid() ? pending : R::err("cancelled", Err::INTERRUPTED);
+	const VariantPair out = pending_ready ? pending : pg_fail("cancelled", Err::INTERRUPTED);
 	notify(out);
 	if (cancel_finished) {
 		cancel_finished = false;
@@ -1481,7 +1603,7 @@ void GDPostgresCallInternal::deliver_cancel(uint64_t p_generation) {
 }
 
 // Notify one interrupted caller and drain its wire position without disrupting other queries.
-void GDPostgresCallInternal::interrupt(const Ref<R> &p_out) {
+void GDPostgresCallInternal::interrupt(const VariantPair &p_out) {
 	if (self_hold.is_null() || dropped) {
 		return; // Ignore an already completed operation.
 	}
@@ -1495,19 +1617,27 @@ void GDPostgresCallInternal::interrupt(const Ref<R> &p_out) {
 	batches = Array();
 	// Notify on the next turn so the caller has time to attach its waiter.
 	pending = p_out;
+	pending_ready = true;
 	cancel_deferred = true;
 	Async::post(Ref<RefCounted>(this), callable_mp(this, &GDPostgresCallInternal::deliver_cancel).bind(generation));
 }
 
 // Cancel this waiter while preserving any already-sent query's response boundary.
 void GDPostgresCallInternal::cancel() {
-	interrupt(R::err("cancelled", Err::INTERRUPTED));
+	interrupt(pg_fail("cancelled", Err::INTERRUPTED));
+}
+
+// Discard an abandoned connection when no caller remains to wait for synchronization.
+void GDPostgresCallInternal::abort() {
+	if (db.is_valid()) db->close();
+	else cancel();
 }
 
 // Register public methods and properties with script.
 void GDPostgresCallInternal::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDPostgresCallInternal::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ClassDB::bind_method(D_METHOD("abort"), &GDPostgresCallInternal::abort);
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value"), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 	ADD_SIGNAL(MethodInfo("settled"));
 }
 
@@ -1543,9 +1673,10 @@ void GDPostgresClient::close() {
 		sock.close();
 	}
 	// Notify all waiters instead of silently discarding their unfinished operations.
-	drain(R::err("connection closed", Err::INTERRUPTED));
+	drain(pg_fail("connection closed", Err::INTERRUPTED));
 	// Discard cached server-side statement names when their connection ends.
 	stmts.clear();
+	stmt_pending.clear();
 	stmt_lru.clear();
 	stmt_lru_pos.clear();
 	cols.clear();
@@ -1564,7 +1695,7 @@ void GDPostgresClient::close() {
 // Detach delivery and notify all waiters with the same failure reason.
 // Defer notification until the next turn because closure may follow immediately
 // after queueing, before the caller has attached to the signal.
-void GDPostgresClient::drain(const Ref<R> &p_why) {
+void GDPostgresClient::drain(const VariantPair &p_why) {
 	wire_generation++;
 	scram_job.unref(); // Ignore authentication work that completes after this connection ends.
 	// Only unrecoverable protocol failures enter this path. Close before notification
@@ -1590,9 +1721,11 @@ void GDPostgresClient::drain(const Ref<R> &p_why) {
 	while (!inflight.is_empty()) {
 		Ref<GDPostgresCallInternal> c = inflight.front()->get();
 		inflight.pop_front();
-		c->fail_later(p_why);
+		const Ref<Err> transport = p_why.error;
+		c->fail_later({ p_why.value, Err::join(c->all_failures(), transport) });
 	}
 	stmts.clear();
+	stmt_pending.clear();
 	stmt_lru.clear();
 	stmt_lru_pos.clear();
 	cols.clear();
@@ -1618,7 +1751,7 @@ Error GDPostgresClient::send(const String &p_kind, const ByteBuf &p_body) {
 }
 
 // Append socket bytes to the receive buffer.
-Ref<R> GDPostgresClient::fill(int p_max_bytes) {
+Ref<Err> GDPostgresClient::fill(int p_max_bytes) {
 	return sock_fill(sock, buf, buf_at, p_max_bytes, int64_t(SEND_BYTES_MAX) + 1);
 }
 
@@ -1663,7 +1796,7 @@ bool GDPostgresClient::has_complete_msg() const {
 // ---------------- SCRAM-SHA-256 ----------------
 
 // Build the initial remote SQL SCRAM authentication message.
-Ref<R> GDPostgresClient::sasl_begin(const PackedByteArray &p_data) {
+Ref<Err> GDPostgresClient::sasl_begin(const PackedByteArray &p_data) {
 	PackedStringArray mechs;
 	int at = 4; // The first four bytes contain the authentication type.
 	while (at < p_data.size() && p_data[at] != 0) {
@@ -1672,11 +1805,11 @@ Ref<R> GDPostgresClient::sasl_begin(const PackedByteArray &p_data) {
 		at = next;
 	}
 	if (!mechs.has("SCRAM-SHA-256")) {
-		return R::err(vformat("server offers %s, none supported", mechs), Err::UNSUPPORTED);
+		return Err::from(vformat("server offers %s, none supported", mechs), Err::UNSUPPORTED);
 	}
 
 	const PackedByteArray raw = GDDigest::random(18);
-	if (raw.size() != 18) return R::err("cannot generate SCRAM nonce", Err::INVALID_DATA);
+	if (raw.size() != 18) return Err::from("cannot generate SCRAM nonce", Err::INVALID_DATA);
 	nonce = Encoding::base64_encode(raw);
 	first_bare = vformat("n=,r=%s", nonce);
 	const PackedByteArray initial = ("n,," + first_bare).to_utf8_buffer();
@@ -1686,9 +1819,9 @@ Ref<R> GDPostgresClient::sasl_begin(const PackedByteArray &p_data) {
 	put32(body, initial.size());
 	put_raw(body, initial.ptr(), initial.size());
 	if (send("p", body) != OK) {
-		return R::err("sasl send failed", Err::INVALID_DATA);
+		return Err::from("sasl send failed", Err::INVALID_DATA);
 	}
-	return R::ok();
+	return Ref<Err>();
 }
 
 // Derive authentication keys outside the event loop.
@@ -1712,13 +1845,13 @@ void ScramKeyJob::finish() {
 	db.unref();
 	password.clear();
 	salt.clear();
-	salted.unref();
+	salted = VariantPair();
 }
 
 // Build the remote SQL SCRAM authentication proof.
-Ref<R> GDPostgresClient::sasl_continue(const PackedByteArray &p_data, const String &p_password) {
+Ref<Err> GDPostgresClient::sasl_continue(const PackedByteArray &p_data, const String &p_password) {
 	if (!scram_pending || nonce.is_empty() || !server_sig.is_empty()) {
-		return R::err("unexpected sasl continuation", Err::INVALID_DATA);
+		return Err::from("unexpected sasl continuation", Err::INVALID_DATA);
 	}
 	const PackedByteArray tail = p_data.slice(4);
 	const String server_first = String::utf8((const char *)tail.ptr(), tail.size());
@@ -1729,33 +1862,33 @@ Ref<R> GDPostgresClient::sasl_continue(const PackedByteArray &p_data, const Stri
 		}
 	}
 	if (!(fields.has("r") && fields.has("s") && fields.has("i"))) {
-		return R::err("malformed server-first", Err::INVALID_DATA);
+		return Err::from("malformed server-first", Err::INVALID_DATA);
 	}
 	// Reject empty-password derivation before entering this path.
 	// Otherwise empty derived values could compare equal without a valid proof.
 	if (p_password.is_empty()) {
-		return R::err("scram needs a password", Err::INVALID_DATA);
+		return Err::from("scram needs a password", Err::INVALID_DATA);
 	}
 	const String combined = fields["r"];
 	// Require the server to extend the client nonce rather than merely echo it,
 	// as specified by RFC 5802.
 	if (!combined.begins_with(nonce) || combined.length() <= nonce.length()) {
-		return R::err("server nonce mismatch", Err::PERMISSION_DENIED);
+		return Err::from("server nonce mismatch", Err::PERMISSION_DENIED);
 	}
 
-	const Ref<R> decoded = Encoding::base64_decode(fields["s"]);
-	if (!decoded->get_ok()) return R::err("invalid SCRAM salt", Err::INVALID_DATA);
-	const PackedByteArray salt = decoded->get_v();
+	const VariantPair decoded = Encoding::base64_decode(fields["s"]);
+	if (decoded.error.get_type() != Variant::NIL) return Err::from("invalid SCRAM salt", Err::INVALID_DATA);
+	const PackedByteArray salt = decoded.value;
 	// Read iteration counts in 64 bits before validating them.
 	// Narrowing first could truncate a large value past the lower-bound check.
 	const int64_t iters = String(fields["i"]).to_int();
 	if (iters < SCRAM_MIN_ITERS || iters > SCRAM_MAX_ITERS) {
-		return R::err(vformat("server asked for %d rounds (need %d..%d)", iters, SCRAM_MIN_ITERS, SCRAM_MAX_ITERS), Err::PERMISSION_DENIED);
+		return Err::from(vformat("server asked for %d rounds (need %d..%d)", iters, SCRAM_MIN_ITERS, SCRAM_MAX_ITERS), Err::PERMISSION_DENIED);
 	}
 	// Reject duplicate derivation requests to prevent one job's result from being
 	// combined with another request's authentication inputs.
 	if (scram_job.is_valid()) {
-		return R::err("server sent a second sasl continue", Err::INVALID_DATA);
+		return Err::from("server sent a second sasl continue", Err::INVALID_DATA);
 	}
 	// Dispatch peer-selected key derivation to a worker to keep listeners responsive.
 	// Build the continuation in sasl_derived after the worker completes.
@@ -1768,15 +1901,15 @@ Ref<R> GDPostgresClient::sasl_continue(const PackedByteArray &p_data, const Stri
 	scram_job->server_first = server_first;
 	if (!scram_job->submit(true)) { // Schedule CPU-bound derivation within processor capacity.
 		scram_job.unref();
-		return R::err("worker pool stopped", Err::INTERRUPTED);
+		return Err::from("worker pool stopped", Err::INTERRUPTED);
 	}
-	return R::ok();
+	return Ref<Err>();
 }
 
 // Build the authentication continuation after worker key derivation completes.
-void GDPostgresClient::sasl_derived(const Ref<R> &p_salted, const String &p_combined, const String &p_server_first) {
-	if (!p_salted->get_ok()) { drain(p_salted); return; }
-	const PackedByteArray salted = p_salted->get_v();
+void GDPostgresClient::sasl_derived(const VariantPair &p_salted, const String &p_combined, const String &p_server_first) {
+	if (p_salted.error.get_type() != Variant::NIL) { drain(pg_fail(p_salted.error)); return; }
+	const PackedByteArray salted = p_salted.value;
 	const String combined = p_combined;
 	const String server_first = p_server_first;
 	const PackedByteArray client_key = Hash::hmac_sha256(salted, String("Client Key").to_utf8_buffer());
@@ -1784,7 +1917,7 @@ void GDPostgresClient::sasl_derived(const Ref<R> &p_salted, const String &p_comb
 	// Stop if any derivation stage fails; otherwise an empty expected signature
 	// could accept an empty server response as a valid proof.
 	if (salted.is_empty() || client_key.is_empty() || stored_key.is_empty()) {
-		drain(R::err("cannot derive the scram keys", Err::INVALID_DATA));
+		drain(pg_fail("cannot derive the scram keys", Err::INVALID_DATA));
 		return;
 	}
 
@@ -1797,7 +1930,7 @@ void GDPostgresClient::sasl_derived(const Ref<R> &p_salted, const String &p_comb
 	const PackedByteArray server_key = Hash::hmac_sha256(salted, String("Server Key").to_utf8_buffer());
 	const PackedByteArray want_sig = Hash::hmac_sha256(server_key, auth_msg.to_utf8_buffer());
 	if (client_sig.is_empty() || proof.is_empty() || want_sig.is_empty()) {
-		drain(R::err("cannot derive the scram keys", Err::INVALID_DATA));
+		drain(pg_fail("cannot derive the scram keys", Err::INVALID_DATA));
 		return;
 	}
 	server_sig = Encoding::base64_encode(want_sig);
@@ -1807,14 +1940,14 @@ void GDPostgresClient::sasl_derived(const Ref<R> &p_salted, const String &p_comb
 	const PackedByteArray proof_raw = out.to_utf8_buffer();
 	put_raw(proof_msg, proof_raw.ptr(), proof_raw.size());
 	if (send("p", proof_msg) != OK) {
-		drain(R::err("sasl proof send failed", Err::INVALID_DATA));
+		drain(pg_fail("sasl proof send failed", Err::INVALID_DATA));
 	}
 }
 
 // Verify the remote SQL SCRAM server signature.
-Ref<R> GDPostgresClient::sasl_final(const PackedByteArray &p_data) {
+Ref<Err> GDPostgresClient::sasl_final(const PackedByteArray &p_data) {
 	if (!scram_pending || scram_job.is_valid() || server_sig.is_empty()) {
-		return R::err("unexpected sasl final", Err::PERMISSION_DENIED);
+		return Err::from("unexpected sasl final", Err::PERMISSION_DENIED);
 	}
 	const PackedByteArray tail = p_data.slice(4);
 	const String msg = String::utf8((const char *)tail.ptr(), tail.size());
@@ -1822,12 +1955,12 @@ Ref<R> GDPostgresClient::sasl_final(const PackedByteArray &p_data) {
 		if (part.begins_with("v=")) {
 			// Compare in constant time to avoid revealing matching signature prefixes.
 			if (!Hash::equal_ct(part.substr(2).to_utf8_buffer(), server_sig.to_utf8_buffer())) {
-				return R::err("server signature mismatch", Err::PERMISSION_DENIED);
+				return Err::from("server signature mismatch", Err::PERMISSION_DENIED);
 			}
-			return R::ok();
+			return Ref<Err>();
 		}
 	}
-	return R::err("no server signature", Err::INVALID_DATA);
+	return Err::from("no server signature", Err::INVALID_DATA);
 }
 
 // ---------------- Result decoding ----------------
@@ -1924,6 +2057,20 @@ Variant GDPostgresClient::data_row(const uint8_t *p_data, int p_len, const Local
 		}
 		const int32_t oid = i < (int)p_oids.size() ? p_oids[i] : 25;
 		const bool bin = i < (int)p_fmts.size() && p_fmts[i] == 1;
+		if (oid == 17) {
+			PackedByteArray value;
+			if (!bin && !bytea_value(b + at, len, value)) {
+				torn = vformat("binary value %d is malformed", i);
+				break;
+			}
+			if (bin) {
+				value.resize(len);
+				if (len > 0) memcpy(value.ptrw(), b + at, len);
+			}
+			set_value(i, value);
+			at += len;
+			continue;
+		}
 		if (bin) {
 			int width = -1;
 			switch (oid) {
@@ -2027,7 +2174,7 @@ Signal GDPostgresClient::open(const String &p_host, int64_t p_port, const Dictio
 	if (p_host.is_empty() || p_port < Limit::PORT_MIN || p_port > Limit::PORT_MAX) {
 		Ref<GDPostgresCallInternal> bad = lend();
 		bad->self_hold = bad;
-		bad->fail_later(R::err("postgres address is invalid", Err::INVALID_DATA));
+		bad->fail_later(pg_fail("postgres address is invalid", Err::INVALID_DATA));
 		return Signal(bad.ptr(), "finished");
 	}
 	port = int(p_port);
@@ -2036,12 +2183,11 @@ Signal GDPostgresClient::open(const String &p_host, int64_t p_port, const Dictio
 	call->self_hold = call;
 	call->mode = GDPostgresCallInternal::CONNECTING;
 	call->opts = p_opts;
-	const double connect_timeout = p_opts.get("connect_timeout", double(WAIT_MS) / 1000.0);
-	const double timeout = p_opts.get("timeout", 0.0);
 	uint64_t connect_ms = 0;
 	uint64_t query_ms = 0;
-	if (!Limit::seconds_ms(connect_timeout, connect_ms) || !Limit::seconds_ms(timeout, query_ms)) {
-		call->fail_later(R::err("timeouts must be zero or a positive number of seconds", Err::INVALID_DATA));
+	if (!DbOption::seconds(p_opts, "connect_timeout", 0.0, connect_ms) ||
+			!DbOption::seconds(p_opts, "timeout", 0.0, query_ms)) {
+		call->fail_later(pg_fail("timeouts must be zero or a positive number of seconds", Err::INVALID_DATA));
 		return Signal(call.ptr(), "finished");
 	}
 	call->set_due(connect_ms);
@@ -2052,25 +2198,29 @@ Signal GDPostgresClient::open(const String &p_host, int64_t p_port, const Dictio
 	server_sig = String();
 	scram_done = false;
 	md5_done = false;
-	const String auth = p_opts.get("auth", "any");
-	if (auth != "any" && auth != "scram" && auth != "md5") {
-		call->fail_later(R::err("auth must be any, scram, or md5", Err::INVALID_DATA));
+	String auth;
+	if (!DbOption::text(p_opts, "auth", "any", auth) || (auth != "any" && auth != "scram" && auth != "md5") || !pg_credentials(p_opts)) {
+		call->fail_later(pg_fail("auth must be any, scram, or md5", Err::INVALID_DATA));
 		return Signal(call.ptr(), "finished");
 	}
 
 	// Select verify-full for explicit true or external-host defaults, and disable for default loopback.
 	if (!Wire::guard_of(p_opts.get("tls", Wire::default_guard(p_host)), guard)) {
-		call->fail_later(R::err("tls must be one of disable / require / verify-full", Err::INVALID_DATA));
+		call->fail_later(pg_fail("tls must be one of disable / require / verify-full", Err::INVALID_DATA));
 		return Signal(call.ptr(), "finished");
 	}
-	const String ca_path = p_opts.get("ca", "");
+	String ca_path;
+	if (!DbOption::text(p_opts, "ca", "", ca_path)) {
+		call->fail_later(pg_fail("ca path must be text", Err::INVALID_DATA));
+		return Signal(call.ptr(), "finished");
+	}
 	ca.unref();
 	tls_at = guard == Wire::NONE ? TLS_OFF : TLS_ASK;
 	// Accept hostnames as well as numeric addresses for container and production endpoints.
 	// Check network permission before resolving names, since a later connection check
 	// would still allow the DNS query to leave the process.
 	if (!Perm::check(Perm::NET, vformat("%s:%d", p_host, p_port))) {
-		call->fail_later(R::err(vformat("net access to \"%s\" is not allowed", p_host), Err::PERMISSION_DENIED));
+		call->fail_later(pg_fail(vformat("net access to \"%s\" is not allowed", p_host), Err::PERMISSION_DENIED));
 		return Signal(call.ptr(), "finished");
 	}
 	if (opening.is_valid() || sock.is_valid() || !inflight.is_empty() || !packing.is_empty()) {
@@ -2079,12 +2229,12 @@ Signal GDPostgresClient::open(const String &p_host, int64_t p_port, const Dictio
 	opening = call;
 	if (!ca_path.is_empty()) {
 		call->mode = GDPostgresCallInternal::RESOLVING;
-		GDFileCall::start([p_host, ca_path]() { return Wire::prepare(p_host, ca_path); }).connect(
+		GDPairCall::start([p_host, ca_path]() { return Wire::prepare(p_host, ca_path); }, false).connect(
 				callable_mp(this, &GDPostgresClient::resolved).bind(call), Object::CONNECT_ONE_SHOT);
 		return Signal(call.ptr(), "finished");
 	}
 	if (sock.open(p_host, p_port, call->due) != OK) {
-		call->fail_later(R::err(vformat("cannot reach %s:%d", p_host, p_port), Err::NOT_FOUND));
+		call->fail_later(pg_fail(vformat("cannot reach %s:%d", p_host, p_port), Err::NOT_FOUND));
 	} else {
 		call->schedule();
 	}
@@ -2105,11 +2255,16 @@ void GDPostgresClient::close_stmt(const String &p_name) {
 	}
 }
 
-// Prepare a statement only when its SQL is not already cached.
-// Retain its server-side name so subsequent executions omit Parse.
+// Prepare each SQL after its first Parse is confirmed by the server.
+// Give overlapping requests temporary names so they never Bind an unconfirmed statement.
 String GDPostgresClient::prepare(const String &p_sql, bool &r_is_new) {
 	HashMap<String, String>::Iterator found = stmts.find(p_sql);
 	if (found) {
+		if (stmt_pending.has(found->value)) {
+			// Keep the first cache entry until its reply establishes whether reuse is safe.
+			r_is_new = true;
+			return vformat("gds%d", ++stmt_seq);
+		}
 		List<String>::Element **at = stmt_lru_pos.getptr(p_sql);
 		if (at) {
 			stmt_lru.move_to_front(*at);
@@ -2125,6 +2280,7 @@ String GDPostgresClient::prepare(const String &p_sql, bool &r_is_new) {
 	r_is_new = true;
 	const String name = vformat("gds%d", ++stmt_seq);
 	stmts.insert(p_sql, name);
+	stmt_pending.insert(name);
 	stmt_lru.push_front(p_sql);
 	stmt_lru_pos.insert(p_sql, stmt_lru.front());
 	return name;
@@ -2162,7 +2318,7 @@ void GDPostgresClient::pump() {
 			forget(job->sql);
 		}
 		if (!job->call->dropped) {
-			job->call->interrupt(R::err("postgres batch encoding timed out", Err::TIMED_OUT));
+			job->call->interrupt(pg_fail("postgres batch encoding timed out", Err::TIMED_OUT));
 		}
 		Async::drop_deadline(job->call.ptr(), job->call->due);
 		job->call->due = 0;
@@ -2182,13 +2338,13 @@ void GDPostgresClient::pump() {
 			return false;
 		}
 		if (head->shared) {
-			head->interrupt(R::err("timeout", Err::TIMED_OUT));
+			head->interrupt(pg_fail("timeout", Err::TIMED_OUT));
 			return false;
 		}
 		inflight.pop_front();
 		head->db.unref();
 		close();
-		head->fail_later(R::err("timeout", Err::TIMED_OUT));
+		head->fail_later(pg_fail("timeout", Err::TIMED_OUT));
 		return true;
 	};
 	if (expire()) {
@@ -2197,7 +2353,7 @@ void GDPostgresClient::pump() {
 	if (!inflight.is_empty() && inflight.front()->get()->stream_paused) {
 		return; // Do not read the next row from the socket or buffer until Next is requested.
 	}
-	const Ref<R> live = fill(PG_READ_CHUNK);
+	const Ref<Err> live = fill(PG_READ_CHUNK);
 	// Preserve complete buffered replies before applying a transport failure to unfinished calls.
 
 	char kind = 0;
@@ -2217,7 +2373,7 @@ void GDPostgresClient::pump() {
 			inflight.pop_front();
 			head->db.unref();
 			close();
-			head->fail_later(R::err("postgres message exceeds the protocol maximum", Err::LIMITED));
+			head->fail_later(pg_fail("postgres message exceeds the protocol maximum", Err::LIMITED));
 			return;
 		}
 		const int message_bytes = len + 4;
@@ -2226,19 +2382,19 @@ void GDPostgresClient::pump() {
 			inflight.pop_front();
 			head->db.unref();
 			close();
-			head->fail_later(R::err("postgres message exceeds the protocol maximum", Err::LIMITED));
+			head->fail_later(pg_fail("postgres message exceeds the protocol maximum", Err::LIMITED));
 			return;
 		}
 		// Preserve the negotiated text contract before decoding results or reusing this connection.
 		if (kind == 'S') {
 			const Ref<Err> error = status_error(buf.ptr() + at, len);
 			if (error.is_valid()) {
-				drain(R::err(error));
+				drain(pg_fail(error));
 				return;
 			}
 		}
 		if (kind == 'Z' && !ready_state(buf.ptr() + at, len)) {
-			drain(R::err("invalid postgres transaction state", Err::INVALID_DATA));
+			drain(pg_fail("invalid postgres transaction state", Err::INVALID_DATA));
 			return;
 		}
 		GDPostgresCallInternal *head = inflight.front()->get().ptr();
@@ -2261,8 +2417,8 @@ void GDPostgresClient::pump() {
 		}
 	}
 	const bool paused = !inflight.is_empty() && inflight.front()->get()->stream_paused;
-	if (live->get_e().is_valid() && !has_complete_msg() && !paused) {
-		drain(live);
+	if (live.is_valid() && !has_complete_msg() && !paused) {
+		drain(pg_fail(live));
 		return;
 	}
 	if (has_complete_msg() || sock.available() > 0) {
@@ -2290,11 +2446,11 @@ void GDPostgresClient::flush_out() {
 	if (!sock.is_valid() || !sock.is_ready()) {
 		sock.write_wait(false);
 		out_buf.clear();
-		drain(sock_error(sock, "connection lost"));
+		drain(pg_fail(sock_error(sock, "connection lost")));
 		return;
 	}
 	if (!sock_flush(sock, out_buf)) {
-		drain(sock_error(sock, "send failed"));
+		drain(pg_fail(sock_error(sock, "send failed")));
 		return;
 	}
 	if (out_buf.is_empty() && !next_buf.is_empty()) {
@@ -2339,6 +2495,7 @@ void GDPostgresClient::give_back(GDPostgresCallInternal *p_call) {
 void GDPostgresClient::forget(const String &p_sql, bool p_close) {
 	const String *name = stmts.getptr(p_sql);
 	if (name) {
+		stmt_pending.erase(*name);
 		if (p_close) {
 			close_stmt(*name);
 		}
@@ -2420,7 +2577,7 @@ void GDPostgresPackJob::run() {
 	const int64_t sql_bytes = utf8_bytes(sql);
 	const int64_t stmt_bytes = utf8_bytes(stmt);
 	if ((check_only || is_new) && (stmt_bytes > SEND_BYTES_MAX - 8 || sql_bytes > SEND_BYTES_MAX - 8 - stmt_bytes)) {
-		error = R::err(check_only ? "postgres check SQL exceeds the byte limit" : "postgres SQL exceeds the byte limit", Err::LIMITED);
+		error = Err::make(check_only ? "postgres check SQL exceeds the byte limit" : "postgres SQL exceeds the byte limit", Err::LIMITED);
 		return;
 	}
 	if (check_only) {
@@ -2451,25 +2608,25 @@ void GDPostgresPackJob::run() {
 	add_bound(send_bound, int64_t(fmts.size()) * 2 * rows.size());
 	for (int r = 0; r < rows.size(); r++) {
 		if (rows[r].get_type() != Variant::ARRAY) {
-			error = R::err(vformat("postgres batch row %d is not an Array", r + 1), Err::INVALID_DATA);
+		error = Err::make(vformat("postgres batch row %d is not an Array", r + 1), Err::INVALID_DATA);
 			return;
 		}
 		const Array args = rows[r];
 		if (args.size() > PARAM_MAX) {
-			error = R::err(vformat("postgres batch row %d parameter count exceeds the limit", r + 1), Err::LIMITED);
+		error = Err::make(vformat("postgres batch row %d parameter count exceeds the limit", r + 1), Err::LIMITED);
 			return;
 		}
 		add_bound(send_bound, 64 + int64_t(args.size()) * 4);
 		for (int i = 0; i < args.size(); i++) {
 			const int64_t value_bound = param_bound(args[i]);
 			if (value_bound < 0) {
-				error = R::err(vformat("postgres parameter %d in row %d has an unsupported type", i + 1, r + 1), Err::INVALID_DATA);
+			error = Err::make(vformat("postgres parameter %d in row %d has an unsupported type", i + 1, r + 1), Err::INVALID_DATA);
 				return;
 			}
 			add_bound(send_bound, value_bound);
 		}
 		if (due > 0 && (r & 255) == 255 && GDClock::msec() > due) {
-			error = R::err("postgres batch encoding timed out", Err::TIMED_OUT);
+		error = Err::make("postgres batch encoding timed out", Err::TIMED_OUT);
 			return;
 		}
 	}
@@ -2484,7 +2641,7 @@ void GDPostgresPackJob::run() {
 			}
 		}
 		if (send_bound > PACK_BYTES_MAX) {
-			error = R::err("postgres batch exceeds the in-memory representation", Err::LIMITED);
+		error = Err::make("postgres batch exceeds the in-memory representation", Err::LIMITED);
 			return;
 		}
 	}
@@ -2514,7 +2671,7 @@ void GDPostgresPackJob::run() {
 		}
 		if (fmts.size() > PARAM_MAX) {
 			packed.reset();
-			error = R::err("postgres result format count exceeds the protocol maximum", Err::LIMITED);
+		error = Err::make("postgres result format count exceeds the protocol maximum", Err::LIMITED);
 			return;
 		}
 		if (!fmts.is_empty()) {
@@ -2527,7 +2684,7 @@ void GDPostgresPackJob::run() {
 		}
 		if ((int64_t)packed.size() - len_at > SEND_BYTES_MAX) {
 			packed.reset();
-			error = R::err("postgres bind message exceeds the protocol maximum", Err::LIMITED);
+		error = Err::make("postgres bind message exceeds the protocol maximum", Err::LIMITED);
 			return;
 		}
 		fix_len(packed, len_at);
@@ -2602,14 +2759,14 @@ void GDPostgresClient::start_pack() {
 		if (!is_open()) {
 			packing.pop_front();
 			packing_bytes = MAX(int64_t(0), packing_bytes - job->queued_bytes);
-			job->call->fail_later(R::err("not connected", Err::NOT_FOUND));
+			job->call->fail_later(pg_fail("not connected", Err::NOT_FOUND));
 			continue;
 		}
 		if (job->started) break; // A worker already owns the first job.
 		if (job->call->dropped) {
 			packing.pop_front();
 			packing_bytes = MAX(int64_t(0), packing_bytes - job->queued_bytes);
-			job->call->done(R::err("cancelled", Err::INTERRUPTED));
+			job->call->done(pg_fail("cancelled", Err::INTERRUPTED));
 			continue;
 		}
 		job->started = true;
@@ -2620,6 +2777,9 @@ void GDPostgresClient::start_pack() {
 			job->stmt = prepare(job->sql, job->is_new);
 			job->call->sql = job->sql;
 			job->call->stmt = job->stmt;
+			job->call->parse_pending = job->is_new;
+			const String *cached = stmts.getptr(job->sql);
+			job->call->temporary_stmt = job->is_new && (!cached || *cached != job->stmt);
 			const PackedStringArray *known = known_cols(job->sql);
 			job->ask_desc = (known == nullptr);
 			if (known) {
@@ -2645,8 +2805,8 @@ void GDPostgresClient::start_pack() {
 		if (job->submit(true)) break;
 		packing.pop_front();
 		packing_bytes = MAX(int64_t(0), packing_bytes - job->queued_bytes);
-		if (job->is_new) forget(job->sql);
-		job->call->done(R::err("worker pool stopped", Err::INTERRUPTED));
+		if (job->is_new && stmts.getptr(job->sql) && *stmts.getptr(job->sql) == job->stmt) forget(job->sql);
+		job->call->done(pg_fail("worker pool stopped", Err::INTERRUPTED));
 	}
 	packing_active = false;
 }
@@ -2660,27 +2820,27 @@ void GDPostgresClient::packed(GDPostgresPackJob *p_job) {
 	packing.pop_front();
 	packing_bytes = MAX(int64_t(0), packing_bytes - job->queued_bytes);
 	if (!job->call.is_valid() || !job->call->self_hold.is_valid()) {
-		if (job->is_new) {
+		if (job->is_new && stmts.getptr(job->sql) && *stmts.getptr(job->sql) == job->stmt) {
 			forget(job->sql);
 		}
 	} else if (job->call->dropped) {
-		if (job->is_new) {
+		if (job->is_new && stmts.getptr(job->sql) && *stmts.getptr(job->sql) == job->stmt) {
 			forget(job->sql);
 		}
-		job->call->done(R::err("cancelled", Err::INTERRUPTED));
+		job->call->done(pg_fail("cancelled", Err::INTERRUPTED));
 	} else {
 		if (job->error.is_valid()) {
-			if (job->is_new) {
+			if (job->is_new && stmts.getptr(job->sql) && *stmts.getptr(job->sql) == job->stmt) {
 				forget(job->sql);
 			}
-			job->call->fail_later(job->error);
+			job->call->fail_later(pg_fail(job->error));
 		} else if (!is_open()) {
-			job->call->fail_later(R::err("not connected", Err::NOT_FOUND));
+			job->call->fail_later(pg_fail("not connected", Err::NOT_FOUND));
 		} else if (job->due > 0 && GDClock::msec() >= job->due) {
-			if (job->is_new) {
+			if (job->is_new && stmts.getptr(job->sql) && *stmts.getptr(job->sql) == job->stmt) {
 				forget(job->sql);
 			}
-			job->call->fail_later(R::err("postgres batch encoding timed out", Err::TIMED_OUT));
+			job->call->fail_later(pg_fail("postgres batch encoding timed out", Err::TIMED_OUT));
 		} else {
 			if (job->call->want_n > 0 && !job->call->discard_many && !job->call->flat_many) {
 				job->call->batches.resize(job->rows.size());
@@ -2724,11 +2884,11 @@ Signal GDPostgresClient::send_rows(const String &p_sql, const Array &p_rows, boo
 	call->max_rows = p_max_rows;
 	call->max_bytes = p_max_bytes;
 	if (!is_open()) {
-		call->fail_later(R::err("not connected", Err::NOT_FOUND));
+		call->fail_later(pg_fail("not connected", Err::NOT_FOUND));
 		return Signal(call.ptr(), "finished");
 	}
 	if (p_rows.is_empty()) {
-		call->fail_later(p_many ? (p_discard ? R::ok(0) : R::ok(Array())) : R::err("no args", Err::INVALID_DATA));
+		call->fail_later(p_many ? (p_discard ? pg_ok(0) : pg_ok(Array())) : pg_fail("no args", Err::INVALID_DATA));
 		return Signal(call.ptr(), "finished");
 	}
 	Ref<GDPostgresPackJob> job;
@@ -2795,7 +2955,7 @@ Ref<GDDatabaseRows> GDPostgresClient::start_rows(const String &p_sql, const Arra
 
 // Return one row per Next call without accumulating the complete result.
 Signal GDPostgresClient::query_rows(const String &p_sql, const Array &p_args) {
-	return Async::ready(R::ok(start_rows(p_sql, p_args)));
+	return Async::ready_pair({ start_rows(p_sql, p_args), Variant() });
 }
 
 // Send multiple SQL executions as one operation.
@@ -2835,7 +2995,7 @@ Signal GDPostgresClient::check(const String &p_sql) {
 	call->set_due(wait_ms);
 
 	if (!is_open()) {
-		call->fail_later(R::err("not connected", Err::NOT_FOUND));
+		call->fail_later(pg_fail("not connected", Err::NOT_FOUND));
 		return Signal(call.ptr(), "finished");
 	}
 	Ref<GDPostgresPackJob> job;
@@ -2868,11 +3028,6 @@ enum PgPoolKind {
 	PG_POOL_EXEC, // Return only the completed-update count.
 };
 
-// Reserve connections only for operations that expose connection-local state or incremental reads.
-bool pool_exclusive(int p_kind) {
-	return p_kind == PG_POOL_ACQUIRE || p_kind == PG_POOL_ROWS;
-}
-
 // Start the selected query on a borrowed connection.
 void GDPostgresPoolCall::start(const Ref<GDPostgresClient> &p_conn) {
 	if (done || p_conn.is_null()) {
@@ -2880,7 +3035,8 @@ void GDPostgresPoolCall::start(const Ref<GDPostgresClient> &p_conn) {
 	}
 	conn = p_conn;
 	if (kind == PG_POOL_ACQUIRE) {
-		pending = R::ok(Ref<GDPostgresPoolCall>(this));
+		pending = pg_ok(Ref<GDPostgresPoolCall>(this));
+		pending_ready = true;
 		delivery_posted = true;
 		Async::post(Ref<RefCounted>(this), callable_mp(this, &GDPostgresPoolCall::deliver_lease));
 		return;
@@ -2889,7 +3045,7 @@ void GDPostgresPoolCall::start(const Ref<GDPostgresClient> &p_conn) {
 	if (due > 0) {
 		const uint64_t now = GDClock::msec();
 		if (now >= due) {
-			fail_later(R::err("postgres pool wait timed out", Err::TIMED_OUT));
+			fail_later(pg_fail("postgres pool wait timed out", Err::TIMED_OUT));
 			return;
 		}
 		conn->wait_ms = MAX(uint64_t(1), due - now);
@@ -2899,14 +3055,15 @@ void GDPostgresPoolCall::start(const Ref<GDPostgresClient> &p_conn) {
 		conn->wait_ms = full_wait;
 		due = 0;
 		if (stream.is_null() || stream->pg.is_null()) {
-			fail_later(R::err("postgres pool Rows did not start", Err::INTERRUPTED));
+			fail_later(pg_fail("postgres pool Rows did not start", Err::INTERRUPTED));
 			return;
 		}
 		inner = stream->pg;
 		inner->pool_call = this; // Receive the Rows protocol boundary directly without an intermediate signal.
 		args = Array();
 		sql = String();
-		pending = R::ok(stream); // Retain Rows through completion-queue delivery even if the protocol finishes first.
+		pending = pg_ok(stream); // Retain Rows through completion-queue delivery even if the protocol finishes first.
+		pending_ready = true;
 		delivery_posted = true;
 		Async::post(Ref<RefCounted>(this), callable_mp(this, &GDPostgresPoolCall::deliver_stream));
 		return;
@@ -2957,7 +3114,7 @@ void GDPostgresPoolCall::start(const Ref<GDPostgresClient> &p_conn) {
 			break;
 		default:
 			conn->wait_ms = full_wait;
-			fail_later(R::err("invalid postgres pool query", Err::INVALID_DATA));
+			fail_later(pg_fail("invalid postgres pool query", Err::INVALID_DATA));
 			return;
 	}
 	if (many) {
@@ -2970,17 +3127,16 @@ void GDPostgresPoolCall::start(const Ref<GDPostgresClient> &p_conn) {
 	due = 0;
 	inner = Ref<GDPostgresCallInternal>(Object::cast_to<GDPostgresCallInternal>(signal.get_object()));
 	if (inner.is_null()) {
-		fail_later(R::err("postgres pool query did not start", Err::INTERRUPTED));
+		fail_later(pg_fail("postgres pool query did not start", Err::INTERRUPTED));
 		return;
 	}
 	inner->pool_call = this; // Deliver directly into pool-operation state without an internal signal round trip.
-	inner->shared = true;
 	args = Array(); // Release the waiting snapshot after transferring arguments to the query.
 	sql = String();
 }
 
 // Deliver connection results to the caller.
-void GDPostgresPoolCall::answered(const Ref<R> &p_result) {
+void GDPostgresPoolCall::answered(const VariantPair &p_result) {
 	if (notified || delivery_posted) {
 		return;
 	}
@@ -2996,7 +3152,7 @@ void GDPostgresPoolCall::answered(const Ref<R> &p_result) {
 void GDPostgresPoolCall::settled() {
 	if (kind == PG_POOL_ROWS && !notified && stream.is_valid()) {
 		if (!delivery_posted) {
-			post_result(R::ok(stream), true);
+			post_result(pg_ok(stream), true);
 		} else {
 			release();
 		}
@@ -3006,76 +3162,88 @@ void GDPostgresPoolCall::settled() {
 }
 
 // Deliver pool-side failures on the next turn.
-void GDPostgresPoolCall::fail_later(const Ref<R> &p_result) {
+void GDPostgresPoolCall::fail_later(const VariantPair &p_result) {
 	if (done || notified || delivery_posted) {
 		return;
 	}
 	finish(p_result);
 }
 
+// Emit the exact completed value and its existing error details.
+void GDPostgresPoolCall::emit_result(const VariantPair &p_result) {
+	Async::finish(this, SNAME("finished"), p_result.value, p_result.error);
+}
+
 // Deliver the retained result once from the completion queue.
 void GDPostgresPoolCall::deliver() {
 	delivery_posted = false;
-	if (notified || pending.is_null()) {
+	if (notified || !pending_ready) {
 		return;
 	}
-	const Ref<R> out = pending;
-	pending.unref();
+	const VariantPair out = pending;
+	pending = VariantPair();
+	pending_ready = false;
 	notified = true;
 	Ref<GDPostgresPoolCall> keep(this);
-	emit_signal("finished", out);
+	emit_result(out);
 }
 
 // Deliver the exclusive transaction connection after its receiver attaches to the signal.
 void GDPostgresPoolCall::deliver_lease() {
 	delivery_posted = false;
-	if (done || notified || pending.is_null()) {
+	if (done || notified || !pending_ready) {
 		return;
 	}
 	if (conn.is_null() || !conn->is_open() || pool.is_null() || !pool->leased.has(conn.ptr())) {
-		pending.unref();
-		finish(R::err("postgres pool was closed before acquire", Err::INTERRUPTED));
+		pending = VariantPair();
+		pending_ready = false;
+		finish(pg_fail("postgres pool was closed before acquire", Err::INTERRUPTED));
 		return;
 	}
 	if (due > 0 && GDClock::msec() >= due) {
-		pending.unref();
-		finish(R::err("postgres pool wait timed out", Err::TIMED_OUT));
+		pending = VariantPair();
+		pending_ready = false;
+		finish(pg_fail("postgres pool wait timed out", Err::TIMED_OUT));
 		return;
 	}
-	const Ref<R> out = pending;
-	pending.unref();
+	const VariantPair out = pending;
+	pending = VariantPair();
+	pending_ready = false;
 	notified = true;
 	Ref<GDPostgresPoolCall> keep(this);
-	emit_signal("finished", out);
+	emit_result(out);
 }
 
 // Deliver sequential Rows while retaining the connection through the protocol boundary.
 void GDPostgresPoolCall::deliver_stream() {
 	delivery_posted = false;
-	if (notified || pending.is_null()) {
+	if (notified || !pending_ready) {
 		return;
 	}
 	if (!done && (conn.is_null() || !conn->is_open() || pool.is_null() || !pool->leased.has(conn.ptr()))) {
-		pending.unref();
+		pending = VariantPair();
+		pending_ready = false;
 		stream->close();
 		stream.unref();
-		finish(R::err("postgres pool was closed before Rows started", Err::INTERRUPTED));
+		finish(pg_fail("postgres pool was closed before Rows started", Err::INTERRUPTED));
 		return;
 	}
-	const Ref<R> out = pending;
-	pending.unref();
+	const VariantPair out = pending;
+	pending = VariantPair();
+	pending_ready = false;
 	notified = true;
 	Ref<GDPostgresPoolCall> keep(this);
 	stream.unref();
-	emit_signal("finished", out);
+	emit_result(out);
 }
 
 // Retain a result and schedule it once for the next event-loop turn.
-void GDPostgresPoolCall::post_result(const Ref<R> &p_result, bool p_release) {
+void GDPostgresPoolCall::post_result(const VariantPair &p_result, bool p_release) {
 	if (notified || delivery_posted) {
 		return;
 	}
 	pending = p_result;
+	pending_ready = true;
 	delivery_posted = true;
 	Async::post(Ref<RefCounted>(this), callable_mp(this, &GDPostgresPoolCall::deliver));
 	if (p_release) {
@@ -3084,7 +3252,7 @@ void GDPostgresPoolCall::post_result(const Ref<R> &p_result, bool p_release) {
 }
 
 // Return the borrowed connection and enqueue the retained result for completion.
-void GDPostgresPoolCall::finish(const Ref<R> &p_result) {
+void GDPostgresPoolCall::finish(const VariantPair &p_result) {
 	if (done || notified || delivery_posted) {
 		return;
 	}
@@ -3107,103 +3275,107 @@ void GDPostgresPoolCall::release() {
 	args = Array();
 	sql = String();
 	if (owner.is_valid() && used.is_valid()) {
-		owner->released(used, pool_exclusive(kind));
+		owner->released(used);
 	}
 	self_hold.unref();
 }
 
-// Remove waiting operations from the queue or cancel only their active connection query.
+// Remove waiting operations or close the borrowed connection to stop active work.
 void GDPostgresPoolCall::cancel() {
 	if (done) {
 		return;
 	}
-	if (inner.is_valid()) {
-		if (kind == PG_POOL_ROWS) {
-			const Ref<R> cancelled = R::err("cancelled", Err::INTERRUPTED);
-			if (delivery_posted && !notified) {
-				pending = cancelled;
-			} else {
-				post_result(cancelled, false);
-			}
-			inner->close_stream();
-		} else {
-			inner->cancel();
-		}
+	if (conn.is_valid()) {
+		conn->close();
+		if (kind == PG_POOL_ACQUIRE && notified) release();
 		return;
 	}
 	if (pool.is_valid()) {
 		pool->cancel_wait(this);
 	}
-	fail_later(R::err("cancelled", Err::INTERRUPTED));
+	fail_later(pg_fail("cancelled", Err::INTERRUPTED));
+}
+
+// Free a pool slot when its abandoned query cannot be safely awaited.
+void GDPostgresPoolCall::abort() {
+	if (done) return;
+	if (conn.is_valid()) conn->close();
+	else cancel();
 }
 
 // Register completion signals and cancellation.
 void GDPostgresPoolCall::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDPostgresPoolCall::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ClassDB::bind_method(D_METHOD("abort"), &GDPostgresPoolCall::abort);
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value"), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
-// Derive the default maximum connection count from CPUs with a minimum of four.
+// Leave the default connection count uncapped while creating only connections in demand.
 GDPostgresPool::GDPostgresPool() {
-	const int cpus = GDSystem::cpus();
-	default_size = MAX(4, cpus);
+	default_size = INT_MAX;
 	max_open = default_size;
 }
 
-// Retain the factory's maximum connection count; zero selects the CPU-derived default.
+// Retain an explicit factory capacity or select the uncapped default.
 void GDPostgresPool::set_default_size(int64_t p_size) {
-	const int cpus = GDSystem::cpus();
-	default_size = p_size == 0 ? MAX(4, cpus) : (p_size > 0 && p_size <= INT_MAX ? int(p_size) : 0);
+	default_size = p_size == 0 ? INT_MAX : (p_size > 0 && p_size <= INT_MAX ? int(p_size) : 0);
 	max_open = default_size;
 }
 
 // Configure destination and capacity, creating physical connections only as demand requires.
 Signal GDPostgresPool::open(const String &p_host, int64_t p_port, const Dictionary &p_opts, int64_t p_size) {
 	if (p_size < 0 || p_size > INT_MAX) {
-		return Async::ready(R::err("pool size must be between 0 and 2147483647", Err::INVALID_DATA));
+		return Async::ready_pair({ Variant(), Err::make("pool size must be between 0 and 2147483647", Err::INVALID_DATA) });
 	}
 	if (p_host.is_empty() || p_port < Limit::PORT_MIN || p_port > Limit::PORT_MAX) {
-		return Async::ready(R::err("postgres address is invalid", Err::INVALID_DATA));
+		return Async::ready_pair({ Variant(), Err::make("postgres address is invalid", Err::INVALID_DATA) });
 	}
 	const int want = p_size > 0 ? int(p_size) : default_size;
 	if (want < 1) {
-		return Async::ready(R::err("pool size must be a positive 32-bit integer", Err::INVALID_DATA));
+		return Async::ready_pair({ Variant(), Err::make("pool size must be a positive 32-bit integer", Err::INVALID_DATA) });
 	}
 	uint64_t wait = 0;
 	uint64_t connect_wait = 0;
-	if (!Limit::seconds_ms(p_opts.get("timeout", 0.0), wait) ||
-			!Limit::seconds_ms(p_opts.get("connect_timeout", double(WAIT_MS) / 1000.0), connect_wait)) {
-		return Async::ready(R::err("timeouts must be zero or a positive number of seconds", Err::INVALID_DATA));
+	int64_t idle = 2;
+	if (!DbOption::seconds(p_opts, "timeout", 0.0, wait) ||
+			!DbOption::seconds(p_opts, "connect_timeout", 0.0, connect_wait)) {
+		return Async::ready_pair({ Variant(), Err::make("timeouts must be zero or a positive number of seconds", Err::INVALID_DATA) });
 	}
-	const String auth = p_opts.get("auth", "any");
+	if (!DbOption::integer(p_opts, "max_idle", 2, idle) || idle > INT_MAX) {
+		return Async::ready_pair({ Variant(), Err::make("max_idle must be a 32-bit integer", Err::INVALID_DATA) });
+	}
+	String auth, ca_path;
 	Wire::Guard guard;
-	if ((auth != "any" && auth != "scram" && auth != "md5") ||
+	if (!DbOption::text(p_opts, "auth", "any", auth) || !DbOption::text(p_opts, "ca", "", ca_path) || !pg_credentials(p_opts) ||
+			(auth != "any" && auth != "scram" && auth != "md5") ||
 			!Wire::guard_of(p_opts.get("tls", Wire::default_guard(p_host)), guard)) {
-		return Async::ready(R::err("postgres pool connection options are invalid", Err::INVALID_DATA));
+		return Async::ready_pair({ Variant(), Err::make("postgres pool connection options are invalid", Err::INVALID_DATA) });
 	}
 	close();
 	host = p_host;
 	port = int(p_port);
 	opts = p_opts.duplicate(true);
+	opts.erase("max_idle");
 	max_open = want;
+	max_idle = int(MIN(int64_t(want), MAX(int64_t(0), idle)));
 	query_wait_ms = wait;
 	configured = true;
-	return Async::ready(R::ok());
+	return Async::ready_pair({ Variant(), Variant() });
 }
 
-// Prefer idle connections, then share the least busy after lazy growth reaches capacity.
-Ref<GDPostgresClient> GDPostgresPool::pick(bool p_exclusive) const {
-	Ref<GDPostgresClient> best;
+// Borrow only an idle connection so independent operations cannot affect one another.
+Ref<GDPostgresClient> GDPostgresPool::pick() const {
 	for (const Ref<GDPostgresClient> &c : conns) {
 		if (c.is_null() || !c->is_open() || c->tx_status != 'I' || leased.has(c.ptr())) {
 			continue;
 		}
-		if (c->in_flight() == 0) return c;
-		if (best.is_null() || c->in_flight() < best->in_flight()) {
-			best = c;
-		}
+		if (c->in_flight() != 0) continue;
+		// Detect an idle peer close before assigning a new query to this connection.
+		c->sock.poll();
+		if (c->is_open()) return c;
+		c->close();
 	}
-	return p_exclusive || opening > 0 || conns.size() < max_open ? Ref<GDPostgresClient>() : best;
+	return Ref<GDPostgresClient>();
 }
 
 // Borrow a connection, waiting in arrival order when all are occupied.
@@ -3221,10 +3393,9 @@ Signal GDPostgresPool::send(int p_kind, const String &p_sql, const Array &p_args
 	call->max_rows = p_max_rows;
 	call->max_bytes = p_max_bytes;
 	call->due = deadline_after(query_wait_ms);
-	const bool exclusive = pool_exclusive(p_kind);
-	const Ref<GDPostgresClient> c = waits.is_empty() ? pick(exclusive) : Ref<GDPostgresClient>();
+	const Ref<GDPostgresClient> c = waits.is_empty() ? pick() : Ref<GDPostgresClient>();
 	if (c.is_valid()) {
-		if (exclusive) leased.insert(c.ptr());
+		leased.insert(c.ptr());
 		call->start(c);
 	} else {
 		call->args = p_args.duplicate(true);
@@ -3254,6 +3425,31 @@ void GDPostgresPool::trim_closed() {
 	}
 }
 
+// Release idle connections above the configured retention count.
+void GDPostgresPool::trim_idle(const Ref<GDPostgresClient> &p_preferred) {
+	if (!configured) return;
+	int idle = 0;
+	for (const Ref<GDPostgresClient> &conn : conns) {
+		if (conn.is_valid() && conn->is_open() && conn->tx_status == 'I' && conn->in_flight() == 0 && !leased.has(conn.ptr())) idle++;
+	}
+	if (idle <= max_idle) return;
+	if (p_preferred.is_valid() && p_preferred->is_open() && p_preferred->tx_status == 'I' &&
+			p_preferred->in_flight() == 0 && !leased.has(p_preferred.ptr())) {
+		p_preferred->close();
+		max_idle_closed++;
+		idle--;
+	}
+	for (int i = conns.size() - 1; i >= 0 && idle > max_idle; i--) {
+		const Ref<GDPostgresClient> &conn = conns[i];
+		if (conn.is_valid() && conn->is_open() && conn->tx_status == 'I' && conn->in_flight() == 0 && !leased.has(conn.ptr())) {
+			conn->close();
+			max_idle_closed++;
+			idle--;
+		}
+	}
+	trim_closed();
+}
+
 // Create only the missing connections needed by waiters; capacity is not a preallocation target.
 void GDPostgresPool::grow() {
 	trim_closed();
@@ -3267,7 +3463,7 @@ void GDPostgresPool::grow() {
 }
 
 // Adopt a lazy connection or report its failure to the corresponding first waiter.
-void GDPostgresPool::opened(const Ref<R> &p_result, const Ref<GDPostgresClient> &p_conn, uint64_t p_generation) {
+void GDPostgresPool::opened(const Variant &p_value, const Variant &p_error, const Ref<GDPostgresClient> &p_conn, uint64_t p_generation) {
 	if (!configured || p_generation != generation) {
 		if (p_conn.is_valid()) {
 			p_conn->close();
@@ -3275,15 +3471,16 @@ void GDPostgresPool::opened(const Ref<R> &p_result, const Ref<GDPostgresClient> 
 		return;
 	}
 	opening = MAX(0, opening - 1);
-	if (p_result.is_valid() && p_result->get_ok() && p_conn.is_valid() && p_conn->is_open()) {
+	if (p_error.get_type() == Variant::NIL && p_conn.is_valid() && p_conn->is_open()) {
 		conns.push_back(p_conn);
 	} else if (!waits.is_empty()) {
 		Ref<GDPostgresPoolCall> call = waits.front()->get();
 		record_wait(call.ptr());
 		waits.pop_front();
-		call->fail_later(p_result.is_valid() ? p_result : R::err("postgres connection failed", Err::INTERRUPTED));
+		call->fail_later(p_error.get_type() == Variant::OBJECT ? pg_fail(Ref<Err>(p_error), Err::NONE, p_value) : pg_fail("postgres connection failed", Err::INTERRUPTED));
 	}
 	dispatch();
+	trim_idle(p_conn);
 }
 
 // Accumulate each acquisition wait once.
@@ -3334,9 +3531,9 @@ void GDPostgresPool::step() {
 	}
 	sync_wait();
 	for (const Ref<GDPostgresPoolCall> &call : expired) {
-		call->fail_later(R::err("postgres pool wait timed out", Err::TIMED_OUT));
+		call->fail_later(pg_fail("postgres pool wait timed out", Err::TIMED_OUT));
 	}
-	dispatch(); // Removing an exclusive waiter can unblock shared queries on busy connections.
+	dispatch(); // Expired waiters no longer block later acquisitions.
 }
 
 // Assign available connections to waiting queries in arrival order.
@@ -3344,8 +3541,7 @@ void GDPostgresPool::dispatch() {
 	if (!configured) return; // Closing connections may synchronously release canceled operations.
 	trim_closed();
 	while (!waits.is_empty()) {
-		const bool exclusive = pool_exclusive(waits.front()->get()->kind);
-		const Ref<GDPostgresClient> c = pick(exclusive);
+		const Ref<GDPostgresClient> c = pick();
 		if (c.is_null()) {
 			grow();
 			sync_wait();
@@ -3355,10 +3551,10 @@ void GDPostgresPool::dispatch() {
 		record_wait(call.ptr());
 		waits.pop_front();
 		if (call->done || (call->due > 0 && GDClock::msec() >= call->due)) {
-			call->fail_later(R::err("postgres pool wait timed out", Err::TIMED_OUT));
+			call->fail_later(pg_fail("postgres pool wait timed out", Err::TIMED_OUT));
 			continue;
 		}
-		if (exclusive) leased.insert(c.ptr());
+		leased.insert(c.ptr());
 		call->start(c);
 	}
 	sync_wait();
@@ -3376,15 +3572,16 @@ void GDPostgresPool::cancel_wait(GDPostgresPoolCall *p_call) {
 }
 
 // Lend a completed query's connection to the next waiter.
-void GDPostgresPool::released(const Ref<GDPostgresClient> &p_conn, bool p_exclusive) {
-	if (p_exclusive && p_conn.is_valid()) {
+void GDPostgresPool::released(const Ref<GDPostgresClient> &p_conn) {
+	if (p_conn.is_valid()) {
 		leased.erase(p_conn.ptr());
 	}
 	// A returned connection must not transfer an unfinished transaction to another caller.
-	if (p_conn.is_valid() && p_conn->is_open() && (p_conn->tx_status != 'I' || (p_exclusive && p_conn->in_flight() > 0))) {
+	if (p_conn.is_valid() && p_conn->is_open() && (p_conn->tx_status != 'I' || p_conn->in_flight() > 0)) {
 		p_conn->close();
 	}
 	dispatch();
+	trim_idle(p_conn);
 }
 
 // Report an unopened pool only after the caller can attach its waiter.
@@ -3392,7 +3589,7 @@ Signal GDPostgresPool::no_conn() {
 	Ref<GDPostgresCallInternal> call;
 	call.instantiate();
 	call->self_hold = call;
-	call->fail_later(R::err("pool is not open", Err::NOT_FOUND));
+	call->fail_later(pg_fail("pool is not open", Err::NOT_FOUND));
 	return Signal(call.ptr(), "finished");
 }
 
@@ -3480,7 +3677,7 @@ void GDPostgresPool::close() {
 	opts = Dictionary();
 	query_wait_ms = 0;
 	for (const Ref<GDPostgresPoolCall> &call : pending) {
-		call->fail_later(R::err("pool is closed", Err::INTERRUPTED));
+		call->fail_later(pg_fail("pool is closed", Err::INTERRUPTED));
 	}
 }
 
@@ -3506,13 +3703,13 @@ Dictionary GDPostgresPool::stats() const {
 		}
 	}
 	Dictionary out;
-	out["max_open_connections"] = max_open;
+	out["max_open_connections"] = max_open == INT_MAX ? 0 : max_open;
 	out["open_connections"] = open;
 	out["in_use"] = used;
 	out["idle"] = open - used;
 	out["wait_count"] = wait_count;
 	out["wait_duration_ms"] = wait_usec / 1000;
-	out["max_idle_closed"] = int64_t(0); // This pool does not close connections to reduce idle count.
+	out["max_idle_closed"] = max_idle_closed;
 	out["max_idle_time_closed"] = int64_t(0); // No idle timeout is configured.
 	out["max_lifetime_closed"] = int64_t(0); // No connection lifetime is configured.
 	return out;
@@ -3547,28 +3744,28 @@ void GDPostgresPool::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("fetch_values_many_async", "sql", "rows"), &GDPostgresPool::fetch_values_many);
 	ClassDB::bind_method(D_METHOD("fetch_flat_many_async", "sql", "rows"), &GDPostgresPool::fetch_flat_many);
 	ClassDB::bind_method(D_METHOD("exec_many_async", "sql", "rows"), &GDPostgresPool::exec_many);
-	ADD_AWAIT("open", "R:Variant");
-	ADD_AWAIT("query", "R:Dictionary");
-	ADD_AWAIT("query_row", "R:Dictionary");
-	ADD_AWAIT("query_rows", "R:GDDatabaseRows");
-	ADD_AWAIT("query_values", "R:Dictionary");
-	ADD_AWAIT("query_flat", "R:Dictionary");
-	ADD_AWAIT("query_many", "R:Array");
-	ADD_AWAIT("fetch_many", "R:Array");
-	ADD_AWAIT("fetch_values_many", "R:Array");
-	ADD_AWAIT("fetch_flat_many", "R:Array");
-	ADD_AWAIT("exec_many", "R:int");
-	ADD_AWAIT("open_async", "R:Variant");
-	ADD_AWAIT("query_async", "R:Dictionary");
-	ADD_AWAIT("query_row_async", "R:Dictionary");
-	ADD_AWAIT("query_rows_async", "R:GDDatabaseRows");
-	ADD_AWAIT("query_values_async", "R:Dictionary");
-	ADD_AWAIT("query_flat_async", "R:Dictionary");
-	ADD_AWAIT("query_many_async", "R:Array");
-	ADD_AWAIT("fetch_many_async", "R:Array");
-	ADD_AWAIT("fetch_values_many_async", "R:Array");
-	ADD_AWAIT("fetch_flat_many_async", "R:Array");
-	ADD_AWAIT("exec_many_async", "R:int");
+	ADD_AWAIT("open", "Pair:Variant");
+	ADD_AWAIT("query", "Pair:Dictionary");
+	ADD_AWAIT("query_row", "Pair:Dictionary");
+	ADD_AWAIT("query_rows", "Pair:GDDatabaseRows");
+	ADD_AWAIT("query_values", "Pair:Dictionary");
+	ADD_AWAIT("query_flat", "Pair:Dictionary");
+	ADD_AWAIT("query_many", "Pair:Array");
+	ADD_AWAIT("fetch_many", "Pair:Array");
+	ADD_AWAIT("fetch_values_many", "Pair:Array");
+	ADD_AWAIT("fetch_flat_many", "Pair:Array");
+	ADD_AWAIT("exec_many", "Pair:int");
+	ADD_AWAIT("open_async", "Pair:Variant");
+	ADD_AWAIT("query_async", "Pair:Dictionary");
+	ADD_AWAIT("query_row_async", "Pair:Dictionary");
+	ADD_AWAIT("query_rows_async", "Pair:GDDatabaseRows");
+	ADD_AWAIT("query_values_async", "Pair:Dictionary");
+	ADD_AWAIT("query_flat_async", "Pair:Dictionary");
+	ADD_AWAIT("query_many_async", "Pair:Array");
+	ADD_AWAIT("fetch_many_async", "Pair:Array");
+	ADD_AWAIT("fetch_values_many_async", "Pair:Array");
+	ADD_AWAIT("fetch_flat_many_async", "Pair:Array");
+	ADD_AWAIT("exec_many_async", "Pair:int");
 	ADD_AUTO_WAIT("open");
 	ADD_AUTO_WAIT("query");
 	ADD_AUTO_WAIT("query_row");
@@ -3610,28 +3807,28 @@ void GDPostgresClient::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("fetch_values_many_async", "sql", "rows"), &GDPostgresClient::fetch_values_many);
 	ClassDB::bind_method(D_METHOD("fetch_flat_many_async", "sql", "rows"), &GDPostgresClient::fetch_flat_many);
 	ClassDB::bind_method(D_METHOD("exec_many_async", "sql", "rows"), &GDPostgresClient::exec_many);
-	ADD_AWAIT("open", "R:Variant");
-	ADD_AWAIT("query", "R:Dictionary");
-	ADD_AWAIT("query_row", "R:Dictionary");
-	ADD_AWAIT("query_rows", "R:GDDatabaseRows");
-	ADD_AWAIT("query_values", "R:Dictionary");
-	ADD_AWAIT("query_flat", "R:Dictionary");
-	ADD_AWAIT("query_many", "R:Array");
-	ADD_AWAIT("fetch_many", "R:Array");
-	ADD_AWAIT("fetch_values_many", "R:Array");
-	ADD_AWAIT("fetch_flat_many", "R:Array");
-	ADD_AWAIT("exec_many", "R:int");
-	ADD_AWAIT("open_async", "R:Variant");
-	ADD_AWAIT("query_async", "R:Dictionary");
-	ADD_AWAIT("query_row_async", "R:Dictionary");
-	ADD_AWAIT("query_rows_async", "R:GDDatabaseRows");
-	ADD_AWAIT("query_values_async", "R:Dictionary");
-	ADD_AWAIT("query_flat_async", "R:Dictionary");
-	ADD_AWAIT("query_many_async", "R:Array");
-	ADD_AWAIT("fetch_many_async", "R:Array");
-	ADD_AWAIT("fetch_values_many_async", "R:Array");
-	ADD_AWAIT("fetch_flat_many_async", "R:Array");
-	ADD_AWAIT("exec_many_async", "R:int");
+	ADD_AWAIT("open", "Pair:Variant");
+	ADD_AWAIT("query", "Pair:Dictionary");
+	ADD_AWAIT("query_row", "Pair:Dictionary");
+	ADD_AWAIT("query_rows", "Pair:GDDatabaseRows");
+	ADD_AWAIT("query_values", "Pair:Dictionary");
+	ADD_AWAIT("query_flat", "Pair:Dictionary");
+	ADD_AWAIT("query_many", "Pair:Array");
+	ADD_AWAIT("fetch_many", "Pair:Array");
+	ADD_AWAIT("fetch_values_many", "Pair:Array");
+	ADD_AWAIT("fetch_flat_many", "Pair:Array");
+	ADD_AWAIT("exec_many", "Pair:int");
+	ADD_AWAIT("open_async", "Pair:Variant");
+	ADD_AWAIT("query_async", "Pair:Dictionary");
+	ADD_AWAIT("query_row_async", "Pair:Dictionary");
+	ADD_AWAIT("query_rows_async", "Pair:GDDatabaseRows");
+	ADD_AWAIT("query_values_async", "Pair:Dictionary");
+	ADD_AWAIT("query_flat_async", "Pair:Dictionary");
+	ADD_AWAIT("query_many_async", "Pair:Array");
+	ADD_AWAIT("fetch_many_async", "Pair:Array");
+	ADD_AWAIT("fetch_values_many_async", "Pair:Array");
+	ADD_AWAIT("fetch_flat_many_async", "Pair:Array");
+	ADD_AWAIT("exec_many_async", "Pair:int");
 	ADD_AUTO_WAIT("open");
 	ADD_AUTO_WAIT("query");
 	ADD_AUTO_WAIT("query_row");
@@ -3646,9 +3843,9 @@ void GDPostgresClient::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_open"), &GDPostgresClient::is_open);
 	ClassDB::bind_method(D_METHOD("close"), &GDPostgresClient::close);
 	ClassDB::bind_method(D_METHOD("check", "sql"), &GDPostgresClient::check);
-	ADD_AWAIT("check", "R:Variant");
+	ADD_AWAIT("check", "Pair:Variant");
 	ClassDB::bind_method(D_METHOD("check_async", "sql"), &GDPostgresClient::check);
-	ADD_AWAIT("check_async", "R:Variant");
+	ADD_AWAIT("check_async", "Pair:Variant");
 	ADD_AUTO_WAIT("check");
 	ClassDB::bind_method(D_METHOD("in_flight"), &GDPostgresClient::in_flight);
 	ClassDB::bind_method(D_METHOD("cached_stmts"), &GDPostgresClient::cached_stmts);

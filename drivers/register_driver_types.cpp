@@ -35,15 +35,38 @@
 #ifdef ACCESSKIT_ENABLED
 #include "drivers/accesskit/accessibility_server_accesskit.h"
 #endif
+#ifdef GD_VIEW
+#include "drivers/png/image_loader_png.h"
+#include "drivers/png/resource_saver_png.h"
+#endif
 
-// Keep image loading and saving in the optional game layer.
+#ifdef GD_VIEW
+static Ref<ImageLoaderPNG> image_loader_png;
+static Ref<ResourceSaverPNG> resource_saver_png;
+#endif
+
 void register_core_driver_types() {
 #ifdef ACCESSKIT_ENABLED
 	AccessibilityServerAccessKit::register_create_func();
 #endif
+#ifdef GD_VIEW
+	image_loader_png.instantiate();
+	ImageLoader::add_image_format_loader(image_loader_png);
+
+	resource_saver_png.instantiate();
+	ResourceSaver::add_resource_format_saver(resource_saver_png);
+#endif
 }
 
-void unregister_core_driver_types() {}
+void unregister_core_driver_types() {
+#ifdef GD_VIEW
+	ImageLoader::remove_image_format_loader(image_loader_png);
+	image_loader_png.unref();
+
+	ResourceSaver::remove_resource_format_saver(resource_saver_png);
+	resource_saver_png.unref();
+#endif
+}
 
 void register_driver_types() {
 }

@@ -34,7 +34,7 @@ class GDTCPCall : public RefCounted {
 	bool writing = false; // Whether this is a write operation.
 
 	friend class GDTCPConn;
-	void done(const Ref<R> &p_result);
+	void done(const VariantPair &p_result);
 
 protected:
 	static void _bind_methods();
@@ -51,7 +51,7 @@ class GDTCPDialCall : public RefCounted {
 	struct Lane {
 		PackedStringArray addresses; // Candidates belonging to one address family.
 		Ref<GDStream> peer; // Connection currently attempted in this family.
-		Ref<R> error; // First error returned if all candidates fail.
+		Ref<Err> error; // First error returned if all candidates fail.
 		int next = 0; // Next candidate to attempt.
 		int retries = 0; // Ephemeral-port reselection count, not an address-candidate limit.
 		uint64_t due = 0; // Deadline allocated to the current candidate.
@@ -67,11 +67,11 @@ class GDTCPDialCall : public RefCounted {
 	bool prepared = false; // Whether name resolution has completed.
 	Signal lookup; // This connection's independent lookup wait.
 
-	void resolved(const Ref<R> &p_result);
+	void resolved(const Variant &p_value, const Ref<Err> &p_error);
 	void step();
 	bool advance(Lane &p_lane); // Try candidates in order within one family.
 	void arm_deadline(); // Combine candidate, fallback, and overall deadlines into one notification.
-	void done(const Ref<R> &p_result);
+	void done(const VariantPair &p_result);
 	void watch(bool p_on);
 
 protected:
@@ -97,6 +97,7 @@ class GDTCPConn : public RefCounted {
 	uint64_t write_due = 0; // Deadline for new and pending writes.
 	uint64_t due = 0; // Earliest deadline registered with the kernel wait.
 	bool watching = false; // Active only while operations are pending.
+	bool upgrading = false; // Reserve plaintext transport from the start of TLS preparation.
 
 	friend class GDTCPCall;
 	friend class GDTCPDialCall;
@@ -107,7 +108,7 @@ class GDTCPConn : public RefCounted {
 	void watch(bool p_on);
 	void arm_deadline();
 	void cancel_call(GDTCPCall *p_call);
-	void fail_all(const Ref<R> &p_result);
+	void fail_all(const VariantPair &p_result);
 	static Ref<GDTCPConn> take(const Ref<GDStream> &p_peer);
 	static Ref<GDTCPConn> take_tls(const Ref<GDStream> &p_peer, const Ref<GDTLS> &p_tls, const String &p_name);
 
@@ -119,9 +120,12 @@ public:
 	Signal read_async(int64_t p_max) { return read(p_max); }
 	Signal write(const PackedByteArray &p_data);
 	Signal write_async(const PackedByteArray &p_data) { return write(p_data); }
-	Ref<R> set_deadline(double p_seconds);
-	Ref<R> set_read_deadline(double p_seconds);
-	Ref<R> set_write_deadline(double p_seconds);
+	// Upgrade a quiet plaintext connection to verified TLS.
+	Signal start_tls(const String &p_host, const Dictionary &p_opts);
+	Signal start_tls_async(const String &p_host, const Dictionary &p_opts) { return start_tls(p_host, p_opts); }
+	Ref<Err> set_deadline(double p_seconds);
+	Ref<Err> set_read_deadline(double p_seconds);
+	Ref<Err> set_write_deadline(double p_seconds);
 	Dictionary local_addr() const;
 	Dictionary remote_addr() const;
 	Dictionary connection_state() const;
@@ -136,6 +140,7 @@ class GDTLSDialCall : public RefCounted {
 
 	Ref<GDTLSDialCall> self_hold;
 	Ref<GDStream> peer; // Native TCP connection selected from all candidates.
+	Ref<GDTCPConn> source; // Existing plaintext connection retained during an upgrade.
 	Ref<GDTLS> tls; // Encryption state over the native connection.
 	Signal pending; // TCP connection wait receiving cancellation.
 	String host;
@@ -149,11 +154,12 @@ class GDTLSDialCall : public RefCounted {
 	bool insecure = false; // Disable certificate verification only on explicit request.
 	bool watching = false; // Whether event-loop notifications are attached.
 
-	void prepared(const Ref<R> &p_result);
-	void connected(const Ref<R> &p_result); // Start the TLS handshake after TCP completion.
+	void prepared(const Variant &p_value, const Ref<Err> &p_error);
+	void connected(const Variant &p_value, const Ref<Err> &p_error); // Start the TLS handshake after TCP completion.
 	void step();
-	void done(const Ref<R> &p_result);
+	void done(const VariantPair &p_result);
 	void watch(bool p_on);
+	static Signal start_with_source(const String &p_host, int64_t p_port, const Dictionary &p_opts, const Ref<GDTCPConn> &p_source);
 
 protected:
 	static void _bind_methods();
@@ -161,6 +167,8 @@ protected:
 public:
 	// Start a TLS connection and return its completion signal.
 	static Signal start(const String &p_host, int64_t p_port, const Dictionary &p_opts);
+	// Handshake on an existing TCP stream after its plaintext protocol permits the switch.
+	static Signal start_on_conn(const Ref<GDTCPConn> &p_conn, const String &p_host, const Dictionary &p_opts);
 	// Cancel all handshake waits at process shutdown.
 	static void shutdown_all();
 	// Cancel connection setup and the handshake.
@@ -176,7 +184,7 @@ class GDTCPAcceptCall : public RefCounted {
 	uint64_t due = 0; // Deadline, or zero for no deadline.
 
 	friend class GDTCPListener;
-	void done(const Ref<R> &p_result);
+	void done(const VariantPair &p_result);
 
 protected:
 	static void _bind_methods();
@@ -206,10 +214,10 @@ protected:
 	static void _bind_methods();
 
 public:
-	static Ref<R> listen(const String &p_host, int64_t p_port);
+	static VariantPair listen(const String &p_host, int64_t p_port);
 	Signal accept();
 	Signal accept_async() { return accept(); }
-	Ref<R> set_deadline(double p_seconds);
+	Ref<Err> set_deadline(double p_seconds);
 	Dictionary addr() const;
 	bool is_open() const;
 	void close();
@@ -230,7 +238,7 @@ class GDUDPCall : public RefCounted {
 	bool writing = false; // Whether this is a send operation.
 
 	friend class GDUDPPacketConn;
-	void done(const Ref<R> &p_result);
+	void done(const VariantPair &p_result);
 
 protected:
 	static void _bind_methods();
@@ -257,20 +265,20 @@ class GDUDPPacketConn : public RefCounted {
 	void watch(bool p_on);
 	void arm_deadline();
 	void cancel_call(GDUDPCall *p_call);
-	void fail_all(const Ref<R> &p_result);
+	void fail_all(const VariantPair &p_result);
 
 protected:
 	static void _bind_methods();
 
 public:
-	static Ref<R> listen(const String &p_host, int64_t p_port, int64_t p_buffer);
+	static VariantPair listen(const String &p_host, int64_t p_port, int64_t p_buffer);
 	Signal read_from(int64_t p_max);
 	Signal read_from_async(int64_t p_max) { return read_from(p_max); }
 	Signal write_to(const PackedByteArray &p_data, const String &p_host, int64_t p_port);
 	Signal write_to_async(const PackedByteArray &p_data, const String &p_host, int64_t p_port) { return write_to(p_data, p_host, p_port); }
-	Ref<R> set_deadline(double p_seconds);
-	Ref<R> set_read_deadline(double p_seconds);
-	Ref<R> set_write_deadline(double p_seconds);
+	Ref<Err> set_deadline(double p_seconds);
+	Ref<Err> set_read_deadline(double p_seconds);
+	Ref<Err> set_write_deadline(double p_seconds);
 	Dictionary addr() const;
 	bool is_open() const;
 	void close();

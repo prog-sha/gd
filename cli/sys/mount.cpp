@@ -15,6 +15,7 @@
 #include "cli/sys/source_error.h"
 
 #include "core/os/os.h"
+#include "core/templates/vector.h"
 
 #ifdef UNIX_ENABLED
 #include <errno.h>
@@ -40,7 +41,6 @@ const char *Mount::ROOT = "/";
 #ifdef UNIX_ENABLED
 namespace {
 constexpr int SYMLINK_MAX = 255; // Maximum symbolic links followed during path resolution.
-constexpr int SYMLINK_SIZE_MAX = PATH_MAX; // OS-representable symlink-target byte boundary.
 } // namespace
 
 // Pin existing internal storage without following symlinks and verify ownership and permissions.
@@ -76,11 +76,13 @@ Mount::At::~At() {
 }
 
 // Scheme names reserved by runtime and network APIs.
+static const char *const RESERVED[] = { "res", "user", "uid", "pipe", "local", "libgodot",
+	"tcp", "unix", "http", "https", "file", "data", "cache", "pkg", "global", nullptr };
+
+// Check whether a mount name collides with a reserved scheme.
 bool Mount::_reserved(const String &p_name) {
-	static const char *taken[] = { "res", "user", "uid", "pipe", "local", "libgodot",
-		"tcp", "unix", "http", "https", "file", "data", "cache", "pkg", nullptr };
-	for (int i = 0; taken[i]; i++) {
-		if (p_name == taken[i]) {
+	for (int i = 0; RESERVED[i]; i++) {
+		if (p_name == RESERVED[i]) {
 			return true;
 		}
 	}
@@ -139,7 +141,11 @@ Mount::Parse Mount::parse_flag(const String &p_arg) {
 		return BAD;
 	}
 	if (_reserved(name)) {
-		ERR_PRINT(vformat("Mount name \"%s\" is reserved.", name));
+		String names;
+		for (int i = 0; RESERVED[i]; i++) {
+			names += String(i ? ", " : "") + RESERVED[i];
+		}
+		ERR_PRINT(vformat("Mount name \"%s\" is reserved; choose another, such as \"my-%s\". Reserved names: %s.", name, name, names));
 		return BAD;
 	}
 	if (boxes.has(name)) {
@@ -191,16 +197,21 @@ String Mount::_solid(const String &p_path, int p_hops) {
 		}
 
 		// A dangling symlink still exists itself; read its target and resolve again.
-		char buf[SYMLINK_SIZE_MAX]; // Storage for one symlink target.
-		const ssize_t n = ::readlink(head.utf8().get_data(), buf, sizeof(buf));
+		Vector<char> buf; // Grow storage until an unresolved symlink target fits completely.
+		if (buf.resize(256) != OK) return String();
+		ssize_t n = -1;
+		for (;;) {
+			n = ::readlink(head.utf8().get_data(), buf.ptrw(), buf.size());
+			if (n < 0 || n < buf.size()) break;
+			if (buf.size() > INT_MAX / 2 || buf.resize(buf.size() * 2) != OK) return String();
+		}
 		if (n > 0) {
-			// Bound symlink traversal to terminate cycles, rejecting unresolved paths at exhaustion.
-			if (p_hops >= SYMLINK_MAX || (size_t)n >= sizeof(buf)) {
+			// Bound symlink traversal to terminate cycles.
+			if (p_hops >= SYMLINK_MAX) {
 				return String();
 			}
-			buf[n] = 0;
 			String to;
-			if (to.append_utf8(buf) != OK) {
+			if (to.append_utf8(buf.ptr(), n) != OK) {
 				return String();
 			}
 			if (!to.is_absolute_path()) {
@@ -272,7 +283,7 @@ String Mount::_root_of(const String &p_path) {
 
 // Prepare internal storage, verifying existing paths are user-owned directories.
 //
-// The user directory is under a shared temporary root with a predictable working-directory-derived name.
+// The user directory may be under a shared root with a predictable working-directory-derived name.
 // Another user could precreate a symlink or foreign directory at that path.
 // Using it unchecked would redirect script output into the substituted location.
 bool Mount::_own_dir(const String &p_path) {
@@ -348,7 +359,7 @@ bool Mount::_open_roots() {
 
 // Install built-in mounts, preparing internal storage but leaving caller-supplied roots untouched.
 // Do not create a missing caller-supplied root at an unintended location.
-bool Mount::setup() {
+bool Mount::setup(const String &p_global) {
 	GDAssets::init(); // Retain embedded file storage before scripts can replace the executable.
 	// Use the current directory, read-only in strict mode.
 	// Package commands still write gd.json, gd.lock, and pkg/ there on the operator's behalf.
@@ -382,7 +393,50 @@ bool Mount::setup() {
 	if (!_add("cache", cache, pkg_mode, pkg_mode || make_cache)) {
 		return false;
 	}
+	// Expose the operator-selected command directory only during global package management.
+	if (!p_global.is_empty() && (!GDSystem::make_dirs(p_global) || !_add("global", p_global, true, false))) {
+		ERR_PRINT(vformat("cannot prepare global command directory %s", p_global));
+		return false;
+	}
 	return _open_roots();
+}
+
+// Move res:// onto a startup directory other than the working directory.
+// Keep the current root, including its write flag, when the path is empty or ".".
+bool Mount::bind_res(const String &p_path) {
+	if (p_path.is_empty() || p_path == ".") {
+		return true;
+	}
+	Box *cur = boxes.getptr("res");
+	const String root = _root_of(p_path);
+	if (cur && cur->root == root) {
+		return true;
+	}
+	const bool write = cur ? cur->can_write : (!strict || pkg_mode);
+	const bool own = cur ? cur->own : false;
+#ifdef UNIX_ENABLED
+	int old_fd = -1;
+	if (cur && cur->fd >= 0) {
+		old_fd = cur->fd;
+	}
+	const int fd = ::open(root.utf8().get_data(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (fd < 0 && errno != ENOENT) {
+		ERR_PRINT(vformat("cannot hold res:// at \"%s\".", root));
+		return false;
+	}
+	if (old_fd >= 0) {
+		::close(old_fd);
+	}
+#endif
+	Box box;
+	box.root = root;
+	box.can_write = write;
+	box.own = own;
+#ifdef UNIX_ENABLED
+	box.fd = fd;
+#endif
+	boxes["res"] = box;
+	return true;
 }
 
 // Point the private local:// mount at one package checkout.

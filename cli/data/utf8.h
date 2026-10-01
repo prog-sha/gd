@@ -8,7 +8,10 @@
 #include <utility>
 
 // Preserve arbitrary bytes as text when lossless, or as a byte array otherwise.
-Variant utf8_value(const uint8_t *p_data, int64_t p_size, bool p_strict = false);
+VariantPair utf8_value(const uint8_t *p_data, int64_t p_size, bool p_strict = false);
+
+// Decode text only after validating every byte and rejecting embedded NUL.
+VariantPair utf8_text(const uint8_t *p_data, int64_t p_size);
 
 // Retain measurement and encoding progress independently of the owning HTTP operation.
 struct Utf8Text {

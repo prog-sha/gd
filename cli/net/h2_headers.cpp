@@ -141,9 +141,9 @@ bool Connection::State::complete_headers() {
 	}
 	int64_t length = -1;
 	for (const Field &value : fields) {
+		// Reject connection-specific metadata without terminating other streams.
 		if (connection_field(value)) {
-			if (!config.server || trailers) { reset(id,PROTOCOL_ERROR,true); return !broken; }
-			rejection = 400;
+			reset(id,PROTOCOL_ERROR,true); return !broken;
 		}
 		if (value.name == "content-length") {
 			int64_t count;

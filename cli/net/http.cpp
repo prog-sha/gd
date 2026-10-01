@@ -11,10 +11,10 @@
 // Keep parsed values as offsets and lengths instead of allocating strings.
 // Coalesce response framing and cache the date and 200 status line.
 
-#include "modules/gdscript/gdscript_function.h"
 #include "cli/net/http.h"
 #include "cli/net/http_fields.h"
 #include "cli/sys/clock.h"
+#include "cli/sys/source_error.h"
 #include "cli/net/datagram.h"
 
 #include "cli/api/text.h"
@@ -28,10 +28,45 @@
 #include "core/object/class_db.h"
 #include "core/os/os.h"
 #include "core/string/char_utils.h"
+#include "modules/gdscript/gdscript_function.h"
 
 #include <stdio.h>
 #include <string.h>
 
+namespace {
+constexpr char TYPE_TEXT[] = "text/plain; charset=utf-8"; // Wire value for plain text.
+constexpr char TYPE_HTML[] = "text/html; charset=utf-8"; // Wire value for HTML.
+constexpr char TYPE_JSON[] = "application/json"; // Wire value for JSON.
+constexpr char TYPE_BYTES[] = "application/octet-stream"; // Wire value for opaque bytes.
+}
+
+// Return immutable wire bytes for standard content types.
+const char *http_type_bytes(HttpType p_type) {
+	switch (p_type) {
+		case HTTP_TYPE_TEXT: return TYPE_TEXT;
+		case HTTP_TYPE_HTML: return TYPE_HTML;
+		case HTTP_TYPE_JSON: return TYPE_JSON;
+		case HTTP_TYPE_BYTES: return TYPE_BYTES;
+		default: return "";
+	}
+}
+
+// Return fixed lengths so common types need no scan before writing.
+int http_type_size(HttpType p_type) {
+	switch (p_type) {
+		case HTTP_TYPE_TEXT: return sizeof(TYPE_TEXT) - 1;
+		case HTTP_TYPE_HTML: return sizeof(TYPE_HTML) - 1;
+		case HTTP_TYPE_JSON: return sizeof(TYPE_JSON) - 1;
+		case HTTP_TYPE_BYTES: return sizeof(TYPE_BYTES) - 1;
+		default: return 0;
+	}
+}
+
+// Recognize wire types whose bytes can be emitted without UTF-32 conversion.
+HttpType http_type_of(const String &p_type) {
+	for (int kind = HTTP_TYPE_TEXT; kind <= HTTP_TYPE_BYTES; kind++) if (p_type == http_type_bytes(HttpType(kind))) return HttpType(kind);
+	return HTTP_TYPE_CUSTOM;
+}
 namespace {
 
 // Map native TCP EOF to HTTP half-close state while retaining the response direction.
@@ -981,7 +1016,8 @@ void GDWebServer::consume(Conn *p_c) {
 	p_c->reply_status = 0;
 	p_c->reply_body = PackedByteArray();
 	p_c->reply_type = String();
-	p_c->reply_headers = Dictionary();
+	p_c->reply_headers.reset();
+	p_c->reply_kind = HTTP_TYPE_CUSTOM;
 	p_c->reply_waiting = false;
 	p_c->bad = 0;
 	p_c->head_only = false;
@@ -1023,6 +1059,21 @@ void GDWebServer::dispatch_ready() {
 void GDWebServer::listener_ready() {
 	accept_ready = true;
 	post_ready();
+}
+
+// Resume kernel notifications after a temporary accept failure.
+void GDWebServer::accept_retry() {
+	accept_due = 0;
+	if (srv.is_null() || !srv->is_open()) return;
+	srv->read_wait(true);
+	const Ref<Err> failed = srv->wait_error();
+	if (failed.is_valid()) {
+		accept_error = failed->note("cannot resume HTTP listener");
+		ERR_PRINT(accept_error->text());
+		begin_shutdown();
+		return;
+	}
+	listener_ready();
 }
 
 // Enqueue a connection once in the runnable FIFO.
@@ -1140,6 +1191,19 @@ void GDWebServer::forget(int p_id) {
 	conns.erase(p_id);
 }
 
+// End a failed handler without stopping unrelated connections or streams.
+void GDWebServer::abort_request(int p_id) {
+	Conn **found = conns.getptr(p_id);
+	if (!found) return;
+	Conn *c = *found;
+	Conn *parent = h2_parent(c);
+	if (parent) {
+		parent->h2->connection.reset(c->request->stream, GDH2::INTERNAL_ERROR);
+		h2_schedule(parent);
+	}
+	forget(p_id);
+}
+
 // Reclaim connections closed after a flushed response without leaving notification waits.
 bool GDWebServer::reap_closed(Conn *p_c) {
 	if (!p_c || has_output(p_c) || (p_c->sock.is_valid() && p_c->sock->is_open())) {
@@ -1150,42 +1214,43 @@ bool GDWebServer::reap_closed(Conn *p_c) {
 }
 
 // Start an HTTP listener on the specified host and port.
-Ref<R> GDWebServer::listen(int64_t p_port, const String &p_host) {
+VariantPair GDWebServer::listen(int64_t p_port, const String &p_host) {
 	// Match the permission-checked port exactly to the 16-bit value used by bind.
 	if (p_port < 0 || p_port > Limit::PORT_MAX) {
-		return R::err("HTTP listen port must be 0..65535", Err::INVALID_DATA);
+		return { Variant(), Err::make("HTTP listen port must be 0..65535", Err::INVALID_DATA) };
 	}
 	// Check listen permissions before opening the native socket.
 	if (p_port == 0) {
 		if (!Perm::check_net_any_port(p_host)) {
-			return R::err("HTTP listen address is not allowed", Err::PERMISSION_DENIED);
+			return { Variant(), Err::make("HTTP listen address is not allowed", Err::PERMISSION_DENIED) };
 		}
 	} else if (!Perm::check(Perm::NET, vformat("%s:%d", p_host, p_port))) {
-		return R::err("HTTP listen address is not allowed", Err::PERMISSION_DENIED);
+		return { Variant(), Err::make("HTTP listen address is not allowed", Err::PERMISSION_DENIED) };
 	}
 	stop();
+	accept_error.unref();
 	srv.instantiate();
 	const String host = p_host == "*" || p_host.is_empty() ? String("0.0.0.0") : p_host;
 	const Error err = srv->listen(host, int(p_port), share_port);
 	if (err != OK) {
 		srv.unref();
-		return R::err(vformat("cannot listen on %s:%d", p_host, p_port), Err::of(err));
+		return { Variant(), Err::make(vformat("cannot listen on %s:%d", p_host, p_port), Err::of(err)) };
 	}
 	if (p_port == 0 && !Perm::check(Perm::NET, vformat("%s:%d", p_host, get_port()))) {
 		srv->close();
 		srv.unref();
-		return R::err("HTTP listen address is not allowed", Err::PERMISSION_DENIED);
+		return { Variant(), Err::make("HTTP listen address is not allowed", Err::PERMISSION_DENIED) };
 	}
 	// Replace the opening callback with the application's listener task.
 	srv->read_wait(false);
 	srv->set_callback(callable_mp(this, &GDWebServer::listener_ready));
 	srv->read_wait(true);
-	const Ref<R> failed = srv->wait_error();
+	const Ref<Err> failed = srv->wait_error();
 	if (failed.is_valid()) {
 		srv.unref();
-		return failed->note("cannot start HTTP listener");
+		return { Variant(), failed->note("cannot start HTTP listener") };
 	}
-	return R::ok();
+	return {};
 }
 
 // Return the actual listen port, including a kernel-assigned value.
@@ -1277,6 +1342,9 @@ void GDWebServer::abort_files(Conn *p_c) {
 
 // Close the listener and all connections, releasing retained buffers.
 void GDWebServer::stop() {
+	Async::drop_deadline(&accept_due, accept_due);
+	accept_due = 0;
+	accept_delay = 5;
 	Async::drop_deadline(this, due);
 	due = 0;
 	conn_times.clear();
@@ -1305,6 +1373,8 @@ void GDWebServer::stop() {
 
 // Close the listener and idle connections while preserving active requests through their responses.
 void GDWebServer::begin_shutdown() {
+	Async::drop_deadline(&accept_due, accept_due);
+	accept_due = 0;
 	if (srv.is_valid()) {
 		srv->close();
 		srv.unref();
@@ -1359,9 +1429,30 @@ PackedInt32Array GDWebServer::poll() {
 		accept_ready = false;
 		while (srv.is_valid()) {
 			Ref<GDStream> s;
-			if (srv->accept(s) != OK) {
+			const Error accepted = srv->accept(s);
+			if (accepted != OK) {
+				if (accepted == ERR_OUT_OF_MEMORY) {
+					srv->read_wait(false);
+					accept_due = GDClock::msec() + accept_delay;
+					Async::track_deadline(&accept_due, accept_due, callable_mp(this, &GDWebServer::accept_retry));
+					accept_delay = MIN(accept_delay * 2, uint64_t(1000));
+					WARN_PRINT("HTTP accept is waiting for socket resources");
+				} else if (accepted != ERR_BUSY) {
+					Dictionary info;
+					info["syscall"] = "accept";
+					#ifdef WINDOWS_ENABLED
+					SourceError::win32(srv->get_accept_os_error());
+					#else
+					SourceError::posix(srv->get_accept_os_error());
+					#endif
+					const Error reason = SourceError::put(info, accepted);
+					accept_error = Err::make("HTTP accept failed", Err::of(reason), info);
+					ERR_PRINT(vformat("HTTP accept failed: %s", itos(accepted)));
+					begin_shutdown();
+				}
 				break;
 			}
+			accept_delay = 5;
 			Conn *c = memnew(Conn);
 			c->sock.instantiate();
 			c->sock->start(s, identity);
@@ -1715,12 +1806,13 @@ void GDWebServer::drain_body(Conn *p_c) {
 	}
 	p_c->draining = false;
 	if (p_c->reply_waiting) {
-		build_out(p_c, p_c->reply_status, p_c->reply_body, p_c->reply_type, &p_c->reply_headers, true, p_c->reply_file);
+		build_out(p_c, p_c->reply_status, p_c->reply_body, p_c->reply_type, p_c->reply_headers.get(), true, p_c->reply_file, p_c->reply_kind);
 		p_c->reply_status = 0;
 		p_c->reply_body = PackedByteArray();
 		p_c->reply_file.unref();
 		p_c->reply_type = String();
-		p_c->reply_headers = Dictionary();
+		p_c->reply_kind = HTTP_TYPE_CUSTOM;
+		p_c->reply_headers.reset();
 		p_c->reply_waiting = false;
 	} else {
 		consume(p_c);
@@ -1728,8 +1820,8 @@ void GDWebServer::drain_body(Conn *p_c) {
 }
 
 // Drain a small unread body before sending the response.
-void GDWebServer::queue_reply(Conn *p_c, int64_t p_status, const PackedByteArray &p_body, const String &p_type, const Dictionary *p_extra) {
-	if (p_c->request) { h2_reply(p_c, p_status, p_body, p_type, p_extra, Ref<GDBodySource>()); return; }
+void GDWebServer::queue_reply(Conn *p_c, int64_t p_status, const PackedByteArray &p_body, const String &p_type, const Dictionary *p_extra, HttpType p_kind) {
+	if (p_c->request) { h2_reply(p_c, p_status, p_body, p_type, p_extra, Ref<GDBodySource>(), p_kind); return; }
 	if (p_c->draining) {
 		return;
 	}
@@ -1738,7 +1830,7 @@ void GDWebServer::queue_reply(Conn *p_c, int64_t p_status, const PackedByteArray
 		if (!p_c->body_done) {
 			p_c->keep = false;
 		}
-		build_out(p_c, p_status, p_body, p_type, p_extra);
+		build_out(p_c, p_status, p_body, p_type, p_extra, true, Ref<GDBodySource>(), p_kind);
 		if (reap_closed(p_c)) {
 			arm_deadline();
 			return;
@@ -1752,7 +1844,8 @@ void GDWebServer::queue_reply(Conn *p_c, int64_t p_status, const PackedByteArray
 	p_c->reply_status = p_status;
 	p_c->reply_body = p_body;
 	p_c->reply_type = p_type;
-	p_c->reply_headers = p_extra ? *p_extra : Dictionary();
+	p_c->reply_kind = p_kind;
+	p_c->reply_headers = p_extra ? std::make_unique<Dictionary>(*p_extra) : nullptr;
 	p_c->reply_waiting = true;
 	drain_body(p_c);
 	if (reap_closed(p_c)) {
@@ -1764,8 +1857,8 @@ void GDWebServer::queue_reply(Conn *p_c, int64_t p_status, const PackedByteArray
 }
 
 // Drain a small unread body before sending a file response.
-void GDWebServer::queue_file_reply(Conn *p_c, int64_t p_status, const Ref<GDBodySource> &p_file, const String &p_type, const Dictionary *p_extra) {
-	if (p_c->request) { h2_reply(p_c, p_status, PackedByteArray(), p_type, p_extra, p_file); return; }
+void GDWebServer::queue_file_reply(Conn *p_c, int64_t p_status, const Ref<GDBodySource> &p_file, const String &p_type, const Dictionary *p_extra, HttpType p_kind) {
+	if (p_c->request) { h2_reply(p_c, p_status, PackedByteArray(), p_type, p_extra, p_file, p_kind); return; }
 	if (p_c->draining) {
 		p_file->abort();
 		return;
@@ -1774,7 +1867,7 @@ void GDWebServer::queue_file_reply(Conn *p_c, int64_t p_status, const Ref<GDBody
 		if (!p_c->body_done) {
 			p_c->keep = false;
 		}
-		build_out(p_c, p_status, PackedByteArray(), p_type, p_extra, true, p_file);
+		build_out(p_c, p_status, PackedByteArray(), p_type, p_extra, true, p_file, p_kind);
 		if (reap_closed(p_c)) {
 			arm_deadline();
 			return;
@@ -1788,7 +1881,8 @@ void GDWebServer::queue_file_reply(Conn *p_c, int64_t p_status, const Ref<GDBody
 	p_c->reply_status = p_status;
 	p_c->reply_file = p_file;
 	p_c->reply_type = p_type;
-	p_c->reply_headers = p_extra ? *p_extra : Dictionary();
+	p_c->reply_kind = p_kind;
+	p_c->reply_headers = p_extra ? std::make_unique<Dictionary>(*p_extra) : nullptr;
 	p_c->reply_waiting = true;
 	drain_body(p_c);
 	if (reap_closed(p_c)) {
@@ -1800,7 +1894,7 @@ void GDWebServer::queue_file_reply(Conn *p_c, int64_t p_status, const Ref<GDBody
 }
 
 // Assemble status and headers while preparing the response body for transmission.
-void GDWebServer::build_out(Conn *p_c, int64_t p_status, const PackedByteArray &p_body, const String &p_type, const Dictionary *p_extra, bool p_consume, const Ref<GDBodySource> &p_file) {
+void GDWebServer::build_out(Conn *p_c, int64_t p_status, const PackedByteArray &p_body, const String &p_type, const Dictionary *p_extra, bool p_consume, const Ref<GDBodySource> &p_file, HttpType p_kind) {
 	// Build only headers in the output buffer and share the original body byte array.
 	LocalVector<uint8_t> &out = p_c->out_buf;
 	if (p_c->half && p_c->body_done && (int)p_c->buf.size() <= p_c->chunk_at) {
@@ -1809,7 +1903,7 @@ void GDWebServer::build_out(Conn *p_c, int64_t p_status, const PackedByteArray &
 	const int64_t body_len = p_file.is_valid() ? p_file->size() : p_body.size();
 	int64_t estimate = 512; // Estimated fixed-header size; file bodies are not buffered here.
 	bool too_large = false;
-	estimate += (int64_t)p_type.length() * 4;
+	estimate += p_kind == HTTP_TYPE_CUSTOM ? (int64_t)p_type.length() * 4 : http_type_size(p_kind);
 	if (p_extra) {
 		for (const KeyValue<Variant, Variant> &kv : *p_extra) {
 			const String key = kv.key;
@@ -1879,7 +1973,7 @@ void GDWebServer::build_out(Conn *p_c, int64_t p_status, const PackedByteArray &
 	// Informational headers precede the final response without carrying body framing.
 	if (status < 200 && status != 101) {
 		push(out, "\r\n", 2);
-		build_out(p_c, 200, p_body, p_type, p_extra, p_consume, p_file);
+		build_out(p_c, 200, p_body, p_type, p_extra, p_consume, p_file, p_kind);
 		return;
 	}
 	// For HEAD, omit the body but report the length it would have had.
@@ -1890,7 +1984,12 @@ void GDWebServer::build_out(Conn *p_c, int64_t p_status, const PackedByteArray &
 	p_c->out_chunked = body_len < 0 && !no_body && !p_c->http10;
 	p_c->out_tail = 0;
 	if (body_len < 0 && !no_body && p_c->http10) p_c->keep = false;
-	if (!has_type && !p_type.is_empty() && !no_len) {
+	if (!has_type && p_kind != HTTP_TYPE_CUSTOM && !no_len) {
+		const char *type = http_type_bytes(p_kind);
+		push(out, "Content-Type: ", 14);
+		push(out, type, http_type_size(p_kind));
+		push(out, "\r\n", 2);
+	} else if (!has_type && !p_type.is_empty() && !no_len) {
 		// Cache the last content type's UTF-8 bytes to avoid repeated wide-string conversion.
 		// Convert again only when the content type changes.
 		if (p_type != type_memo) {
@@ -2137,6 +2236,13 @@ void GDWebServer::respond(int p_id, int64_t p_status, const PackedByteArray &p_b
 	queue_reply(*found, p_status, p_body, p_type, nullptr);
 }
 
+// Submit a response using fixed content-type bytes.
+void GDWebServer::respond_fixed(int p_id, int64_t p_status, const PackedByteArray &p_body, HttpType p_type) {
+	Conn **found = conns.getptr(p_id);
+	if (!found) return;
+	queue_reply(*found, p_status, p_body, String(), nullptr, p_type);
+}
+
 // Copy existing memory into a queued HTTP response.
 void GDWebServer::respond_bytes(int p_id, int p_status, const uint8_t *p_body, int p_len, const String &p_type) {
 	Conn **found = conns.getptr(p_id);
@@ -2168,6 +2274,20 @@ void GDWebServer::respond_file(int p_id, int64_t p_status, const Dictionary &p_h
 		return; // The peer disconnected while file opening was pending.
 	}
 	queue_file_reply(*found, p_status, p_file, p_type, &p_headers);
+}
+
+// Stream without creating an additional header dictionary.
+void GDWebServer::respond_file_plain(int p_id, int64_t p_status, const Ref<GDBodySource> &p_file, const String &p_type) {
+	Conn **found = conns.getptr(p_id);
+	if (!found) { p_file->abort(); return; }
+	queue_file_reply(*found, p_status, p_file, p_type, nullptr);
+}
+
+// Submit a streaming response using fixed content-type bytes.
+void GDWebServer::respond_file_fixed(int p_id, int64_t p_status, const Ref<GDBodySource> &p_file, HttpType p_type) {
+	Conn **found = conns.getptr(p_id);
+	if (!found) { p_file->abort(); return; }
+	queue_file_reply(*found, p_status, p_file, String(), nullptr, p_type);
 }
 
 // Return the number of retained connections.
@@ -2214,6 +2334,7 @@ void GDWebServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("body_limit", "bytes"), &GDWebServer::set_body_limit);
 	ClassDB::bind_method(D_METHOD("header_limits", "bytes", "values"), &GDWebServer::set_header_limits);
 	ClassDB::bind_method(D_METHOD("listen", "port", "host"), &GDWebServer::listen, DEFVAL("127.0.0.1"));
+	ADD_PAIR_RESULT("listen", "Variant");
 	ClassDB::bind_method(D_METHOD("port"), &GDWebServer::get_port);
 	ClassDB::bind_method(D_METHOD("stop"), &GDWebServer::stop);
 	ClassDB::bind_method(D_METHOD("is_listening"), &GDWebServer::is_listening);

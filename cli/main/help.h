@@ -6,14 +6,16 @@
 
 // Display CLI usage with only supported flags.
 //
-// Keep the help list aligned with this executable's argument parser.
-// Listing unsupported runtime flags would suggest options that cannot take effect.
+// Render the command registry used by argument validation.
 //
 // Implementation is in help.cpp.
 
 #pragma once
 
+#include "core/string/ustring.h"
+
 class Help {
 public:
-	static void show(const char *p_binary);
+	static void show();
+	static bool command(const String &p_name);
 };

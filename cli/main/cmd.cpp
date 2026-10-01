@@ -7,12 +7,14 @@
 // Implement subcommands declared in cmd.h.
 
 #include "cli/main/cmd.h"
+#include "cli/main/spec.h"
 #include "cli/sys/system.h"
 #include "cli/sys/clock.h"
 #include "cli/main/briefs.gen.h"
 #include "cli/main/manual.gen.h"
 #include "cli/sys/os.h"
 #include "cli/sys/pkgscope.h"
+#include "cli/sys/std.h"
 #include "cli/tool/compile.h"
 #include "cli/tool/fmt.h"
 
@@ -192,6 +194,9 @@ String doc_group(const StringName &p_type, const String &p_name) {
 
 // Format API defaults as concise source-compatible expressions.
 String doc_value(const Variant &p_value) {
+	if (p_value.get_type() == Variant::OBJECT && p_value.get_validated_object() == nullptr) {
+		return "null";
+	}
 	if (p_value.get_type() == Variant::CALLABLE && !Callable(p_value).is_valid()) {
 		return "null";
 	}
@@ -199,11 +204,11 @@ String doc_value(const Variant &p_value) {
 	return json.is_empty() ? vformat("%s", p_value) : json;
 }
 
-// Remove the R metadata marker and return only traversable object types.
+// Remove the paired-result metadata marker and return only traversable object types.
 StringName doc_meta_class(const StringName &p_raw) {
 	String name = p_raw;
-	if (name.begins_with("R:")) {
-		name = name.substr(2);
+	if (name.begins_with("Pair:")) {
+		name = name.substr(5);
 	}
 	return ClassDB::class_exists(name) ? StringName(name) : StringName();
 }
@@ -219,9 +224,10 @@ String doc_flow(const StringName &p_type, const String &p_path, const MethodInfo
 		const StringName object = doc_class(p_method.return_val);
 		return doc_internal(object) ? p_path + "." + String(p_method.name) + "()" : doc_type(p_method.return_val, true);
 	}
-	const bool result = flow.begins_with("R:") || !ClassDB::get_result_class(p_type, p_method.name).is_empty();
-	flow = flow.trim_prefix("R:");
-	return (waits ? "await " : "") + flow + (result ? ", Err" : "");
+	const bool result = flow.begins_with("Pair:") || ClassDB::is_pair_result(p_type, p_method.name);
+	flow = flow.trim_prefix("Pair:");
+	const String shape = flow + (result ? ", Err" : ""); // What awaiting the method yields.
+	return waits ? "GDTask (await " + shape + ")" : shape;
 }
 
 // Find the object type reached after paths such as GD.file or GD.web.app.
@@ -280,13 +286,13 @@ String doc_method_line(const StringName &p_type, const String &p_path, const Met
 
 } // namespace
 
-// Wrap eval source in a main function for immediate execution.
+// Wrap eval source in a main function that receives the trailing arguments.
 String Cmd::wrap_eval(const String &p_src) {
 	String body;
 	for (const String &line : p_src.split("\n")) {
 		body += "\t" + line + "\n";
 	}
-	return "func main() -> int:\n" + body + "\treturn 0\n";
+	return "func main(args: PackedStringArray) -> int:\n" + body + "\treturn 0\n";
 }
 
 // Build script from source text.
@@ -315,7 +321,7 @@ int Cmd::doc(const String &p_name) {
 		print_line("  GD");
 		print_line("  GD.web  GD.database");
 		print_line("  advanced: GD.database.postgres  GD.database.redis");
-		print_line("  results: Err  R");
+		print_line("  results: value, Err");
 		print_line("  gd doc GD.file     inspect a gd API");
 		print_line("  gd doc SceneTree   inspect a Godot class");
 		print_line("  gd doc manual      read the full manual");
@@ -502,6 +508,12 @@ int Cmd::doc(const String &p_name) {
 
 	List<String> constants;
 	ClassDB::get_integer_constant_list(type, &constants, true);
+	if (type == Err::get_class_static()) {
+		print_line("  constants:");
+		for (const String &name : Err::names()) {
+			print_line("    " + name + ": Err");
+		}
+	}
 	if (!constants.is_empty()) {
 		print_line("  constants:");
 		for (const String &c : constants) {
@@ -683,46 +695,65 @@ int Cmd::workers_loop(const List<String> &p_args, int p_count) {
 	return EXIT_SUCCESS;
 }
 
-// Print shell-completion definitions for bash or zsh.
+// Print shell completion from command masks, excluding options unsupported by the selected command.
 int Cmd::completions(const String &p_shell) {
-	// Keep command and flag names aligned with is_subcommand and takes_flag.
-	const String cmds = "run serve test check fmt eval init task add install remove outdated update search publish info compile completions bench repl doc";
-	const String flags = "--mount --strict --allow-net --allow-env --allow-run --allow-ext --allow-sys "
-						 "--deny-net --deny-env --deny-run --deny-ext --deny-sys -A --allow-all "
-						 "--watch --workers= --no-scene-tree -o --output --check "
-						 "-v --verbose -q --quiet --header --no-header "
-						 "--latest --frozen --cached-only --dry-run --dump-extension-api --version --help";
+	if (p_shell != "bash" && p_shell != "zsh") {
+		print_error("usage: gd completions <bash|zsh>");
+		return EXIT_FAILURE;
+	}
+	String cmds;
+	String cases;
+	String run_flags;
+	String values;
+	for (const CLI::Option &option : CLI::OPTIONS) {
+		if (option.value != CLI::REQUIRED) continue;
+		values += (values.is_empty() ? "" : "|") + String(option.name);
+		if (option.alias[0]) values += "|" + String(option.alias);
+	}
+	for (const CLI::Command &command : CLI::COMMANDS) {
+		cmds += (cmds.is_empty() ? "" : " ") + String(command.name);
+		String flags;
+		for (const CLI::Option &option : CLI::OPTIONS) {
+			if (!((CLI::COMMON | command.flags) & option.flag)) continue;
+			flags += (flags.is_empty() ? "" : " ") + String(option.name);
+			if (option.alias[0]) flags += " " + String(option.alias);
+		}
+		if (String(command.name) == "run") run_flags = flags;
+		cases += vformat("    %s) flags='%s' ;;\n", command.name, flags);
+	}
+	cases += vformat("    *) flags='%s' ;;\n", run_flags);
+	// Inspect complete words only, skipping values so paths named like commands stay literal.
+	const String select = vformat(
+			"  local cmd='' flags='' word skip=0 marked=0\n"
+			"  for word in \"${prior[@]}\"; do\n"
+			"    if [ \"$skip\" = 1 ]; then skip=0; continue; fi\n"
+			"    case \"$word\" in\n"
+			"      --) marked=1; break ;;\n"
+			"      %s) skip=1 ;;\n"
+			"      -*) ;;\n"
+			"      *) if [ -z \"$cmd\" ]; then cmd=$word; fi ;;\n"
+			"    esac\n"
+			"  done\n"
+			"  case \"${cmd:-run}\" in\n%s  esac\n"
+			"  if [ \"$marked\" = 1 ]; then flags=''; fi\n", values, cases);
 	if (p_shell == "zsh") {
-		print_line(vformat(
-				"#compdef gd\n"
-				"_gd() {\n"
-				"  local -a cmds flags\n"
-				"  cmds=(%s)\n"
-				"  flags=(%s)\n"
-				"  if (( CURRENT == 2 )); then\n"
+		print_line("#compdef gd\n_gd() {\n  local -a prior opts cmds\n  prior=(\"${words[@]:1:$((CURRENT-2))}\")\n" + select +
+				"  opts=(${=flags})\n  cmds=(" + cmds + ")\n"
+				"  if (( CURRENT == 2 )) && [[ $PREFIX != -* ]]; then\n"
 				"    _describe 'command' cmds\n"
 				"  else\n"
-				"    _alternative 'flags:flag:($flags)' 'files:file:_files -g \"*.gd\"'\n"
-				"  fi\n"
-				"}\n"
-				"compdef _gd gd",
-				cmds, flags));
-		return EXIT_SUCCESS;
+				"    _alternative 'options:option:($opts)' 'files:file:_files'\n"
+				"  fi\n}\ncompdef _gd gd");
+	} else {
+		print_line("_gd() {\n  local cur=\"${COMP_WORDS[COMP_CWORD]}\"\n  local -a prior\n  prior=(\"${COMP_WORDS[@]:1:$((COMP_CWORD-1))}\")\n" + select +
+				"  if [ \"$COMP_CWORD\" = 1 ] && [[ \"$cur\" != -* ]]; then\n"
+				"    COMPREPLY=( $(compgen -W \"" + cmds + "\" -- \"$cur\") )\n"
+				"  elif [[ \"$cur\" == -* ]]; then\n"
+				"    COMPREPLY=( $(compgen -W \"$flags\" -- \"$cur\") )\n"
+				"  else\n"
+				"    COMPREPLY=( $(compgen -f -- \"$cur\") )\n"
+				"  fi\n}\ncomplete -F _gd gd");
 	}
-	// Default to bash.
-	print_line(vformat(
-			"_gd() {\n"
-			"  local cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
-			"  if [ $COMP_CWORD -eq 1 ]; then\n"
-			"    COMPREPLY=( $(compgen -W \"%s\" -- \"$cur\") )\n"
-			"  elif [[ \"$cur\" == -* ]]; then\n"
-			"    COMPREPLY=( $(compgen -W \"%s\" -- \"$cur\") )\n"
-			"  else\n"
-			"    COMPREPLY=( $(compgen -f -X '!*.gd' -- \"$cur\") $(compgen -d -- \"$cur\") )\n"
-			"  fi\n"
-			"}\n"
-			"complete -F _gd gd",
-			cmds, flags));
 	return EXIT_SUCCESS;
 }
 
@@ -731,15 +762,63 @@ int Cmd::completions(const String &p_shell) {
 List<String> Cmd::child_args(const String &p_drop) {
 	List<String> child;
 	bool user = false;
-	for (const String &a : Cmd::raw) {
-		if (user || !a.begins_with(p_drop)) {
-			child.push_back(a);
+	for (auto *arg = Cmd::raw.front(); arg; arg = arg->next()) {
+		const String &word = arg->get();
+		if (!user && (word == p_drop || word.begins_with(p_drop + "="))) {
+			const CLI::Option *opt = CLI::option(p_drop.utf8().get_data());
+			if (word == p_drop && opt && opt->value == CLI::REQUIRED && arg->next()) arg = arg->next();
+			continue;
 		}
-		if (a == "--" || a == "++") {
-			user = true;
-		}
+		child.push_back(word);
+		if (word == "--") user = true;
 	}
 	return child;
+}
+
+// Validate package-relative entry segments without rejecting dots inside a filename.
+bool Cmd::global_entry(const String &p_path) {
+	const String prefix = "res://pkg/tool/"; // Installed entries belong to the root package copy.
+	if (!p_path.begins_with(prefix) || !p_path.ends_with(".gd") || p_path.contains("\\")) return false;
+	for (const String &part : p_path.trim_prefix(prefix).split("/", true)) {
+		if (part.is_empty() || part == "." || part == "..") return false;
+	}
+	return true;
+}
+
+// Expand launcher metadata through native access before filesystem isolation is installed.
+bool Cmd::installed_args(List<String> &r_args) {
+	if (r_args.is_empty() || r_args.front()->get() != "--installed") return true;
+	auto *root_arg = r_args.front()->next();
+	if (!root_arg || !root_arg->get().is_absolute_path()) return false;
+	const String root = root_arg->get();
+	const Ref<FileAccess> file = FileAccess::open(root.path_join("gd.json"), FileAccess::READ);
+	JSON json;
+	if (file.is_null() || json.parse(file->get_as_text()) != OK || json.get_data().get_type() != Variant::DICTIONARY) return false;
+	const Dictionary cfg = json.get_data();
+	const String entry = cfg.get("global_entry", "");
+	if (!cfg.has("global_command") || !global_entry(entry)) return false;
+	const Variant flags = cfg.get("global_flags", Variant());
+	const Variant fixed = cfg.get("global_args", Variant());
+	if (flags.get_type() != Variant::ARRAY || fixed.get_type() != Variant::ARRAY) return false;
+	List<String> expanded;
+	// Accept only saved runtime authority, never management or execution options.
+	for (const Variant &value : Array(flags)) {
+		if (value.get_type() != Variant::STRING) return false;
+		const String flag = value;
+		if (!runtime_flag(flag)) return false;
+		expanded.push_back(flag);
+	}
+	expanded.push_back("--path");
+	expanded.push_back(root);
+	expanded.push_back(entry);
+	expanded.push_back("--");
+	for (const Variant &value : Array(fixed)) {
+		if (value.get_type() != Variant::STRING) return false;
+		expanded.push_back(value);
+	}
+	for (auto *arg = root_arg->next(); arg; arg = arg->next()) expanded.push_back(arg->get());
+	r_args = expanded;
+	return true;
 }
 
 // Read gd.json only at the jail root; parent traversal is not permitted.
@@ -768,11 +847,16 @@ Dictionary Cmd::load_config() {
 	return data.get_type() == Variant::DICTIONARY ? Dictionary(data) : Dictionary();
 }
 
+// Select the placement shared by explicit options and delegated editor commands.
+bool Cmd::for_godot() {
+	return OS::get_singleton()->get_environment("GD_FOR_GODOT") == "1";
+}
+
 // Locate package copies beside gd.json.
 String Cmd::pkg_dir() {
 	const String cfg = Cmd::find_config();
 	const String base = cfg.is_empty() ? String(".") : cfg.get_base_dir();
-	return base.path_join("pkg");
+	return base.path_join(for_godot() ? "addons" : "pkg");
 }
 
 // Map strictness settings to warning levels.
@@ -813,17 +897,6 @@ void Cmd::apply_types() {
 	}
 }
 
-// Check whether a subcommand belongs to the embedded dependency-management script.
-bool Cmd::is_pkg_cmd(const String &p_cmd) {
-	static const char *cmds[] = { "install", "add", "remove", "outdated", "update", "search", "publish", nullptr };
-	for (int i = 0; cmds[i]; i++) {
-		if (p_cmd == cmds[i]) {
-			return true;
-		}
-	}
-	return false;
-}
-
 // List installed dependencies.
 int Cmd::info() {
 	const Dictionary cfg = Cmd::load_config();
@@ -833,10 +906,11 @@ int Cmd::info() {
 		print_line(vformat("name:   %s", String(cfg["name"])));
 	}
 	const Dictionary imports = cfg.has("imports") ? Dictionary(cfg["imports"]) : Dictionary();
+	const bool addons = for_godot();
 	print_line(vformat("imports: %d", imports.size()));
 	for (const Variant &k : imports.keys()) {
 		// Probe through the alias so cached, copied, and local packages report alike.
-		const bool present = DirAccess::exists("pkg://" + String(k));
+		const bool present = addons ? DirAccess::exists(Cmd::pkg_dir().path_join(String(k))) : DirAccess::exists("pkg://" + String(k));
 		print_line(vformat("  %s <- %s %s", String(k), String(imports[k]), present ? "[ok]" : "[missing]"));
 	}
 	// List every pinned registry package, including those only other packages need.
@@ -857,7 +931,8 @@ int Cmd::info() {
 			for (const Variant &a : deps.keys()) {
 				needs += (needs.is_empty() ? String(" needs ") : String(", ")) + String(a) + "=" + String(deps[a]);
 			}
-			print_line(vformat("  %s %s%s", id, DirAccess::exists("pkg://" + id) ? "[ok]" : "[missing]", needs));
+			const bool present = addons ? DirAccess::exists(Cmd::pkg_dir().path_join(id)) : DirAccess::exists("pkg://" + id);
+			print_line(vformat("  %s %s%s", id, present ? "[ok]" : "[missing]", needs));
 		}
 	}
 	return EXIT_SUCCESS;
@@ -973,7 +1048,7 @@ int Cmd::run_task(const String &p_name) {
 			return EXIT_FAILURE;
 		}
 		args.push_back(part);
-		user_args = user_args || part == "--" || part == "++";
+		user_args = user_args || part == "--";
 	}
 	// Connect all three standard streams directly to the child for streaming I/O.
 	int code = EXIT_FAILURE;
@@ -1009,48 +1084,6 @@ void Cmd::collect(const String &p_path, List<String> &r_files, const String &p_s
 	}
 	dir->list_dir_end();
 	return;
-}
-
-// Collect *_bench.gd files, run repeated samples, and report their durations.
-int Cmd::run_bench(const String &p_path, const List<String> &p_flags, int p_runs) {
-	List<String> files;
-	if (!Cmd::collect_or_fail(p_path, "_bench.gd", files)) {
-		return EXIT_FAILURE;
-	}
-
-	const String self = OS::get_singleton()->get_executable_path();
-	for (const String &file : files) {
-		List<String> args;
-		for (const String &f : p_flags) {
-			args.push_back(f);
-		}
-		args.push_back(file);
-
-		uint64_t best = UINT64_MAX;
-		uint64_t total = 0;
-		int failed = 0;
-		for (int i = 0; i < p_runs; i++) {
-			String output;
-			int code = 0;
-			const uint64_t t0 = GDClock::usec();
-			const Error err = OS::get_singleton()->execute(self, args, &output, &code, true);
-			const uint64_t dt = GDClock::usec() - t0;
-			if (err != OK || code != 0) {
-				failed++;
-				continue;
-			}
-			best = MIN(best, dt);
-			total += dt;
-		}
-		if (failed == p_runs) {
-			print_line(vformat("FAIL  %s", file));
-			continue;
-		}
-		const int ok_runs = p_runs - failed;
-		print_line(vformat("%-40s best %7.1f ms  avg %7.1f ms  (%d runs)",
-				file, best / 1000.0, (total / (double)ok_runs) / 1000.0, ok_runs));
-	}
-	return EXIT_SUCCESS;
 }
 
 // Collect and sort files, reporting an error when none match.
@@ -1118,51 +1151,4 @@ int Cmd::run_tests(const String &p_path, const List<String> &p_flags) {
 // Check each .gd file beneath a path and fail when none pass.
 int Cmd::run_checks(const String &p_path, const List<String> &p_flags) {
 	return Cmd::run_each(p_path, p_flags, ".gd", "check", false, "checked");
-}
-
-// Check whether a positional argument names a subcommand.
-bool Cmd::is_subcommand(const String &p_arg) {
-	static const char *cmds[] = { "run", "check", "eval", "serve", "test", "init", "task", "install", "add", "remove", "outdated", "update", "search", "publish", "info", "fmt", "compile", "completions", "bench", "repl", "doc", nullptr };
-	for (int i = 0; cmds[i]; i++) {
-		if (p_arg == cmds[i]) {
-			return true;
-		}
-	}
-	return false;
-}
-
-// Define the single supported-flag list and keep help output aligned with it.
-// Reject unlisted runtime flags rather than silently forwarding undocumented options.
-bool Cmd::takes_flag(const String &p_arg) {
-	static const char *exact[] = {
-		"-h", "--help", "--version", "--header", "--no-header", "-v", "--verbose", "-q", "--quiet",
-		"--dump-extension-api",
-		"--mount", "--strict", "-A", "--allow-all",
-		"--watch", "--no-scene-tree", "-o", "--output", "--check",
-		"--latest", "--frozen", "--cached-only", "--dry-run", "--sync", // Options consumed only by package management.
-		"--", "++", // Following arguments belong to the script.
-		nullptr
-	};
-	for (int i = 0; exact[i]; i++) {
-		if (p_arg == exact[i]) {
-			return true;
-		}
-	}
-	static const char *heads[] = { "--mount=", "--workers=", nullptr }; // Flags whose values follow an equals sign.
-	for (int i = 0; heads[i]; i++) {
-		if (p_arg.begins_with(heads[i])) {
-			return true;
-		}
-	}
-	// Accept allow and deny flags with optional resource scopes.
-	static const char *kinds[] = { "net", "env", "run", "ext", "sys", nullptr };
-	for (int i = 0; kinds[i]; i++) {
-		for (int deny = 0; deny < 2; deny++) {
-			const String head = (deny ? "--deny-" : "--allow-") + String(kinds[i]);
-			if (p_arg == head || p_arg.begins_with(head + "=")) {
-				return true;
-			}
-		}
-	}
-	return false;
 }

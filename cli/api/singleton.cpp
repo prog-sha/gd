@@ -7,6 +7,7 @@
 // Bind shared APIs and state, and register singleton instances declared in singleton.h.
 
 #include "cli/api/singleton.h"
+#include "cli/main/cmd.h"
 #include "cli/sys/system.h"
 #include "cli/net/lookup.h"
 #include "cli/net/body_source.h"
@@ -27,6 +28,7 @@
 #include "core/os/os.h"
 #include "core/version.h"
 #include "modules/gdscript/gdscript_function.h"
+#include "cli/sys/task.h"
 
 namespace {
 
@@ -90,20 +92,38 @@ StringName web_group(const StringName &p_name) {
 
 } // namespace
 
+// Invoke a callable while retaining its second result in the error slot.
+VariantPair GDAsyncAPI::call_pair(const Callable &p_fn) {
+	Variant value;
+	Variant error_value;
+	Callable::CallError error;
+	error.result_error = &error_value;
+	p_fn.callp(nullptr, 0, value, error);
+	return error.error == Callable::CallError::CALL_OK && !error.runtime_failed ? VariantPair{ value, error_value } : VariantPair{ Variant(), Err::make("cannot call paired function", Err::INVALID_DATA) };
+}
+
 // Expose asynchronous coordination APIs to script.
 void GDAsyncAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_max_threads", "max"), &GDAsyncAPI::set_max_threads);
 	ClassDB::bind_method(D_METHOD("sleep", "sec"), &GDAsyncAPI::sleep);
 	ClassDB::bind_method(D_METHOD("spawn", "fn"), &GDAsyncAPI::spawn);
-	ClassDB::bind_method(D_METHOD("all", "signals"), &GDAsyncAPI::all);
-	ClassDB::bind_method(D_METHOD("race", "signals"), &GDAsyncAPI::race);
-	ClassDB::bind_method(D_METHOD("with_timeout", "signal", "sec"), &GDAsyncAPI::with_timeout);
-	ClassDB::bind_method(D_METHOD("with_context", "context", "signal"), &GDAsyncAPI::with_context);
+	ClassDB::bind_method(D_METHOD("spawn_pair", "fn"), &GDAsyncAPI::spawn_pair);
+	ClassDB::bind_method(D_METHOD("call_pair", "fn"), &GDAsyncAPI::call_pair);
+	ClassDB::bind_method(D_METHOD("all", "tasks"), &GDAsyncAPI::all);
+	ClassDB::bind_method(D_METHOD("race", "tasks"), &GDAsyncAPI::race);
+	ClassDB::bind_method(D_METHOD("with_timeout", "task", "sec"), &GDAsyncAPI::with_timeout);
+	ClassDB::bind_method(D_METHOD("with_context", "context", "task"), &GDAsyncAPI::with_context);
+	ClassDB::bind_method(D_METHOD("with_context_pair", "context", "task"), &GDAsyncAPI::with_context_pair);
 	ClassDB::bind_method(D_METHOD("context"), &GDAsyncAPI::context);
+	ADD_AWAIT("sleep", "Variant");
+	ADD_AWAIT("spawn", "Variant");
 	ADD_AWAIT("all", "Array");
 	ADD_AWAIT("race", "int");
 	ADD_AWAIT("with_timeout", "int");
 	ADD_AWAIT("with_context", "Variant");
+	ADD_AWAIT("with_context_pair", "Pair:Variant");
+	ADD_AWAIT("spawn_pair", "Pair:Variant");
+	ADD_PAIR_RESULT("call_pair", "Variant");
 }
 
 // Set the shared logger's name and minimum level.
@@ -127,36 +147,36 @@ void GDLogAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("info", "msg", "extra"), &GDLogAPI::info, DEFVAL(Variant()));
 	ClassDB::bind_method(D_METHOD("warn", "msg", "extra"), &GDLogAPI::warn, DEFVAL(Variant()));
 	ClassDB::bind_method(D_METHOD("error", "msg", "extra"), &GDLogAPI::error, DEFVAL(Variant()));
-	ClassDB::bind_method(D_METHOD("result", "r", "msg"), &GDLogAPI::result);
+	ClassDB::bind_method(D_METHOD("result", "error", "msg"), &GDLogAPI::result);
 	ClassDB::bind_method(D_METHOD("write_async", "level", "msg", "extra"), &GDLogAPI::write, DEFVAL(Variant()));
 	ClassDB::bind_method(D_METHOD("debug_async", "msg", "extra"), &GDLogAPI::debug, DEFVAL(Variant()));
 	ClassDB::bind_method(D_METHOD("info_async", "msg", "extra"), &GDLogAPI::info, DEFVAL(Variant()));
 	ClassDB::bind_method(D_METHOD("warn_async", "msg", "extra"), &GDLogAPI::warn, DEFVAL(Variant()));
 	ClassDB::bind_method(D_METHOD("error_async", "msg", "extra"), &GDLogAPI::error, DEFVAL(Variant()));
-	ClassDB::bind_method(D_METHOD("result_async", "r", "msg"), &GDLogAPI::result);
-	ADD_AWAIT("write_async", "R:Variant");
-	ADD_AWAIT("debug_async", "R:Variant");
-	ADD_AWAIT("info_async", "R:Variant");
-	ADD_AWAIT("warn_async", "R:Variant");
-	ADD_AWAIT("error_async", "R:Variant");
-	ADD_AWAIT("result_async", "R:Variant");
+	ClassDB::bind_method(D_METHOD("result_async", "error", "msg"), &GDLogAPI::result);
+	ADD_AWAIT("write_async", "Pair:Variant");
+	ADD_AWAIT("debug_async", "Pair:Variant");
+	ADD_AWAIT("info_async", "Pair:Variant");
+	ADD_AWAIT("warn_async", "Pair:Variant");
+	ADD_AWAIT("error_async", "Pair:Variant");
+	ADD_AWAIT("result_async", "Pair:Variant");
 	ClassDB::bind_method(D_METHOD("format", "level", "msg", "extra"), &GDLogAPI::format, DEFVAL(Variant()));
 	ClassDB::bind_method(D_METHOD("flush"), &GDLogAPI::flush);
 	ClassDB::bind_method(D_METHOD("flush_async"), &GDLogAPI::flush_async);
-	ADD_AWAIT("flush", "R:Variant");
-	ADD_AWAIT("flush_async", "R:Variant");
+	ADD_AWAIT("flush", "Pair:Variant");
+	ADD_AWAIT("flush_async", "Pair:Variant");
 	ADD_AUTO_WAIT("flush");
-	ADD_AWAIT("write", "R:Variant");
+	ADD_AWAIT("write", "Pair:Variant");
 	ADD_AUTO_WAIT("write");
-	ADD_AWAIT("debug", "R:Variant");
+	ADD_AWAIT("debug", "Pair:Variant");
 	ADD_AUTO_WAIT("debug");
-	ADD_AWAIT("info", "R:Variant");
+	ADD_AWAIT("info", "Pair:Variant");
 	ADD_AUTO_WAIT("info");
-	ADD_AWAIT("warn", "R:Variant");
+	ADD_AWAIT("warn", "Pair:Variant");
 	ADD_AUTO_WAIT("warn");
-	ADD_AWAIT("error", "R:Variant");
+	ADD_AWAIT("error", "Pair:Variant");
 	ADD_AUTO_WAIT("error");
-	ADD_AWAIT("result", "R:Variant");
+	ADD_AWAIT("result", "Pair:Variant");
 	ADD_AUTO_WAIT("result");
 }
 
@@ -183,22 +203,22 @@ void GDNetAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("local_addresses_async"), &GDNetAPI::local_addresses_async);
 	ClassDB::bind_method(D_METHOD("is_ip", "text"), &GDNetAPI::is_ip);
 	ClassDB::bind_method(D_METHOD("split_host", "text", "default_port"), &GDNetAPI::split_host, DEFVAL(80));
-	ADD_RESULT("free_port", "int");
-	ADD_AWAIT("resolve", "R:String");
-	ADD_AWAIT("resolve_async", "R:String");
-	ADD_AWAIT("dial_tcp", "R:GDTCPConn");
-	ADD_AWAIT("dial_tcp_async", "R:GDTCPConn");
-	ADD_AWAIT("dial_tls", "R:GDTCPConn");
-	ADD_AWAIT("dial_tls_async", "R:GDTCPConn");
+	ADD_PAIR_RESULT("free_port", "int");
+	ADD_AWAIT("resolve", "Pair:String");
+	ADD_AWAIT("resolve_async", "Pair:String");
+	ADD_AWAIT("dial_tcp", "Pair:GDTCPConn");
+	ADD_AWAIT("dial_tcp_async", "Pair:GDTCPConn");
+	ADD_AWAIT("dial_tls", "Pair:GDTCPConn");
+	ADD_AWAIT("dial_tls_async", "Pair:GDTCPConn");
 	ADD_AUTO_WAIT("resolve");
 	ADD_AUTO_WAIT("dial_tcp");
 	ADD_AUTO_WAIT("dial_tls");
-	ADD_RESULT("listen_tcp", "GDTCPListener");
-	ADD_RESULT("listen_udp", "GDUDPPacketConn");
+	ADD_PAIR_RESULT("listen_tcp", "GDTCPListener");
+	ADD_PAIR_RESULT("listen_udp", "GDUDPPacketConn");
 	ADD_AWAIT("is_free_async", "bool");
-	ADD_AWAIT("free_port_async", "R:int");
-	ADD_AWAIT("local_addresses_async", "R:PackedStringArray");
-	ADD_AWAIT("local_addresses", "R:PackedStringArray");
+	ADD_AWAIT("free_port_async", "Pair:int");
+	ADD_AWAIT("local_addresses_async", "Pair:PackedStringArray");
+	ADD_AWAIT("local_addresses", "Pair:PackedStringArray");
 	ADD_AUTO_WAIT("local_addresses");
 }
 
@@ -214,12 +234,12 @@ Signal GDNetAPI::is_free_async(int64_t p_port, const String &p_host) {
 
 // Dispatch free-port discovery to an I/O worker.
 Signal GDNetAPI::free_port_async(int64_t p_from, const String &p_host) {
-	return GDFileCall::start([p_from, p_host]() { return Net::free_port(p_from, p_host); });
+	return GDPairCall::start([p_from, p_host]() { return Net::free_port(p_from, p_host); }, false);
 }
 
 // Dispatch local-address enumeration to an I/O worker.
 Signal GDNetAPI::local_addresses_async() {
-	return GDFileCall::start([]() { return Net::local_addresses(); });
+	return GDPairCall::start([]() -> VariantPair { return Net::local_addresses(); }, false);
 }
 
 // Expose the HTTP client and URL helpers to script.
@@ -241,21 +261,21 @@ void GDHTTPAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("media_type_for_extension", "ext"), &GDHTTPAPI::media_type_for_extension);
 	ClassDB::bind_method(D_METHOD("is_textual", "kind"), &GDHTTPAPI::is_textual);
 	ClassDB::bind_method(D_METHOD("extension_for_media_type", "kind"), &GDHTTPAPI::extension_for_media_type);
-	ADD_AWAIT("fetch", "R:GDHTTPResponse");
-	ADD_AWAIT("fetch_async", "R:GDHTTPResponse");
+	ADD_AWAIT("fetch", "Pair:GDHTTPResponse");
+	ADD_AWAIT("fetch_async", "Pair:GDHTTPResponse");
 	ADD_AUTO_WAIT("fetch");
-	ADD_RESULT("parse_url", "Dictionary");
-	ADD_RESULT("decode_query", "Dictionary");
-	ADD_AWAIT("parse_url_async", "R:Dictionary");
+	ADD_PAIR_RESULT("parse_url", "Dictionary");
+	ADD_PAIR_RESULT("decode_query", "Dictionary");
+	ADD_AWAIT("parse_url_async", "Pair:Dictionary");
 	ADD_AWAIT("build_url_async", "String");
 	ADD_AWAIT("request_target_async", "String");
-	ADD_AWAIT("decode_query_async", "R:Dictionary");
+	ADD_AWAIT("decode_query_async", "Pair:Dictionary");
 	ADD_AWAIT("encode_query_async", "String");
 }
 
 // Dispatch URL parsing to a CPU worker.
 Signal GDHTTPAPI::parse_url_async(const String &p_raw) {
-	return GDValueCall::start([p_raw]() -> Variant { return Url::parse(p_raw); });
+	return GDPairCall::start([p_raw]() -> VariantPair { return Url::parse(p_raw); });
 }
 
 // Dispatch URL formatting to a CPU worker.
@@ -272,7 +292,7 @@ Signal GDHTTPAPI::request_target_async(const Dictionary &p_url) {
 
 // Dispatch query parsing to a CPU worker.
 Signal GDHTTPAPI::decode_query_async(const String &p_raw) {
-	return GDValueCall::start([p_raw]() -> Variant { return Url::decode_query(p_raw); });
+	return GDPairCall::start([p_raw]() -> VariantPair { return Url::decode_query(p_raw); });
 }
 
 // Dispatch query encoding to a CPU worker.
@@ -291,8 +311,13 @@ void GDFSAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("replace_text", "path", "old", "body"), &GDFSAPI::replace_text_async);
 	ClassDB::bind_method(D_METHOD("_remove_text", "path", "old"), &GDFSAPI::_remove_text);
 	ClassDB::bind_method(D_METHOD("_lock", "path"), &GDFSAPI::_lock);
+	ADD_PAIR_RESULT("_remove_text", "Variant");
+	ADD_PAIR_RESULT("_lock", "GDFileLock");
 	ClassDB::bind_method(D_METHOD("_local", "path"), &GDFSAPI::_local);
 	ClassDB::bind_method(D_METHOD("_local_stamp", "path"), &GDFSAPI::_local_stamp);
+	ClassDB::bind_method(D_METHOD("_check_global", "root", "entry", "flags"), &GDFSAPI::_check_global);
+	ADD_PAIR_RESULT("_check_global", "Variant");
+	ClassDB::bind_method(D_METHOD("_global_info"), &GDFSAPI::_global_info);
 	ClassDB::bind_method(D_METHOD("write_bytes", "path", "body"), &GDFSAPI::write_bytes_async);
 	ClassDB::bind_method(D_METHOD("append_bytes", "path", "body"), &GDFSAPI::append_bytes_async);
 	ClassDB::bind_method(D_METHOD("append_text", "path", "body"), &GDFSAPI::append_text_async);
@@ -362,70 +387,70 @@ void GDFSAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("can_read_async", "path"), &GDFSAPI::can_read_async);
 	ClassDB::bind_method(D_METHOD("create_tar_async", "root"), &GDFSAPI::create_tar_async);
 	ClassDB::bind_method(D_METHOD("extract_tar_async", "data", "root"), &GDFSAPI::extract_tar_async);
-	ADD_AWAIT("read_text_async", "R:String");
-	ADD_AWAIT("open", "R:GDFileStream");
-	ADD_AWAIT("open_async", "R:GDFileStream");
-	ADD_AWAIT("read_bytes_async", "R:PackedByteArray");
-	ADD_AWAIT("write_text_async", "R:Variant");
-	ADD_AWAIT("write_bytes_async", "R:Variant");
-	ADD_AWAIT("append_text_async", "R:Variant");
-	ADD_AWAIT("append_bytes_async", "R:Variant");
-	ADD_AWAIT("copy_async", "R:Variant");
-	ADD_AWAIT("replace_text_async", "R:Variant");
+	ADD_AWAIT("read_text_async", "Pair:String");
+	ADD_AWAIT("open", "Pair:GDFileStream");
+	ADD_AWAIT("open_async", "Pair:GDFileStream");
+	ADD_AWAIT("read_bytes_async", "Pair:PackedByteArray");
+	ADD_AWAIT("write_text_async", "Pair:Variant");
+	ADD_AWAIT("write_bytes_async", "Pair:Variant");
+	ADD_AWAIT("append_text_async", "Pair:Variant");
+	ADD_AWAIT("append_bytes_async", "Pair:Variant");
+	ADD_AWAIT("copy_async", "Pair:Variant");
+	ADD_AWAIT("replace_text_async", "Pair:Variant");
 	ADD_AWAIT("exists_async", "bool");
-	ADD_AWAIT("remove_async", "R:Variant");
-	ADD_AWAIT("size_of_async", "R:int");
-	ADD_AWAIT("rename_async", "R:Variant");
-	ADD_AWAIT("list_dir_async", "R:Array");
-	ADD_AWAIT("make_dir_async", "R:Variant");
-	ADD_AWAIT("ensure_dir_async", "R:Variant");
-	ADD_AWAIT("walk_async", "R:Array");
-	ADD_AWAIT("glob_async", "R:Array");
-	ADD_AWAIT("remove_all_async", "R:Variant");
+	ADD_AWAIT("remove_async", "Pair:Variant");
+	ADD_AWAIT("size_of_async", "Pair:int");
+	ADD_AWAIT("rename_async", "Pair:Variant");
+	ADD_AWAIT("list_dir_async", "Pair:Array");
+	ADD_AWAIT("make_dir_async", "Pair:Variant");
+	ADD_AWAIT("ensure_dir_async", "Pair:Variant");
+	ADD_AWAIT("walk_async", "Pair:Array");
+	ADD_AWAIT("glob_async", "Pair:Array");
+	ADD_AWAIT("remove_all_async", "Pair:Variant");
 	ADD_AWAIT("can_read_async", "bool");
-	ADD_AWAIT("create_tar_async", "R:PackedByteArray");
-	ADD_AWAIT("extract_tar_async", "R:int");
-	ADD_AWAIT("read_csv_async", "R:Array");
-	ADD_AWAIT("read_ini_async", "R:Dictionary");
-	ADD_AWAIT("read_toml_async", "R:Dictionary");
-	ADD_AWAIT("read_yaml_async", "R:Variant");
-	ADD_AWAIT("read_jsonc_async", "R:Variant");
-	ADD_AWAIT("read_jsonl_async", "R:Array");
-	ADD_AWAIT("read_front_matter_async", "R:Dictionary");
-	ADD_AWAIT("read_xml_async", "R:Dictionary");
-	ADD_AWAIT("read_env_async", "R:Dictionary");
-	ADD_AWAIT("read_tar_async", "R:Array");
-	ADD_AWAIT("read_text", "R:String");
-	ADD_AWAIT("read_bytes", "R:PackedByteArray");
-	ADD_AWAIT("write_text", "R:Variant");
-	ADD_AWAIT("write_bytes", "R:Variant");
-	ADD_AWAIT("append_text", "R:Variant");
-	ADD_AWAIT("append_bytes", "R:Variant");
-	ADD_AWAIT("copy", "R:Variant");
-	ADD_AWAIT("replace_text", "R:Variant");
+	ADD_AWAIT("create_tar_async", "Pair:PackedByteArray");
+	ADD_AWAIT("extract_tar_async", "Pair:int");
+	ADD_AWAIT("read_csv_async", "Pair:Array");
+	ADD_AWAIT("read_ini_async", "Pair:Dictionary");
+	ADD_AWAIT("read_toml_async", "Pair:Dictionary");
+	ADD_AWAIT("read_yaml_async", "Pair:Variant");
+	ADD_AWAIT("read_jsonc_async", "Pair:Variant");
+	ADD_AWAIT("read_jsonl_async", "Pair:Array");
+	ADD_AWAIT("read_front_matter_async", "Pair:Dictionary");
+	ADD_AWAIT("read_xml_async", "Pair:Dictionary");
+	ADD_AWAIT("read_env_async", "Pair:Dictionary");
+	ADD_AWAIT("read_tar_async", "Pair:Array");
+	ADD_AWAIT("read_text", "Pair:String");
+	ADD_AWAIT("read_bytes", "Pair:PackedByteArray");
+	ADD_AWAIT("write_text", "Pair:Variant");
+	ADD_AWAIT("write_bytes", "Pair:Variant");
+	ADD_AWAIT("append_text", "Pair:Variant");
+	ADD_AWAIT("append_bytes", "Pair:Variant");
+	ADD_AWAIT("copy", "Pair:Variant");
+	ADD_AWAIT("replace_text", "Pair:Variant");
 	ADD_AWAIT("exists", "bool");
-	ADD_AWAIT("remove", "R:Variant");
-	ADD_AWAIT("size_of", "R:int");
-	ADD_AWAIT("rename", "R:Variant");
-	ADD_AWAIT("list_dir", "R:Array");
-	ADD_AWAIT("make_dir", "R:Variant");
-	ADD_AWAIT("ensure_dir", "R:Variant");
-	ADD_AWAIT("walk", "R:Array");
-	ADD_AWAIT("glob", "R:Array");
-	ADD_AWAIT("remove_all", "R:Variant");
+	ADD_AWAIT("remove", "Pair:Variant");
+	ADD_AWAIT("size_of", "Pair:int");
+	ADD_AWAIT("rename", "Pair:Variant");
+	ADD_AWAIT("list_dir", "Pair:Array");
+	ADD_AWAIT("make_dir", "Pair:Variant");
+	ADD_AWAIT("ensure_dir", "Pair:Variant");
+	ADD_AWAIT("walk", "Pair:Array");
+	ADD_AWAIT("glob", "Pair:Array");
+	ADD_AWAIT("remove_all", "Pair:Variant");
 	ADD_AWAIT("can_read", "bool");
-	ADD_AWAIT("create_tar", "R:PackedByteArray");
-	ADD_AWAIT("extract_tar", "R:int");
-	ADD_AWAIT("read_csv", "R:Array");
-	ADD_AWAIT("read_ini", "R:Dictionary");
-	ADD_AWAIT("read_toml", "R:Dictionary");
-	ADD_AWAIT("read_yaml", "R:Variant");
-	ADD_AWAIT("read_jsonc", "R:Variant");
-	ADD_AWAIT("read_jsonl", "R:Array");
-	ADD_AWAIT("read_front_matter", "R:Dictionary");
-	ADD_AWAIT("read_xml", "R:Dictionary");
-	ADD_AWAIT("read_env", "R:Dictionary");
-	ADD_AWAIT("read_tar", "R:Array");
+	ADD_AWAIT("create_tar", "Pair:PackedByteArray");
+	ADD_AWAIT("extract_tar", "Pair:int");
+	ADD_AWAIT("read_csv", "Pair:Array");
+	ADD_AWAIT("read_ini", "Pair:Dictionary");
+	ADD_AWAIT("read_toml", "Pair:Dictionary");
+	ADD_AWAIT("read_yaml", "Pair:Variant");
+	ADD_AWAIT("read_jsonc", "Pair:Variant");
+	ADD_AWAIT("read_jsonl", "Pair:Array");
+	ADD_AWAIT("read_front_matter", "Pair:Dictionary");
+	ADD_AWAIT("read_xml", "Pair:Dictionary");
+	ADD_AWAIT("read_env", "Pair:Dictionary");
+	ADD_AWAIT("read_tar", "Pair:Array");
 	const char *wait_names[] = {
 		"open", "read_text", "read_bytes", "write_text", "write_bytes", "append_text", "append_bytes", "copy", "replace_text",
 		"exists", "remove", "size_of", "rename", "list_dir", "make_dir", "ensure_dir", "walk", "glob", "remove_all", "can_read",
@@ -452,49 +477,86 @@ String GDFSAPI::_local_stamp(const String &p_path) {
 	return PkgSource::stamp(p_path);
 }
 
+// Supply only command-management metadata while its private mount is active.
+Dictionary GDFSAPI::_global_info() {
+	Dictionary info;
+	if (!Mount::has_mount("global")) return info;
+	info["platform"] = GDSystem::platform().to_lower();
+	info["arch"] = Engine::get_singleton()->get_architecture_name();
+	info["cli"] = OS::get_singleton()->get_executable_path();
+	info["registry"] = GDSystem::env("GD_REGISTRY");
+	info["version"] = GD_CLI_VERSION;
+	return info;
+}
+
+// Validate a staged entry in a fresh process without executing its main function.
+VariantPair GDFSAPI::_check_global(const String &p_root, const String &p_entry, const PackedStringArray &p_flags) {
+	if (!Mount::has_mount("global") || !p_root.begins_with("global://") || !Cmd::global_entry(p_entry)) {
+		return { Variant(), Err::from("global installation is not active", Err::PERMISSION_DENIED) };
+	}
+	String why;
+	const String root = Mount::resolve(p_root, false, why);
+	if (root.is_empty()) return { Variant(), Err::from(why, Err::PERMISSION_DENIED) };
+	List<String> args;
+	for (const String &flag : p_flags) {
+		if (!Cmd::runtime_flag(flag)) return { Variant(), Err::from("invalid global runtime flag", Err::INVALID_DATA) };
+		args.push_back(flag);
+	}
+	args.push_back("--path");
+	args.push_back(root);
+	args.push_back("check");
+	args.push_back(p_entry);
+	String output;
+	int code = -1;
+	const Perm::Trusted trust; // Only the internal checker bypasses user process flags.
+	const Error error = OS::get_singleton()->execute(OS::get_singleton()->get_executable_path(), args, &output, &code, true);
+	if (error != OK || code != 0) return { Variant(), Err::from("global entry check failed: " + output, Err::INVALID_DATA) };
+	return { Variant(), Variant() };
+}
+
 // --- Awaitable file operations ---
 // Execute the synchronous Os operations on worker threads.
 // Keep blocking regular-file system calls off the main thread so the event loop can progress.
 
 // Read a text file through an awaitable operation.
 Signal GDFSAPI::read_text_async(const String &p_path) {
-	return GDFileCall::start([p_path]() { return Os::read_text(p_path); });
+	return GDPairCall::start([p_path]() { return Os::read_text(p_path); }, false);
 }
 
 // Read up to the requested byte count from a file offset asynchronously.
 Signal GDFSAPI::read_bytes_async(const String &p_path, int64_t p_offset, int64_t p_max) {
-	return GDFileCall::start([p_path, p_offset, p_max]() { return Os::read_bytes(p_path, p_offset, p_max); });
+	return GDPairCall::start([p_path, p_offset, p_max]() { return Os::read_bytes(p_path, p_offset, p_max); }, false);
 }
 
 // Write a complete text file asynchronously.
 Signal GDFSAPI::write_text_async(const String &p_path, const String &p_body) {
-	return GDFileCall::start([p_path, p_body]() { return Os::write_text(p_path, p_body); });
+	return GDPairCall::start([p_path, p_body]() { return Os::write_text(p_path, p_body); }, false);
 }
 
 // Write a complete binary file asynchronously.
 Signal GDFSAPI::write_bytes_async(const String &p_path, const PackedByteArray &p_body) {
-	return GDFileCall::start([p_path, p_body]() { return Os::write_bytes(p_path, p_body); });
+	return GDPairCall::start([p_path, p_body]() { return Os::write_bytes(p_path, p_body); }, false);
 }
 
 // Append text to a file asynchronously.
 Signal GDFSAPI::append_text_async(const String &p_path, const String &p_body) {
-	return GDFileCall::start([p_path, p_body]() { return Os::append_text(p_path, p_body); });
+	return GDPairCall::start([p_path, p_body]() { return Os::append_text(p_path, p_body); }, false);
 }
 
 // Append bytes to a file asynchronously.
 Signal GDFSAPI::append_bytes_async(const String &p_path, const PackedByteArray &p_body) {
-	return GDFileCall::start([p_path, p_body]() { return Os::append_bytes(p_path, p_body); });
+	return GDPairCall::start([p_path, p_body]() { return Os::append_bytes(p_path, p_body); }, false);
 }
 
 // Copy a file to another path asynchronously.
 Signal GDFSAPI::copy_async(const String &p_src, const String &p_dst) {
-	return GDFileCall::start([p_src, p_dst]() { return Os::copy(p_src, p_dst); });
+	return GDPairCall::start([p_src, p_dst]() { return Os::copy(p_src, p_dst); }, false);
 }
 
 // Replace a file asynchronously only if its contents remain unchanged.
 Signal GDFSAPI::replace_text_async(const String &p_path, const Variant &p_old, const String &p_body) {
 	const Variant old = p_old.duplicate(true);
-	return GDFileCall::start([p_path, old, p_body]() { return Os::replace_text(p_path, old, p_body); });
+	return GDPairCall::start([p_path, old, p_body]() { return Os::replace_text(p_path, old, p_body); }, false);
 }
 
 // Check path existence asynchronously.
@@ -504,47 +566,47 @@ Signal GDFSAPI::exists_async(const String &p_path) {
 
 // Remove a file or empty directory asynchronously.
 Signal GDFSAPI::remove_async(const String &p_path) {
-	return GDFileCall::start([p_path]() { return Os::remove(p_path); });
+	return GDPairCall::start([p_path]() { return Os::remove(p_path); }, false);
 }
 
 // Get a file's byte count asynchronously.
 Signal GDFSAPI::size_of_async(const String &p_path) {
-	return GDFileCall::start([p_path]() { return Os::size_of(p_path); });
+	return GDPairCall::start([p_path]() { return Os::size_of(p_path); }, false);
 }
 
 // Rename a file or directory asynchronously.
 Signal GDFSAPI::rename_async(const String &p_src, const String &p_dst) {
-	return GDFileCall::start([p_src, p_dst]() { return Os::rename(p_src, p_dst); });
+	return GDPairCall::start([p_src, p_dst]() { return Os::rename(p_src, p_dst); }, false);
 }
 
 // List immediate directory entries asynchronously.
 Signal GDFSAPI::list_dir_async(const String &p_path) {
-	return GDFileCall::start([p_path]() { return Os::list_dir(p_path); });
+	return GDPairCall::start([p_path]() { return Os::list_dir(p_path); }, false);
 }
 
 // Create one directory asynchronously.
 Signal GDFSAPI::make_dir_async(const String &p_path) {
-	return GDFileCall::start([p_path]() { return Os::make_dir(p_path); });
+	return GDPairCall::start([p_path]() { return Os::make_dir(p_path); }, false);
 }
 
 // Create a directory and missing parents asynchronously.
 Signal GDFSAPI::ensure_dir_async(const String &p_path) {
-	return GDFileCall::start([p_path]() { return Os::ensure_dir(p_path); });
+	return GDPairCall::start([p_path]() { return Os::ensure_dir(p_path); }, false);
 }
 
 // Enumerate a directory tree asynchronously.
 Signal GDFSAPI::walk_async(const String &p_path, bool p_want_dirs, bool p_hidden) {
-	return GDFileCall::start([p_path, p_want_dirs, p_hidden]() { return Os::walk(p_path, p_want_dirs, p_hidden); });
+	return GDPairCall::start([p_path, p_want_dirs, p_hidden]() { return Os::walk(p_path, p_want_dirs, p_hidden); }, false);
 }
 
 // Find paths matching a pattern asynchronously.
 Signal GDFSAPI::glob_async(const String &p_path, const String &p_pattern, bool p_hidden) {
-	return GDFileCall::start([p_path, p_pattern, p_hidden]() { return Os::glob(p_path, p_pattern, p_hidden); });
+	return GDPairCall::start([p_path, p_pattern, p_hidden]() { return Os::glob(p_path, p_pattern, p_hidden); }, false);
 }
 
 // Remove a directory tree and its contents asynchronously.
 Signal GDFSAPI::remove_all_async(const String &p_path) {
-	return GDFileCall::start([p_path]() { return Os::remove_all(p_path); });
+	return GDPairCall::start([p_path]() { return Os::remove_all(p_path); }, false);
 }
 
 // Check path readability asynchronously.
@@ -554,17 +616,17 @@ Signal GDFSAPI::can_read_async(const String &p_path) {
 
 // Archive a directory tree as tar asynchronously.
 Signal GDFSAPI::create_tar_async(const String &p_root) {
-	return GDFileCall::start([p_root]() { return Tar::pack_dir(p_root); });
+	return GDPairCall::start([p_root]() { return Tar::pack_dir(p_root); }, false);
 }
 
 // Extract a tar archive into a directory asynchronously.
 Signal GDFSAPI::extract_tar_async(const PackedByteArray &p_data, const String &p_root) {
-	return GDFileCall::start([p_data, p_root]() { return Tar::unpack_to(p_data, p_root); });
+	return GDPairCall::start([p_data, p_root]() { return Tar::unpack_to(p_data, p_root); }, false);
 }
 
 // Dispatch CSV parsing to a CPU worker.
 Signal GDCodecAPI::csv_async(const String &p_src, const String &p_sep) {
-	return GDValueCall::start([p_src, p_sep]() -> Variant { return Csv::parse(p_src, p_sep); });
+	return GDPairCall::start([p_src, p_sep]() { return Csv::parse(p_src, p_sep); });
 }
 
 // Dispatch CSV encoding to a CPU worker.
@@ -575,7 +637,7 @@ Signal GDCodecAPI::to_csv_async(const Array &p_rows, const String &p_sep) {
 
 // Dispatch object CSV parsing to a CPU worker.
 Signal GDCodecAPI::csv_objects_async(const String &p_src, const String &p_sep) {
-	return GDValueCall::start([p_src, p_sep]() -> Variant { return Csv::parse_objects(p_src, p_sep); });
+	return GDPairCall::start([p_src, p_sep]() { return Csv::parse_objects(p_src, p_sep); });
 }
 
 // Dispatch object CSV encoding to a CPU worker.
@@ -586,7 +648,7 @@ Signal GDCodecAPI::to_csv_objects_async(const Array &p_items, const String &p_se
 
 // Dispatch INI parsing to a CPU worker.
 Signal GDCodecAPI::ini_async(const String &p_src) {
-	return GDValueCall::start([p_src]() -> Variant { return Ini::parse(p_src); });
+	return GDPairCall::start([p_src]() { return Ini::parse(p_src); });
 }
 
 // Dispatch INI encoding to a CPU worker.
@@ -597,29 +659,29 @@ Signal GDCodecAPI::to_ini_async(const Dictionary &p_data) {
 
 // Dispatch TOML parsing to a CPU worker.
 Signal GDCodecAPI::toml_async(const String &p_src) {
-	return GDValueCall::start([p_src]() -> Variant { return Toml::parse(p_src); });
+	return GDPairCall::start([p_src]() { return Toml::parse(p_src); });
 }
 
 // Dispatch TOML encoding to a CPU worker.
 Signal GDCodecAPI::to_toml_async(const Dictionary &p_data, const String &p_prefix) {
 	const Dictionary data = p_data.duplicate(true);
-	return GDValueCall::start([data, p_prefix]() -> Variant { return Toml::stringify(data, p_prefix); });
+	return GDPairCall::start([data, p_prefix]() { return Toml::stringify(data, p_prefix); });
 }
 
 // Dispatch YAML parsing to a CPU worker.
 Signal GDCodecAPI::yaml_async(const String &p_src) {
-	return GDValueCall::start([p_src]() -> Variant { return Yaml::parse(p_src); });
+	return GDPairCall::start([p_src]() { return Yaml::parse(p_src); });
 }
 
 // Dispatch YAML encoding to a CPU worker.
 Signal GDCodecAPI::to_yaml_async(const Variant &p_data, int p_depth) {
 	const Variant data = p_data.duplicate(true);
-	return GDValueCall::start([data, p_depth]() -> Variant { return Yaml::stringify(data, p_depth); });
+	return GDPairCall::start([data, p_depth]() { return Yaml::stringify(data, p_depth); });
 }
 
 // Dispatch commented JSON parsing to a CPU worker.
 Signal GDCodecAPI::jsonc_async(const String &p_src) {
-	return GDValueCall::start([p_src]() -> Variant { return Jsonc::parse(p_src); });
+	return GDPairCall::start([p_src]() { return Jsonc::parse(p_src); });
 }
 
 // Dispatch JSON comment stripping to a CPU worker.
@@ -629,67 +691,58 @@ Signal GDCodecAPI::strip_jsonc_async(const String &p_src) {
 
 // Dispatch JSON Lines parsing to a CPU worker.
 Signal GDCodecAPI::jsonl_async(const String &p_src) {
-	return GDValueCall::start([p_src]() -> Variant { return Jsonl::parse(p_src); });
+	return GDPairCall::start([p_src]() { return Jsonl::parse(p_src); });
 }
 
 // Dispatch JSON Lines encoding to a CPU worker.
 Signal GDCodecAPI::to_jsonl_async(const Array &p_items) {
 	const Array items = p_items.duplicate(true);
-	return GDValueCall::start([items]() -> Variant { return Jsonl::stringify(items); });
+	return GDPairCall::start([items]() { return Jsonl::stringify(items); });
 }
 
 // Dispatch front-matter parsing to a CPU worker.
 Signal GDCodecAPI::front_matter_async(const String &p_src) {
-	return GDValueCall::start([p_src]() -> Variant { return Front::parse(p_src); });
+	return GDPairCall::start([p_src]() { return Front::parse(p_src); });
 }
 
 // Dispatch front-matter encoding to a CPU worker.
 Signal GDCodecAPI::to_front_matter_async(const Dictionary &p_attrs, const String &p_body, const String &p_kind) {
 	const Dictionary attrs = p_attrs.duplicate(true);
-	return GDValueCall::start([attrs, p_body, p_kind]() -> Variant { return Front::stringify(attrs, p_body, p_kind); });
+	return GDPairCall::start([attrs, p_body, p_kind]() { return Front::stringify(attrs, p_body, p_kind); });
 }
 
 // Dispatch XML parsing to a CPU worker.
 Signal GDCodecAPI::xml_async(const String &p_src) {
-	return GDValueCall::start([p_src]() -> Variant { return Xml::parse(p_src); });
+	return GDPairCall::start([p_src]() { return Xml::parse(p_src); });
 }
 
 // Dispatch XML encoding to a CPU worker.
 Signal GDCodecAPI::to_xml_async(const Dictionary &p_data, int p_indent) {
 	const Dictionary data = p_data.duplicate(true);
-	return GDValueCall::start([data, p_indent]() -> Variant { return Xml::stringify(data, p_indent); });
+	return GDPairCall::start([data, p_indent]() { return Xml::stringify(data, p_indent); });
 }
 
 // Dispatch dotenv parsing to a CPU worker.
 Signal GDCodecAPI::env_async(const String &p_src) {
-	return GDValueCall::start([p_src]() -> Variant { return Dotenv::parse(p_src); });
+	return GDPairCall::start([p_src]() { return Dotenv::parse(p_src); });
 }
 
 // Dispatch dotenv encoding to a CPU worker.
 Signal GDCodecAPI::to_env_async(const Dictionary &p_data) {
 	const Dictionary data = p_data.duplicate(true);
-	return GDValueCall::start([data]() -> Variant { return Dotenv::stringify(data); });
+	return GDPairCall::start([data]() { return Dotenv::stringify(data); });
 }
 
 // Dispatch tar encoding to a CPU worker.
 Signal GDCodecAPI::tar_async(const Array &p_entries) {
 	const Array entries = p_entries.duplicate(true);
-	return GDValueCall::start([entries]() -> Variant { return Tar::pack(entries); });
+	return GDPairCall::start([entries]() { return Tar::pack(entries); });
 }
 
 // Dispatch tar decoding to a CPU worker.
 Signal GDCodecAPI::untar_async(const PackedByteArray &p_data) {
-	return GDValueCall::start([p_data]() -> Variant { return Tar::unpack(p_data); });
+	return GDPairCall::start([p_data]() { return Tar::unpack(p_data); });
 }
-
-namespace {
-
-// Dispatch text-file loading and format parsing to separate worker queues.
-Signal read_format_async(const String &p_path, std::function<Ref<R>(const String &)> p_parse) {
-	return GDFormatCall::start([p_path]() { return Os::read_text(p_path); }, [p_parse](const Ref<R> &p_text) { return p_parse(p_text->get_v()); });
-}
-
-} // namespace
 
 // Create a sequential JSON Lines reader.
 Ref<GDJSONLReader> GDCodecAPI::jsonl_reader() {
@@ -700,52 +753,52 @@ Ref<GDJSONLReader> GDCodecAPI::jsonl_reader() {
 
 // Read a CSV file on a worker and parse its rows.
 Signal GDFSAPI::read_csv_async(const String &p_path, const String &p_sep) {
-	return read_format_async(p_path, [p_sep](const String &p_text) { return Csv::parse(p_text, p_sep); });
+	return GDFormatCall::start([p_path]() { return Os::read_text(p_path); }, [p_sep](const Variant &p_text) { return Csv::parse(p_text, p_sep); });
 }
 
 // Read an INI file on a worker and parse its dictionary.
 Signal GDFSAPI::read_ini_async(const String &p_path) {
-	return read_format_async(p_path, &Ini::parse);
+	return GDFormatCall::start([p_path]() { return Os::read_text(p_path); }, [](const Variant &p_text) { return Ini::parse(p_text); });
 }
 
 // Read a TOML file on a worker and parse its dictionary.
 Signal GDFSAPI::read_toml_async(const String &p_path) {
-	return read_format_async(p_path, &Toml::parse);
+	return GDFormatCall::start([p_path]() { return Os::read_text(p_path); }, [](const Variant &p_text) { return Toml::parse(p_text); });
 }
 
 // Read a YAML file on a worker and parse its value.
 Signal GDFSAPI::read_yaml_async(const String &p_path) {
-	return read_format_async(p_path, &Yaml::parse);
+	return GDFormatCall::start([p_path]() { return Os::read_text(p_path); }, [](const Variant &p_text) { return Yaml::parse(p_text); });
 }
 
 // Read a commented JSON file on a worker and parse its value.
 Signal GDFSAPI::read_jsonc_async(const String &p_path) {
-	return read_format_async(p_path, &Jsonc::parse);
+	return GDFormatCall::start([p_path]() { return Os::read_text(p_path); }, [](const Variant &p_text) { return Jsonc::parse(p_text); });
 }
 
 // Read a JSON Lines file on a worker and parse its values.
 Signal GDFSAPI::read_jsonl_async(const String &p_path) {
-	return read_format_async(p_path, &Jsonl::parse);
+	return GDFormatCall::start([p_path]() { return Os::read_text(p_path); }, [](const Variant &p_text) { return Jsonl::parse(p_text); });
 }
 
 // Read a front-matter file on a worker and parse its attributes and body.
 Signal GDFSAPI::read_front_matter_async(const String &p_path) {
-	return read_format_async(p_path, &Front::parse);
+	return GDFormatCall::start([p_path]() { return Os::read_text(p_path); }, [](const Variant &p_text) { return Front::parse(p_text); });
 }
 
 // Read an XML file on a worker and parse its dictionary.
 Signal GDFSAPI::read_xml_async(const String &p_path) {
-	return read_format_async(p_path, &Xml::parse);
+	return GDFormatCall::start([p_path]() { return Os::read_text(p_path); }, [](const Variant &p_text) { return Xml::parse(p_text); });
 }
 
 // Read a dotenv file on a worker and parse its environment dictionary.
 Signal GDFSAPI::read_env_async(const String &p_path) {
-	return read_format_async(p_path, &Dotenv::parse);
+	return GDFormatCall::start([p_path]() { return Os::read_text(p_path); }, [](const Variant &p_text) { return Dotenv::parse(p_text); });
 }
 
 // Read a tar file on a worker and decode its entries.
 Signal GDFSAPI::read_tar_async(const String &p_path) {
-	return GDFormatCall::start([p_path]() { return Os::read_bytes(p_path); }, [](const Ref<R> &p_data) { return Tar::unpack(p_data->get_v()); });
+	return GDFormatCall::start([p_path]() { return Os::read_bytes(p_path); }, [](const Variant &p_data) { return Tar::unpack(p_data); });
 }
 
 // Create a binary heap with a selectable priority function.
@@ -917,7 +970,7 @@ void GDCollectionsAPI::_bind_methods() {
 // Expose binary, encoding, and hashing APIs to script.
 void GDCodecAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("gzip_writer", "writer", "level"), &GDCodecAPI::gzip_writer, DEFVAL(-1));
-	ADD_RESULT("gzip_writer", "GDGzipWriter");
+	ADD_PAIR_RESULT("gzip_writer", "GDGzipWriter");
 	ClassDB::bind_method(D_METHOD("csv", "src", "sep"), &GDCodecAPI::csv, DEFVAL(","));
 	ClassDB::bind_method(D_METHOD("to_csv", "rows", "sep"), &GDCodecAPI::to_csv, DEFVAL(","));
 	ClassDB::bind_method(D_METHOD("csv_objects", "src", "sep"), &GDCodecAPI::csv_objects, DEFVAL(","));
@@ -1050,52 +1103,52 @@ void GDCodecAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("to_env_async", "data"), &GDCodecAPI::to_env_async);
 	ClassDB::bind_method(D_METHOD("tar_async", "entries"), &GDCodecAPI::tar_async);
 	ClassDB::bind_method(D_METHOD("untar_async", "data"), &GDCodecAPI::untar_async);
-	ADD_RESULT("json_encode", "PackedByteArray");
-	ADD_RESULT("json_decode", "Variant");
-	ADD_RESULT("hex_decode", "PackedByteArray");
-	ADD_RESULT("base64_decode", "PackedByteArray");
-	ADD_RESULT("base64url_decode", "PackedByteArray");
-	ADD_RESULT("base32_decode", "PackedByteArray");
-	ADD_RESULT("varint_decode", "Dictionary");
-	ADD_RESULT("to_toml", "String");
-	ADD_RESULT("to_yaml", "String");
-	ADD_RESULT("to_front_matter", "String");
-	ADD_RESULT("to_xml", "String");
-	ADD_RESULT("env", "Dictionary");
-	ADD_RESULT("to_env", "String");
-	ADD_RESULT("tar", "PackedByteArray");
-	ADD_RESULT("msgpack", "PackedByteArray");
-	ADD_RESULT("cbor", "PackedByteArray");
-	ADD_RESULT("pbkdf2_sha256", "PackedByteArray");
-	ADD_RESULT("unmsgpack", "Variant");
-	ADD_RESULT("uncbor", "Variant");
-	ADD_RESULT("hmac", "PackedByteArray");
-	ADD_RESULT("pbkdf2", "PackedByteArray");
-	ADD_RESULT("hkdf", "PackedByteArray");
-	ADD_RESULT("hkdf_extract", "PackedByteArray");
-	ADD_RESULT("hkdf_expand", "PackedByteArray");
-	ADD_RESULT("csv", "Array");
-	ADD_RESULT("csv_objects", "Array");
-	ADD_RESULT("ini", "Dictionary");
-	ADD_RESULT("toml", "Dictionary");
-	ADD_RESULT("yaml", "Variant");
-	ADD_RESULT("jsonc", "Variant");
-	ADD_RESULT("jsonl", "Array");
-	ADD_RESULT("to_jsonl", "String");
-	ADD_RESULT("front_matter", "Dictionary");
-	ADD_RESULT("xml", "Dictionary");
-	ADD_RESULT("untar", "Array");
-	ADD_AWAIT("pbkdf2_sha256_async", "R:PackedByteArray");
-	ADD_AWAIT("pbkdf2_async", "R:PackedByteArray");
-	ADD_AWAIT("hkdf_async", "R:PackedByteArray");
-	ADD_AWAIT("hkdf_extract_async", "R:PackedByteArray");
-	ADD_AWAIT("hkdf_expand_async", "R:PackedByteArray");
-	ADD_AWAIT("json_encode_async", "R:PackedByteArray");
-	ADD_AWAIT("json_decode_async", "R:Variant");
-	ADD_AWAIT("msgpack_async", "R:PackedByteArray");
-	ADD_AWAIT("unmsgpack_async", "R:Variant");
-	ADD_AWAIT("cbor_async", "R:PackedByteArray");
-	ADD_AWAIT("uncbor_async", "R:Variant");
+	ADD_PAIR_RESULT("json_encode", "PackedByteArray");
+	ADD_PAIR_RESULT("json_decode", "Variant");
+	ADD_PAIR_RESULT("hex_decode", "PackedByteArray");
+	ADD_PAIR_RESULT("base64_decode", "PackedByteArray");
+	ADD_PAIR_RESULT("base64url_decode", "PackedByteArray");
+	ADD_PAIR_RESULT("base32_decode", "PackedByteArray");
+	ADD_PAIR_RESULT("varint_decode", "Dictionary");
+	ADD_PAIR_RESULT("to_toml", "String");
+	ADD_PAIR_RESULT("to_yaml", "String");
+	ADD_PAIR_RESULT("to_front_matter", "String");
+	ADD_PAIR_RESULT("to_xml", "String");
+	ADD_PAIR_RESULT("env", "Dictionary");
+	ADD_PAIR_RESULT("to_env", "String");
+	ADD_PAIR_RESULT("tar", "PackedByteArray");
+	ADD_PAIR_RESULT("msgpack", "PackedByteArray");
+	ADD_PAIR_RESULT("cbor", "PackedByteArray");
+	ADD_PAIR_RESULT("pbkdf2_sha256", "PackedByteArray");
+	ADD_PAIR_RESULT("unmsgpack", "Variant");
+	ADD_PAIR_RESULT("uncbor", "Variant");
+	ADD_PAIR_RESULT("hmac", "PackedByteArray");
+	ADD_PAIR_RESULT("pbkdf2", "PackedByteArray");
+	ADD_PAIR_RESULT("hkdf", "PackedByteArray");
+	ADD_PAIR_RESULT("hkdf_extract", "PackedByteArray");
+	ADD_PAIR_RESULT("hkdf_expand", "PackedByteArray");
+	ADD_PAIR_RESULT("csv", "Array");
+	ADD_PAIR_RESULT("csv_objects", "Array");
+	ADD_PAIR_RESULT("ini", "Dictionary");
+	ADD_PAIR_RESULT("toml", "Dictionary");
+	ADD_PAIR_RESULT("yaml", "Variant");
+	ADD_PAIR_RESULT("jsonc", "Variant");
+	ADD_PAIR_RESULT("jsonl", "Array");
+	ADD_PAIR_RESULT("to_jsonl", "String");
+	ADD_PAIR_RESULT("front_matter", "Dictionary");
+	ADD_PAIR_RESULT("xml", "Dictionary");
+	ADD_PAIR_RESULT("untar", "Array");
+	ADD_AWAIT("pbkdf2_sha256_async", "Pair:PackedByteArray");
+	ADD_AWAIT("pbkdf2_async", "Pair:PackedByteArray");
+	ADD_AWAIT("hkdf_async", "Pair:PackedByteArray");
+	ADD_AWAIT("hkdf_extract_async", "Pair:PackedByteArray");
+	ADD_AWAIT("hkdf_expand_async", "Pair:PackedByteArray");
+	ADD_AWAIT("json_encode_async", "Pair:PackedByteArray");
+	ADD_AWAIT("json_decode_async", "Pair:Variant");
+	ADD_AWAIT("msgpack_async", "Pair:PackedByteArray");
+	ADD_AWAIT("unmsgpack_async", "Pair:Variant");
+	ADD_AWAIT("cbor_async", "Pair:PackedByteArray");
+	ADD_AWAIT("uncbor_async", "Pair:Variant");
 	ADD_AWAIT("sha224_async", "PackedByteArray");
 	ADD_AWAIT("sha256_async", "PackedByteArray");
 	ADD_AWAIT("sha384_async", "PackedByteArray");
@@ -1105,16 +1158,16 @@ void GDCodecAPI::_bind_methods() {
 	ADD_AWAIT("sha3_384_async", "PackedByteArray");
 	ADD_AWAIT("sha3_512_async", "PackedByteArray");
 	ADD_AWAIT("sha1_async", "PackedByteArray");
-	ADD_AWAIT("hmac_async", "R:PackedByteArray");
+	ADD_AWAIT("hmac_async", "Pair:PackedByteArray");
 	ADD_AWAIT("hmac_sha256_async", "PackedByteArray");
 	ADD_AWAIT("hex_encode_async", "String");
-	ADD_AWAIT("hex_decode_async", "R:PackedByteArray");
+	ADD_AWAIT("hex_decode_async", "Pair:PackedByteArray");
 	ADD_AWAIT("base64_encode_async", "String");
-	ADD_AWAIT("base64_decode_async", "R:PackedByteArray");
+	ADD_AWAIT("base64_decode_async", "Pair:PackedByteArray");
 	ADD_AWAIT("base64url_encode_async", "String");
-	ADD_AWAIT("base64url_decode_async", "R:PackedByteArray");
+	ADD_AWAIT("base64url_decode_async", "Pair:PackedByteArray");
 	ADD_AWAIT("base32_encode_async", "String");
-	ADD_AWAIT("base32_decode_async", "R:PackedByteArray");
+	ADD_AWAIT("base32_decode_async", "Pair:PackedByteArray");
 	ADD_AWAIT("concat_async", "PackedByteArray");
 	ADD_AWAIT("equals_async", "bool");
 	ADD_AWAIT("includes_async", "bool");
@@ -1127,28 +1180,28 @@ void GDCodecAPI::_bind_methods() {
 	ADD_AWAIT("split_async", "Array");
 	ADD_AWAIT("xor_bytes_async", "PackedByteArray");
 	ADD_AWAIT("equal_ct_async", "bool");
-	ADD_AWAIT("csv_async", "R:Array");
+	ADD_AWAIT("csv_async", "Pair:Array");
 	ADD_AWAIT("to_csv_async", "String");
-	ADD_AWAIT("csv_objects_async", "R:Array");
+	ADD_AWAIT("csv_objects_async", "Pair:Array");
 	ADD_AWAIT("to_csv_objects_async", "String");
-	ADD_AWAIT("ini_async", "R:Dictionary");
+	ADD_AWAIT("ini_async", "Pair:Dictionary");
 	ADD_AWAIT("to_ini_async", "String");
-	ADD_AWAIT("toml_async", "R:Dictionary");
-	ADD_AWAIT("to_toml_async", "R:String");
-	ADD_AWAIT("yaml_async", "R:Variant");
-	ADD_AWAIT("to_yaml_async", "R:String");
-	ADD_AWAIT("jsonc_async", "R:Variant");
+	ADD_AWAIT("toml_async", "Pair:Dictionary");
+	ADD_AWAIT("to_toml_async", "Pair:String");
+	ADD_AWAIT("yaml_async", "Pair:Variant");
+	ADD_AWAIT("to_yaml_async", "Pair:String");
+	ADD_AWAIT("jsonc_async", "Pair:Variant");
 	ADD_AWAIT("strip_jsonc_async", "String");
-	ADD_AWAIT("jsonl_async", "R:Array");
-	ADD_AWAIT("to_jsonl_async", "R:String");
-	ADD_AWAIT("front_matter_async", "R:Dictionary");
-	ADD_AWAIT("to_front_matter_async", "R:String");
-	ADD_AWAIT("xml_async", "R:Dictionary");
-	ADD_AWAIT("to_xml_async", "R:String");
-	ADD_AWAIT("env_async", "R:Dictionary");
-	ADD_AWAIT("to_env_async", "R:String");
-	ADD_AWAIT("tar_async", "R:PackedByteArray");
-	ADD_AWAIT("untar_async", "R:Array");
+	ADD_AWAIT("jsonl_async", "Pair:Array");
+	ADD_AWAIT("to_jsonl_async", "Pair:String");
+	ADD_AWAIT("front_matter_async", "Pair:Dictionary");
+	ADD_AWAIT("to_front_matter_async", "Pair:String");
+	ADD_AWAIT("xml_async", "Pair:Dictionary");
+	ADD_AWAIT("to_xml_async", "Pair:String");
+	ADD_AWAIT("env_async", "Pair:Dictionary");
+	ADD_AWAIT("to_env_async", "Pair:String");
+	ADD_AWAIT("tar_async", "Pair:PackedByteArray");
+	ADD_AWAIT("untar_async", "Pair:Array");
 	List<MethodInfo> methods;
 	ClassDB::get_method_list(get_class_static(), &methods, true);
 	for (const MethodInfo &method : methods) {
@@ -1158,61 +1211,61 @@ void GDCodecAPI::_bind_methods() {
 
 // Dispatch key derivation to a CPU worker.
 Signal GDCodecAPI::pbkdf2_sha256_async(const PackedByteArray &p_pass, const PackedByteArray &p_salt, int64_t p_rounds) {
-	return GDValueCall::start([p_pass, p_salt, p_rounds]() -> Variant { return Hash::pbkdf2_sha256(p_pass, p_salt, p_rounds); });
+	return GDPairCall::start([p_pass, p_salt, p_rounds]() -> VariantPair { return Hash::pbkdf2_sha256(p_pass, p_salt, p_rounds); });
 }
 
 // Dispatch PBKDF2 with the selected hash to a CPU worker.
 Signal GDCodecAPI::pbkdf2_async(const String &p_hash, const PackedByteArray &p_pass, const PackedByteArray &p_salt, int64_t p_rounds, int64_t p_size) {
-	return GDValueCall::start([p_hash, p_pass, p_salt, p_rounds, p_size]() -> Variant { return Hash::pbkdf2(p_hash, p_pass, p_salt, p_rounds, p_size); });
+	return GDPairCall::start([p_hash, p_pass, p_salt, p_rounds, p_size]() -> VariantPair { return Hash::pbkdf2(p_hash, p_pass, p_salt, p_rounds, p_size); });
 }
 
 // Dispatch HKDF key derivation to a CPU worker.
 Signal GDCodecAPI::hkdf_async(const String &p_hash, const PackedByteArray &p_secret, const PackedByteArray &p_salt, const PackedByteArray &p_info, int64_t p_size) {
-	return GDValueCall::start([p_hash, p_secret, p_salt, p_info, p_size]() -> Variant { return Hash::hkdf(p_hash, p_secret, p_salt, p_info, p_size); });
+	return GDPairCall::start([p_hash, p_secret, p_salt, p_info, p_size]() -> VariantPair { return Hash::hkdf(p_hash, p_secret, p_salt, p_info, p_size); });
 }
 
 // Dispatch HKDF extraction to a CPU worker.
 Signal GDCodecAPI::hkdf_extract_async(const String &p_hash, const PackedByteArray &p_secret, const PackedByteArray &p_salt) {
-	return GDValueCall::start([p_hash, p_secret, p_salt]() -> Variant { return Hash::hkdf_extract(p_hash, p_secret, p_salt); });
+	return GDPairCall::start([p_hash, p_secret, p_salt]() -> VariantPair { return Hash::hkdf_extract(p_hash, p_secret, p_salt); });
 }
 
 // Dispatch HKDF expansion to a CPU worker.
 Signal GDCodecAPI::hkdf_expand_async(const String &p_hash, const PackedByteArray &p_key, const PackedByteArray &p_info, int64_t p_size) {
-	return GDValueCall::start([p_hash, p_key, p_info, p_size]() -> Variant { return Hash::hkdf_expand(p_hash, p_key, p_info, p_size); });
+	return GDPairCall::start([p_hash, p_key, p_info, p_size]() -> VariantPair { return Hash::hkdf_expand(p_hash, p_key, p_info, p_size); });
 }
 
 // Dispatch JSON encoding to a CPU worker.
 Signal GDCodecAPI::json_encode_async(const Variant &p_value, const Dictionary &p_opts) {
 	const Variant value = p_value;
 	const Dictionary opts = p_opts.duplicate();
-	return GDValueCall::start([value, opts]() -> Variant { return JsonData::encode(value, opts); });
+	return GDPairCall::start([value, opts]() -> VariantPair { return JsonData::encode(value, opts); });
 }
 
 // Dispatch JSON decoding to a CPU worker.
 Signal GDCodecAPI::json_decode_async(const PackedByteArray &p_data) {
-	return GDValueCall::start([p_data]() -> Variant { return JsonData::decode(p_data); });
+	return GDPairCall::start([p_data]() -> VariantPair { return JsonData::decode(p_data); });
 }
 
 // Dispatch MessagePack encoding to a CPU worker.
 Signal GDCodecAPI::msgpack_async(const Variant &p_value) {
 	const Variant value = p_value.duplicate(true);
-	return GDValueCall::start([value]() -> Variant { return Msgpack::encode(value); });
+	return GDPairCall::start([value]() -> VariantPair { return Msgpack::encode(value); });
 }
 
 // Dispatch MessagePack decoding to a CPU worker.
 Signal GDCodecAPI::unmsgpack_async(const PackedByteArray &p_data) {
-	return GDValueCall::start([p_data]() -> Variant { return Msgpack::decode(p_data); });
+	return GDPairCall::start([p_data]() -> VariantPair { return Msgpack::decode(p_data); });
 }
 
 // Dispatch CBOR encoding to a CPU worker.
 Signal GDCodecAPI::cbor_async(const Variant &p_value) {
 	const Variant value = p_value.duplicate(true);
-	return GDValueCall::start([value]() -> Variant { return Cbor::encode(value); });
+	return GDPairCall::start([value]() -> VariantPair { return Cbor::encode(value); });
 }
 
 // Dispatch CBOR decoding to a CPU worker.
 Signal GDCodecAPI::uncbor_async(const PackedByteArray &p_data) {
-	return GDValueCall::start([p_data]() -> Variant { return Cbor::decode(p_data); });
+	return GDPairCall::start([p_data]() -> VariantPair { return Cbor::decode(p_data); });
 }
 
 // Dispatch SHA-224 hashing to a CPU worker.
@@ -1262,7 +1315,7 @@ Signal GDCodecAPI::sha1_async(const PackedByteArray &p_msg) {
 
 // Dispatch HMAC with the selected hash to a CPU worker.
 Signal GDCodecAPI::hmac_async(const String &p_hash, const PackedByteArray &p_key, const PackedByteArray &p_msg) {
-	return GDValueCall::start([p_hash, p_key, p_msg]() -> Variant { return Hash::hmac(p_hash, p_key, p_msg); });
+	return GDPairCall::start([p_hash, p_key, p_msg]() -> VariantPair { return Hash::hmac(p_hash, p_key, p_msg); });
 }
 
 // Dispatch HMAC-SHA-256 to a CPU worker.
@@ -1277,7 +1330,7 @@ Signal GDCodecAPI::hex_encode_async(const PackedByteArray &p_data) {
 
 // Dispatch hexadecimal decoding to a CPU worker.
 Signal GDCodecAPI::hex_decode_async(const String &p_text) {
-	return GDValueCall::start([p_text]() -> Variant { return Encoding::hex_decode(p_text); });
+	return GDPairCall::start([p_text]() { return Encoding::hex_decode(p_text); });
 }
 
 // Dispatch Base64 encoding to a CPU worker.
@@ -1287,7 +1340,7 @@ Signal GDCodecAPI::base64_encode_async(const PackedByteArray &p_data) {
 
 // Dispatch Base64 decoding to a CPU worker.
 Signal GDCodecAPI::base64_decode_async(const String &p_text, bool p_raw) {
-	return GDValueCall::start([p_text, p_raw]() -> Variant { return Encoding::base64_decode(p_text, p_raw); });
+	return GDPairCall::start([p_text, p_raw]() { return Encoding::base64_decode(p_text, p_raw); });
 }
 
 // Dispatch URL-safe Base64 encoding to a CPU worker.
@@ -1297,7 +1350,7 @@ Signal GDCodecAPI::base64url_encode_async(const PackedByteArray &p_data) {
 
 // Dispatch URL-safe Base64 decoding to a CPU worker.
 Signal GDCodecAPI::base64url_decode_async(const String &p_text, bool p_raw) {
-	return GDValueCall::start([p_text, p_raw]() -> Variant { return Encoding::base64url_decode(p_text, p_raw); });
+	return GDPairCall::start([p_text, p_raw]() { return Encoding::base64url_decode(p_text, p_raw); });
 }
 
 // Dispatch Base32 encoding to a CPU worker.
@@ -1307,7 +1360,7 @@ Signal GDCodecAPI::base32_encode_async(const PackedByteArray &p_data) {
 
 // Dispatch Base32 decoding to a CPU worker.
 Signal GDCodecAPI::base32_decode_async(const String &p_text, bool p_raw) {
-	return GDValueCall::start([p_text, p_raw]() -> Variant { return Encoding::base32_decode(p_text, p_raw); });
+	return GDPairCall::start([p_text, p_raw]() { return Encoding::base32_decode(p_text, p_raw); });
 }
 
 // Dispatch byte-sequence concatenation to a CPU worker.
@@ -1386,15 +1439,15 @@ void GDIDAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("dns_namespace"), &GDIDAPI::dns_namespace);
 	ClassDB::bind_method(D_METHOD("url_namespace"), &GDIDAPI::url_namespace);
 	ClassDB::bind_method(D_METHOD("oid_namespace"), &GDIDAPI::oid_namespace);
-	ADD_RESULT("ulid_time", "int");
-	ADD_RESULT("uuid_v5", "String");
-	ADD_RESULT("uuid_bytes", "PackedByteArray");
-	ADD_AWAIT("uuid_v5_async", "R:String");
+	ADD_PAIR_RESULT("ulid_time", "int");
+	ADD_PAIR_RESULT("uuid_v5", "String");
+	ADD_PAIR_RESULT("uuid_bytes", "PackedByteArray");
+	ADD_AWAIT("uuid_v5_async", "Pair:String");
 }
 
 // Dispatch name-based UUID generation to a CPU worker.
 Signal GDIDAPI::uuid_v5_async(const String &p_space, const String &p_name) {
-	return GDValueCall::start([p_space, p_name]() -> Variant { return Uuid::v5(p_space, p_name); });
+	return GDPairCall::start([p_space, p_name]() -> VariantPair { return Uuid::v5(p_space, p_name); });
 }
 
 // Expose text formatting APIs to script.
@@ -1463,9 +1516,9 @@ Signal GDTextAPI::table_async(const Array &p_rows, int p_gap) {
 // Expose HTML entities, tags, and templates to script.
 void GDHTMLAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("fill", "tpl", "data", "partials"), &GDHTMLAPI::fill, DEFVAL(Dictionary()));
-	ADD_RESULT("fill", "String");
+	ADD_PAIR_RESULT("fill", "String");
 	ClassDB::bind_method(D_METHOD("template", "tpl", "partials"), &GDHTMLAPI::template_of, DEFVAL(Dictionary()));
-	ADD_RESULT("template", "GDHTMLTemplate");
+	ADD_PAIR_RESULT("template", "GDHTMLTemplate");
 	ClassDB::bind_method(D_METHOD("attr", "value"), &GDHTMLAPI::attr);
 	ClassDB::bind_method(D_METHOD("tag", "name", "body", "attrs"), &GDHTMLAPI::tag, DEFVAL(Dictionary()));
 	ClassDB::bind_method(D_METHOD("escape", "text"), &GDHTMLAPI::escape);
@@ -1479,7 +1532,7 @@ void GDHTMLAPI::_bind_methods() {
 	ADD_AWAIT("unescape_async", "String");
 	ADD_AWAIT("attr_async", "String");
 	ADD_AWAIT("tag_async", "String");
-	ADD_AWAIT("fill_async", "R:String");
+	ADD_AWAIT("fill_async", "Pair:String");
 }
 
 // Dispatch HTML text escaping to a CPU worker.
@@ -1507,7 +1560,7 @@ Signal GDHTMLAPI::tag_async(const String &p_name, const String &p_body, const Di
 Signal GDHTMLAPI::fill_async(const String &p_tpl, const Dictionary &p_data, const Dictionary &p_partials) {
 	const Dictionary data = p_data;
 	const Dictionary partials = p_partials;
-	return GDValueCall::start([p_tpl, data, partials]() -> Variant { return Html::fill(p_tpl, data, partials); });
+	return GDPairCall::start([p_tpl, data, partials]() -> VariantPair { return Html::fill(p_tpl, data, partials); });
 }
 
 // Expose semantic-version APIs to script.
@@ -1520,14 +1573,14 @@ void GDSemanticVersionAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("best", "list", "range"), &GDSemanticVersionAPI::best, DEFVAL("*"));
 	ClassDB::bind_method(D_METHOD("best_async", "list", "range"), &GDSemanticVersionAPI::best_async, DEFVAL("*"));
 	ClassDB::bind_method(D_METHOD("satisfies", "v", "range"), &GDSemanticVersionAPI::satisfies);
-	ADD_RESULT("parse", "Dictionary");
-	ADD_RESULT("best", "Dictionary");
-	ADD_AWAIT("best_async", "R:Dictionary");
+	ADD_PAIR_RESULT("parse", "Dictionary");
+	ADD_PAIR_RESULT("best", "Dictionary");
+	ADD_AWAIT("best_async", "Pair:Dictionary");
 }
 
 // Dispatch version-list selection to a CPU worker.
 Signal GDSemanticVersionAPI::best_async(const PackedStringArray &p_list, const String &p_range) {
-	return GDValueCall::start([p_list, p_range]() -> Variant { return Semver::best(p_list, p_range); });
+	return GDPairCall::start([p_list, p_range]() -> VariantPair { return Semver::best(p_list, p_range); });
 }
 
 // Expose date-time conversion and arithmetic to script.
@@ -1546,7 +1599,7 @@ void GDDateTimeAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("days_in_month", "year", "month"), &GDDateTimeAPI::days_in_month);
 	ClassDB::bind_method(D_METHOD("ago", "unix", "base"), &GDDateTimeAPI::ago, DEFVAL(-1));
 	ClassDB::bind_method(D_METHOD("format", "unix", "pattern"), &GDDateTimeAPI::format);
-	ADD_RESULT("parse_iso", "int");
+	ADD_PAIR_RESULT("parse_iso", "int");
 }
 
 // Return the running executable's version.
@@ -1575,14 +1628,14 @@ Variant GDCLIAPI::env(const String &p_name, const Variant &p_fallback) const {
 }
 
 // Read a required environment value, or return Err when absent.
-Ref<R> GDCLIAPI::require_env(const String &p_name) const {
+VariantPair GDCLIAPI::require_env(const String &p_name) const {
 	if (!Perm::check(Perm::ENV, p_name)) {
-		return R::err(vformat("environment variable %s is not allowed", p_name), Err::PERMISSION_DENIED);
+		return { Variant(), Err::make(vformat("environment variable %s is not allowed", p_name), Err::PERMISSION_DENIED) };
 	}
 	if (!GDSystem::has_env(p_name)) {
-		return R::err(vformat("environment variable %s is missing", p_name), Err::NOT_FOUND);
+		return { Variant(), Err::make(vformat("environment variable %s is missing", p_name), Err::NOT_FOUND) };
 	}
-	return R::ok(GDSystem::env(p_name));
+	return { GDSystem::env(p_name), Variant() };
 }
 
 // Return the current working directory.
@@ -1620,9 +1673,9 @@ void GDCLIAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("bold", "text"), &GDCLIAPI::bold);
 	ClassDB::bind_method(D_METHOD("run", "path", "args", "opts"), &GDCLIAPI::run, DEFVAL(PackedStringArray()), DEFVAL(Dictionary()));
 	ClassDB::bind_method(D_METHOD("run_async", "path", "args", "opts"), &GDCLIAPI::run_async, DEFVAL(PackedStringArray()), DEFVAL(Dictionary()));
-	ADD_RESULT("require_env", "String");
-	ADD_AWAIT("run", "R:Dictionary");
-	ADD_AWAIT("run_async", "R:Dictionary");
+	ADD_PAIR_RESULT("require_env", "String");
+	ADD_AWAIT("run", "Pair:Dictionary");
+	ADD_AWAIT("run_async", "Pair:Dictionary");
 	ADD_AUTO_WAIT("run");
 }
 
@@ -1648,6 +1701,7 @@ GDAPI::GDAPI() {
 	async = memnew(GDAsyncAPI);
 	log = memnew(GDLogAPI);
 	net = memnew(GDNetAPI);
+	mail = memnew(GDMailAPI);
 	http = memnew(GDHTTPAPI);
 	web = memnew(GDWebAPI);
 	file = memnew(GDFSAPI);
@@ -1662,10 +1716,12 @@ GDAPI::GDAPI() {
 	cli = memnew(GDCLIAPI);
 	test = memnew(GDTestAPI);
 	database = memnew(GDDatabaseAPI);
+	online = memnew(GDOnlineAPI);
 }
 
 // Destroy child APIs in reverse construction order.
 GDAPI::~GDAPI() {
+	memdelete(online);
 	memdelete(database);
 	memdelete(test);
 	memdelete(cli);
@@ -1680,6 +1736,7 @@ GDAPI::~GDAPI() {
 	memdelete(file);
 	memdelete(web);
 	memdelete(http);
+	memdelete(mail);
 	memdelete(net);
 	memdelete(log);
 	memdelete(async);
@@ -1693,6 +1750,7 @@ void GDAPI::_bind_methods() {
 	GD_CHILD(async, GDAsyncAPI);
 	GD_CHILD(log, GDLogAPI);
 	GD_CHILD(net, GDNetAPI);
+	GD_CHILD(mail, GDMailAPI);
 	GD_CHILD(http, GDHTTPAPI);
 	GD_CHILD(web, GDWebAPI);
 	GD_CHILD(file, GDFSAPI);
@@ -1707,12 +1765,13 @@ void GDAPI::_bind_methods() {
 	GD_CHILD(cli, GDCLIAPI);
 	GD_CHILD(test, GDTestAPI);
 	GD_CHILD(database, GDDatabaseAPI);
+	GD_CHILD(online, GDOnlineAPI);
 #undef GD_CHILD
 }
 
 // Expose the JWT verification completion signal.
 void GDWebJwtCall::_bind_methods() {
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::DICTIONARY, "claims"), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
 // Run the optional callable on the main thread after cryptographic verification.
@@ -1726,34 +1785,41 @@ Signal GDWebJwtCall::start(const String &p_token, const Variant &p_key, const Di
 	opts.erase("check");
 	const Variant key = p_key;
 	const Signal signal(call.ptr(), "finished");
-	GDValueCall::start([p_token, key, opts]() -> Variant { return GDWebApp::jwt_verify(p_token, key, opts); }).connect(
+	GDPairCall::start([p_token, key, opts]() -> VariantPair { return GDWebApp::jwt_verify(p_token, key, opts); }).connect(
 			callable_mp(call.ptr(), &GDWebJwtCall::verified), Object::CONNECT_ONE_SHOT);
 	return signal;
 }
 
 // Apply revocation checks to the worker result and return the final outcome.
-void GDWebJwtCall::verified(const Variant &p_result) {
+void GDWebJwtCall::verified(const Variant &p_result, const Variant &p_error) {
 	Ref<GDWebJwtCall> keep(this);
-	Ref<R> out = p_result;
-	if (out.is_null()) {
-		out = R::err("JWT worker returned no result", Err::INVALID_DATA);
-	} else if (out->get_ok() && has_check) {
+	VariantPair out{ p_result, p_error };
+	if (Ref<Err>(out.error).is_null() && out.value.get_type() != Variant::DICTIONARY) {
+		out = { Dictionary(), Err::make("JWT worker returned no result", Err::INVALID_DATA) };
+	} else if (Ref<Err>(out.error).is_null() && has_check) {
 		if (check.get_type() != Variant::CALLABLE || !Callable(check).is_valid()) {
-			out = R::err("JWT check must be a valid Callable", Err::INVALID_DATA);
+			out = { Dictionary(), Err::make("JWT check must be a valid Callable", Err::INVALID_DATA) };
 		} else {
 			const Callable fn = check;
-			const Variant arg = out->get_v();
+			const Variant arg = out.value;
 			const Variant *args[] = { &arg };
 			Variant accepted;
+			Variant check_error;
 			Callable::CallError err;
+			err.result_error = &check_error;
 			fn.callp(args, 1, accepted, err);
-			if (err.error != Callable::CallError::CALL_OK || accepted.get_type() != Variant::BOOL || !(bool)accepted) {
-				out = R::err("JWT was revoked", Err::UNAUTHENTICATED);
+			const Ref<Err> failed = Ref<Err>(check_error).is_valid() ? Ref<Err>(check_error) : Ref<Err>(accepted);
+			if (err.error != Callable::CallError::CALL_OK || err.runtime_failed || failed.is_valid()) {
+				out = { Dictionary(), failed.is_valid() ? Variant(failed) : Variant(Err::make("JWT check could not be invoked", Err::INVALID_DATA)) };
+			} else if (accepted.get_type() != Variant::BOOL) {
+				out = { Dictionary(), Err::make("JWT check must return a bool", Err::INVALID_DATA) };
+			} else if (!(bool)accepted) {
+				out = { Dictionary(), Err::make("JWT was revoked", Err::UNAUTHENTICATED) };
 			}
 		}
 	}
 	check = Variant();
-	emit_signal("finished", out);
+	Async::finish(this, SNAME("finished"), out.value, out.error);
 	self_hold.unref();
 }
 
@@ -1765,7 +1831,7 @@ Ref<GDWebApp> GDWebAPI::app() const {
 }
 
 // Create an incremental response without buffering the producer's complete output.
-Dictionary GDWebAPI::stream(const Callable &p_next, int64_t p_length, const String &p_type, int64_t p_status) const {
+Ref<GDWebResponse> GDWebAPI::stream(const Callable &p_next, int64_t p_length, const String &p_type, int64_t p_status) const {
 	return GDWebWriter::reply(p_next, p_length, p_type, p_status);
 }
 
@@ -1782,7 +1848,7 @@ Signal GDWebAPI::view(const String &p_path, const Dictionary &p_data, int64_t p_
 }
 
 // Complete short JSON locally and move only unfinished traversal off the main thread.
-Variant GDWebAPI::json(const Variant &p_data, int64_t p_status) const {
+VariantPair GDWebAPI::json(const Variant &p_data, int64_t p_status) const {
 	uint64_t until = GDScriptFunction::time_slice_deadline();
 	if (!until && Thread::is_main_thread()) until = GDClock::usec() + GD_SCHED_SLICE_USEC;
 	return Http::json_out(p_data, p_status, until);
@@ -1831,7 +1897,7 @@ Signal GDWebAPI::view_async(const String &p_path, const Dictionary &p_data, int6
 // Create large JSON responses on a CPU worker.
 Signal GDWebAPI::json_async(const Variant &p_data, int64_t p_status) const {
 	const Variant data = p_data;
-	return GDValueCall::start([data, p_status]() -> Variant { return Http::json_out(data, p_status); });
+	return GDPairCall::start([data, p_status]() -> VariantPair { return Http::json_out(data, p_status); });
 }
 
 // Sign JWT claims on a CPU worker.
@@ -1839,7 +1905,7 @@ Signal GDWebAPI::jwt_sign_async(const Dictionary &p_claims, const Variant &p_key
 	const Dictionary claims = p_claims;
 	const Variant key = p_key;
 	const Dictionary opts = p_opts;
-	return GDValueCall::start([claims, key, opts]() -> Variant { return GDWebApp::jwt_sign(claims, key, opts); });
+	return GDPairCall::start([claims, key, opts]() -> VariantPair { return GDWebApp::jwt_sign(claims, key, opts); });
 }
 
 // Verify a JWT on a CPU worker.
@@ -1851,7 +1917,7 @@ Signal GDWebAPI::jwt_verify_async(const String &p_token, const Variant &p_key, c
 Signal GDWebAPI::validate_async(const Variant &p_value, const Dictionary &p_rule) const {
 	const Variant value = p_value;
 	const Dictionary rule = p_rule;
-	return GDValueCall::start([value, rule]() -> Variant { return GDWebApp::validate(value, rule); });
+	return GDPairCall::start([value, rule]() -> VariantPair { return GDWebApp::validate(value, rule); });
 }
 
 // Expose web application, response, and middleware APIs to script.
@@ -1893,16 +1959,17 @@ void GDWebAPI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("json_body", "rule", "name"), &GDWebAPI::json_body, DEFVAL("body"));
 	ClassDB::bind_method(D_METHOD("query", "rule", "name"), &GDWebAPI::query, DEFVAL("query"));
 	ClassDB::bind_method(D_METHOD("params", "rule", "name"), &GDWebAPI::params, DEFVAL("params"));
-	ADD_RESULT("jwt_sign", "String");
-	ADD_AWAIT("view", "R:Dictionary");
-	ADD_AWAIT("json", "R:Dictionary");
-	ADD_AWAIT("view_async", "R:Dictionary");
-	ADD_AWAIT("json_async", "R:Dictionary");
-	ADD_AWAIT("jwt_sign_async", "R:String");
-	ADD_AWAIT("jwt_verify_async", "R:Dictionary");
-	ADD_AWAIT("validate_async", "R:Variant");
-	ADD_RESULT("jwt_verify", "Dictionary");
-	ADD_RESULT("validate", "Variant");
+	ADD_PAIR_RESULT("jwt_sign", "String");
+	ADD_AWAIT("view", "Pair:GDWebResponse");
+	ADD_AWAIT("json", "Pair:GDWebResponse");
+	ADD_AWAIT("view_async", "Pair:GDWebResponse");
+	ADD_AWAIT("json_async", "Pair:GDWebResponse");
+	ADD_AWAIT("jwt_sign_async", "Pair:String");
+	ADD_AWAIT("jwt_verify_async", "Pair:Dictionary");
+	ADD_AWAIT("validate_async", "Pair:Variant");
+	ADD_PAIR_RESULT("jwt_verify", "Dictionary");
+	ADD_PAIR_RESULT("json", "GDWebResponse");
+	ADD_PAIR_RESULT("validate", "Variant");
 	ADD_AUTO_WAIT("view");
 	ADD_AUTO_WAIT("json");
 	List<MethodInfo> methods;

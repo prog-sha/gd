@@ -75,9 +75,9 @@ void FileSource::fill_on_worker() {
 	if (need_open) {
 		SourceError::clear();
 		file = GDFile::open(target, GDFile::READ);
-		if (file.is_null()) { finish(SourceError::path(target, "open", GDFile::get_open_error(), "cannot open file")->get_e()); return; }
+		if (file.is_null()) { finish(SourceError::path(target, "open", GDFile::get_open_error(), "cannot open file")); return; }
 		const uint64_t size = file->get_length();
-		if (file->get_error() != OK) { finish(SourceError::path(target, "stat", file->get_error(), "cannot inspect file")->get_e()); return; }
+		if (file->get_error() != OK) { finish(SourceError::path(target, "stat", file->get_error(), "cannot inspect file")); return; }
 		if (size > INT64_MAX) { finish(Err::make("file is too large", Err::LIMITED)); return; }
 		MutexLock lock(mutex);
 		length = size;
@@ -97,7 +97,7 @@ void FileSource::fill_on_worker() {
 		if (chunk.resize(want) != OK) { finish(Err::make("cannot reserve file read buffer", Err::LIMITED)); return; }
 		SourceError::clear();
 		const uint64_t got = file->get_buffer(chunk.ptrw(), want);
-		if (!got || (file->get_error() != OK && file->get_error() != ERR_FILE_EOF)) { finish(SourceError::path(target, "read", file->get_error() == OK ? ERR_FILE_EOF : file->get_error(), "cannot read complete file")->get_e()); return; }
+		if (!got || (file->get_error() != OK && file->get_error() != ERR_FILE_EOF)) { finish(SourceError::path(target, "read", file->get_error() == OK ? ERR_FILE_EOF : file->get_error(), "cannot read complete file")); return; }
 		chunk.resize(got);
 		{
 			MutexLock lock(mutex);
@@ -112,18 +112,18 @@ void FileSource::fill_on_worker() {
 
 // Deliver the open result only on the first worker completion.
 void FileSource::job_finished() {
-	Ref<R> result;
+	VariantPair result;
 	bool first = false;
 	{
 		MutexLock lock(mutex);
 		if (!open_sent) {
 			open_sent = true;
 			first = true;
-			result = why.is_null() && opened ? R::ok(length) : why.is_valid() ? R::err(why) : R::err("file read canceled", Err::INTERRUPTED);
+			result = why.is_null() && opened ? VariantPair{ int64_t(length), Variant() } : VariantPair{ int64_t(0), why.is_valid() ? Variant(why) : Variant(Err::make("file read canceled", Err::INTERRUPTED)) };
 		}
 	}
 	if (first) {
-		emit_signal("opened", result);
+		emit_signal("opened", result.value, result.error);
 	}
 	if (ready.is_valid()) {
 		ready.call();
@@ -177,5 +177,5 @@ void FileSource::abort() {
 // Register the open-completion signal.
 void FileSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &FileSource::abort);
-	ADD_SIGNAL(MethodInfo("opened", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("opened", PropertyInfo(Variant::INT, "length"), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }

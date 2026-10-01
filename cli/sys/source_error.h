@@ -11,7 +11,7 @@
 #include "core/error/error_list.h"
 #include "core/variant/variant.h"
 
-class R;
+class Err;
 
 class SourceError {
 public:
@@ -43,5 +43,5 @@ public:
 	// Expose original subsystem and code in info and return a machine-readable Error.
 	static Error put(Dictionary &r_info, Error p_fallback);
 	// Create a file failure with operation, path, and original cause.
-	static Ref<R> path(const String &p_path, const char *p_op, Error p_fallback, const String &p_msg);
+	static Ref<Err> path(const String &p_path, const char *p_op, Error p_fallback, const String &p_msg);
 };

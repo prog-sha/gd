@@ -191,7 +191,7 @@ Signal GDDatabaseRows::next() {
 	{
 		MutexLock lock(mutex);
 		if (next_pending) {
-			failed = Err::make("database Rows.Next is already waiting", Err::ALREADY_EXISTS);
+			failed = Err::join(failed, Err::make("database Rows.Next is already waiting", Err::ALREADY_EXISTS));
 			ended = true;
 			closed = true;
 			duplicate = true;
@@ -231,22 +231,22 @@ Signal GDDatabaseRows::next() {
 }
 
 // Copy the current row into a column-name dictionary.
-Ref<R> GDDatabaseRows::scan() const {
+VariantPair GDDatabaseRows::scan() const {
 	MutexLock lock(mutex);
 	if (!current_valid) {
-		return R::err("database Rows.Scan called without a current row", Err::INVALID_DATA);
+		return { Variant(), Err::make("database Rows.Scan called without a current row", Err::INVALID_DATA) };
 	}
 	Dictionary row;
 	for (int i = 0; i < names.size() && i < current.size(); i++) {
 		row[names[i]] = current[i];
 	}
-	return R::ok(row);
+	return { row, Variant() };
 }
 
 // Return current-row values in column order.
-Ref<R> GDDatabaseRows::values() const {
+VariantPair GDDatabaseRows::values() const {
 	MutexLock lock(mutex);
-	return current_valid ? R::ok(current) : R::err("database Rows.Values called without a current row", Err::INVALID_DATA);
+	return current_valid ? VariantPair{ current, Variant() } : VariantPair{ Variant(), Err::make("database Rows.Values called without a current row", Err::INVALID_DATA) };
 }
 
 // Return result column names.
@@ -328,8 +328,8 @@ void GDDatabaseRows::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDDatabaseRows::cancel);
 	ClassDB::bind_method(D_METHOD("is_closed"), &GDDatabaseRows::is_closed);
 	ADD_SIGNAL(MethodInfo("nexted", PropertyInfo(Variant::BOOL, "has_row")));
-	ADD_RESULT("scan", "Dictionary");
-	ADD_RESULT("values", "Array");
+	ADD_PAIR_RESULT("scan", "Dictionary");
+	ADD_PAIR_RESULT("values", "Array");
 	ADD_AWAIT("next", "bool");
 	ADD_AWAIT("next_async", "bool");
 	ADD_AUTO_WAIT("next");

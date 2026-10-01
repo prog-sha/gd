@@ -1,30 +1,32 @@
-# 安全な利用と脆弱性報告
+# Security policy
 
-## 対応版
+English | [日本語](SECURITY.ja.md)
 
-修正は最新のreleaseへ入れます。APIが固まる前の版では、互換性より安全な修正を優先します。
+## Supported versions
 
-## 脆弱性の報告
+Fixes are included in the latest release. Before the API is stable, safe fixes take priority over compatibility.
 
-公開issueには書かず、GitHubの
-[Private vulnerability reporting](https://github.com/prog-sha/gd/security/advisories/new)を使ってください。
-利用できない場合は、機密情報を除いた連絡用issueを作り、非公開の連絡方法を相談してください。
+## Reporting a vulnerability
 
-次の情報があると確認が速くなります。
+Do not disclose vulnerabilities in public issues. Use GitHub's
+[private vulnerability reporting](https://github.com/prog-sha/gd/security/advisories/new).
+If it is unavailable, open an issue containing no confidential details and ask for a private contact method.
 
-- 影響する版、OS、architecture
-- 再現に必要な最小のscriptとcommand
-- 必要な権限flagと攻撃者が持つ前提
-- 読取、書込、実行、通信、停止など想定される影響
-- 公開希望日がある場合はその日
+Include the following to help us investigate:
 
-受領後7日以内に確認し、影響と修正方針を返します。修正と公開時期は報告者と調整し、
-修正版、advisory、creditを同時に公開します。
+- Affected version, OS, and architecture
+- A minimal script and command to reproduce the issue
+- Required permission flags and assumptions about the attacker's access
+- Expected impact, such as reading, writing, execution, network access, or service interruption
+- Your preferred disclosure date, if any
 
-## 安全な利用
+We acknowledge reports within seven days and respond with an assessment and proposed fix.
+We coordinate the fix and disclosure date with the reporter, publishing the fixed version, advisory, and credit together.
 
-- 未確認のscriptは`--strict`で実行し、必要なmountとallowだけを渡してください。Windowsではmountが未対応なので、fileを`res://`か`user://`へ置いてください。
-- `--allow-ext`で許したnative extensionはgdと同じ権限で動きます。
-- secretはsource、`gd.json`、command lineへ書かず、許可した環境変数から読んでください。
-- 公開serverはloopbackで動作確認してから、必要なaddressだけを`--allow-net`へ指定してください。
-- release archiveは`SHA256SUMS`を検証してください。
+## Safe use
+
+- Run unverified scripts with `--strict` and grant only the mounts and permissions they need. Named mounts are not supported on Windows; place files in `res://` or `user://` there.
+- Native extensions allowed by `--allow-ext` run with the same privileges as gd.
+- Keep secrets out of source files, `gd.json`, and command lines. Read them from permitted environment variables.
+- Test public servers on loopback first, then grant only the required addresses through `--allow-net`.
+- Verify release archives against `SHA256SUMS`.

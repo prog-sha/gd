@@ -30,6 +30,11 @@
 
 #pragma once
 
+#ifdef GD_VIEW
+// Share one object layout with the recorded display declaration.
+#include "../../tmp/view-src/scene/main/scene_tree.h"
+#else
+
 #include "core/object/message_queue.h"
 #include "core/object/ref_counted.h"
 #include "core/os/main_loop.h"
@@ -433,3 +438,4 @@ public:
 };
 
 VARIANT_ENUM_CAST(SceneTree::GroupCallFlags);
+#endif

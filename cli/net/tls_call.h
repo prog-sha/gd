@@ -8,7 +8,7 @@ class GDWebTLSCall : public PoolJob {
 	friend class GDWebApp;
 	Ref<GDWebApp> app; // Application retained until startup completion.
 	Ref<RefCounted> token; // Cancelled when the application is stopped or another startup wins.
-	Ref<R> result; // Validated immutable identity or a file/PEM error.
+	VariantPair result; // Validated immutable identity and its file or PEM error.
 	String cert, key, host; // Permission-checked credential paths and bind address.
 	Dictionary options; // Immutable TLS startup options copied before worker submission.
 	int64_t port = 0; // Requested port, including ephemeral zero.

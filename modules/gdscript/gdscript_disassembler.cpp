@@ -677,13 +677,18 @@ void GDScriptFunction::disassemble(const Vector<String> &p_code_lines) const {
 			} break;
 			case OPCODE_CALL:
 			case OPCODE_CALL_RETURN:
+			case OPCODE_CALL_PAIR:
+			case OPCODE_CALL_PAIR_ASYNC:
 			case OPCODE_CALL_ASYNC: {
 				bool ret = (_code_ptr[ip]) == OPCODE_CALL_RETURN;
-				bool async = (_code_ptr[ip]) == OPCODE_CALL_ASYNC;
+				bool pair = (_code_ptr[ip]) == OPCODE_CALL_PAIR || (_code_ptr[ip]) == OPCODE_CALL_PAIR_ASYNC;
+				bool async = (_code_ptr[ip]) == OPCODE_CALL_ASYNC || (_code_ptr[ip]) == OPCODE_CALL_PAIR_ASYNC;
 
 				int instr_var_args = _code_ptr[++ip];
 
-				if (ret) {
+				if (pair) {
+					text += "call-pair ";
+				} else if (ret) {
 					text += "call-ret ";
 				} else if (async) {
 					text += "call-async ";
@@ -692,8 +697,11 @@ void GDScriptFunction::disassemble(const Vector<String> &p_code_lines) const {
 				}
 
 				int argc = _code_ptr[ip + 1 + instr_var_args];
-				if (ret || async) {
+				if (ret || async || pair) {
 					text += DADDR(2 + argc) + " = ";
+				}
+				if (pair) {
+					text += DADDR(3 + argc) + " = ";
 				}
 
 				text += DADDR(1 + argc) + ".";
@@ -708,7 +716,7 @@ void GDScriptFunction::disassemble(const Vector<String> &p_code_lines) const {
 				}
 				text += ")";
 
-				incr = 5 + argc;
+				incr = (pair ? 6 : 5) + argc;
 			} break;
 			case OPCODE_CALL_METHOD_BIND:
 			case OPCODE_CALL_METHOD_BIND_RET: {
@@ -963,13 +971,19 @@ void GDScriptFunction::disassemble(const Vector<String> &p_code_lines) const {
 
 				incr = 4 + argc;
 			} break;
-			case OPCODE_CALL_SELF_BASE: {
+			case OPCODE_CALL_SELF_BASE:
+			case OPCODE_CALL_SELF_BASE_PAIR: {
+				const bool paired = _code_ptr[ip] == OPCODE_CALL_SELF_BASE_PAIR;
 				int instr_var_args = _code_ptr[++ip];
 
-				text += "call-self-base ";
+				text += paired ? "call-self-base-pair " : "call-self-base ";
 
 				int argc = _code_ptr[ip + 1 + instr_var_args];
-				text += DADDR(2 + argc) + " = ";
+				text += DADDR(2 + argc);
+				if (paired) {
+					text += ", " + DADDR(3 + argc);
+				}
+				text += " = ";
 
 				text += _global_names_ptr[_code_ptr[ip + 2 + instr_var_args]];
 				text += "(";
@@ -982,7 +996,7 @@ void GDScriptFunction::disassemble(const Vector<String> &p_code_lines) const {
 				}
 				text += ")";
 
-				incr = 4 + argc;
+				incr = 4 + argc + (paired ? 1 : 0);
 			} break;
 			case OPCODE_AWAIT: {
 				text += "await ";
@@ -995,6 +1009,12 @@ void GDScriptFunction::disassemble(const Vector<String> &p_code_lines) const {
 				text += DADDR(1);
 
 				incr = 2;
+			} break;
+			case OPCODE_AWAIT_RESUME_PAIR: {
+				text += "await resume pair ";
+				text += DADDR(1) + ", " + DADDR(2);
+
+				incr = 3;
 			} break;
 			case OPCODE_CREATE_LAMBDA: {
 				int instr_var_args = _code_ptr[++ip];
@@ -1076,6 +1096,14 @@ void GDScriptFunction::disassemble(const Vector<String> &p_code_lines) const {
 				text += DADDR(1);
 
 				incr = 2;
+			} break;
+			case OPCODE_RETURN_PAIR: {
+				text += "return pair ";
+				text += DADDR(1);
+				text += ", ";
+				text += DADDR(2);
+
+				incr = 3;
 			} break;
 			case OPCODE_RETURN_TYPED_BUILTIN: {
 				text += "return typed builtin (";

@@ -36,7 +36,7 @@ private:
 	String path; // Path to open.
 	String mode; // Open mode.
 	int64_t number = 0; // Read length or seek offset.
-	Ref<R> outcome; // Worker-produced result.
+	VariantPair outcome; // Worker-produced value and error.
 
 	friend class GDFileStream;
 
@@ -56,9 +56,9 @@ class GDFileStream : public RefCounted {
 	bool closing = false; // Whether close has been accepted.
 
 	Signal enqueue(GDFileStreamCall::Op p_op, const PackedByteArray &p_data = PackedByteArray(), int64_t p_number = 0);
-	Ref<R> run_call(GDFileStreamCall *p_call); // Perform the file operation on a worker.
+	VariantPair run_call(GDFileStreamCall *p_call); // Perform the file operation on a worker.
 	void call_finished(GDFileStreamCall *p_call); // Submit the next operation to a worker.
-	static Ref<R> fail_file(const String &p_path, const String &p_action, Error p_error, const Variant &p_value = Variant());
+	static VariantPair fail_file(const String &p_path, const String &p_action, Error p_error, const Variant &p_value = Variant());
 
 	friend class GDFileStreamCall;
 
@@ -69,7 +69,7 @@ public:
 	~GDFileStream();
 	// Open on a worker and return the stream.
 	static Signal open(const String &p_path, const String &p_mode);
-	// Read up to the requested bytes; an empty success result denotes EOF.
+	// Read up to the requested bytes; an empty success result denotes EOF when the requested count is positive.
 	Signal read(int64_t p_max = 32768);
 	Signal read_async(int64_t p_max = 32768) { return read(p_max); }
 	// Write all supplied bytes and return the written count.
@@ -81,5 +81,6 @@ public:
 	// Close the file after preceding operations.
 	Signal close();
 	Signal close_async() { return close(); }
+	// Return whether the file has been opened and closing has not started.
 	bool is_open() const { return opened.is_set() && !closing; }
 };

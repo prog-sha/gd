@@ -14,5 +14,5 @@ public:
 	Error update(const PackedByteArray &p_data); // Append input bytes.
 	PackedByteArray finish(); // Return the digest and release state.
 	static PackedByteArray random(int p_size); // Generate cryptographic bytes seeded by the OS.
-	static Ref<R> md5(const PackedByteArray &p_data); // Return a 16-byte protocol MD5 digest or computation failure.
+	static Ref<Err> md5(const PackedByteArray &p_data, PackedByteArray &r_out); // Fill a 16-byte protocol digest or report failure.
 };

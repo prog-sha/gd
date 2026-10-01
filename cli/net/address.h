@@ -9,7 +9,7 @@ struct sockaddr;
 struct sockaddr_storage;
 namespace GDAddress {
 // Enumerate IPv4 and IPv6 addresses from OS interfaces.
-Ref<R> local();
+VariantPair local();
 bool equal(const String &p_left, const String &p_right); // Compare address identity, including mapped IPv4.
 bool loopback(const String &p_host); // Recognize IPv4 127/8 and IPv6 ::1.
 // Convert a numeric IP into a native address, returning its length or zero.

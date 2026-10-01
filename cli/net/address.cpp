@@ -16,7 +16,7 @@
 
 namespace {
 // Return the original enumeration error with its route-operation context.
-Ref<R> local_error(const char *p_call, uint32_t p_code) {
+VariantPair local_error(const char *p_call, uint32_t p_code) {
 #ifdef WINDOWS_ENABLED
 	SourceError::win32(p_code);
 #else
@@ -27,12 +27,12 @@ Ref<R> local_error(const char *p_call, uint32_t p_code) {
 	info["net"] = "ip+net";
 	info["syscall"] = p_call;
 	const Error error = SourceError::put(info, FAILED);
-	return R::err(Err::make("cannot enumerate local addresses", Err::of(error), info));
+	return { PackedStringArray(), Err::make("cannot enumerate local addresses", Err::of(error), info) };
 }
 }
 
 // Enumerate all interface addresses, distinguishing an empty result from failure.
-Ref<R> GDAddress::local() {
+VariantPair GDAddress::local() {
 	SourceError::clear();
 	PackedStringArray out;
 	const auto add = [&](const sockaddr *addr) {
@@ -44,7 +44,7 @@ Ref<R> GDAddress::local() {
 	ULONG size = 15000; // Initial buffer size recommended for Windows adapter enumeration.
 	PackedByteArray buffer;
 	for (;;) {
-		if (buffer.resize(size) != OK) return R::err("cannot allocate address buffer", Err::LIMITED);
+		if (buffer.resize(size) != OK) return { PackedStringArray(), Err::make("cannot allocate address buffer", Err::LIMITED) };
 		auto *list = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(buffer.ptrw());
 		const ULONG result = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, list, &size);
 		if (result == ERROR_BUFFER_OVERFLOW && size > uint64_t(buffer.size())) continue;
@@ -60,7 +60,7 @@ Ref<R> GDAddress::local() {
 	for (auto *item = list; item; item = item->ifa_next) add(item->ifa_addr);
 	::freeifaddrs(list);
 #endif
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // Normalize mapped IPv4 before comparing native addresses.

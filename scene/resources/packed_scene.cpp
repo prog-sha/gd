@@ -43,8 +43,13 @@
 #include "scene/main/missing_node.h"
 #include "scene/property_utils.h"
 
+#ifdef GD_VIEW
+#include "scene/2d/node_2d.h"
+#include "scene/gui/control.h"
 #ifndef _3D_DISABLED
+#include "scene/3d/node_3d.h"
 #endif // _3D_DISABLED
+#endif
 
 #define PACKED_SCENE_VERSION 3
 
@@ -330,7 +335,19 @@ Node *SceneState::instantiate(GenEditState p_edit_state) const {
 					obj = missing_node;
 				} else {
 					WARN_PRINT(vformat("Node %s of type %s cannot be created. A placeholder will be created instead.", snames[n.name], snames[n.type]).ascii().get_data());
-					// Use a plain Node placeholder; display types belong to the optional game layer.
+#ifdef GD_VIEW
+					if (n.parent >= 0 && n.parent < nc && ret_nodes[n.parent]) {
+						if (Object::cast_to<Control>(ret_nodes[n.parent])) {
+							obj = memnew(Control);
+						} else if (Object::cast_to<Node2D>(ret_nodes[n.parent])) {
+							obj = memnew(Node2D);
+#ifndef _3D_DISABLED
+						} else if (Object::cast_to<Node3D>(ret_nodes[n.parent])) {
+							obj = memnew(Node3D);
+#endif // _3D_DISABLED
+						}
+					}
+#endif
 
 					if (!obj) {
 						obj = memnew(Node);

@@ -39,8 +39,8 @@ class GDGzipWriter : public RefCounted {
 	void schedule(); // Post one continuation without extending a callback stack.
 	void step(); // Select the next operation or start another output slice.
 	void compress(const Ref<GDGzipCall> &p_call); // Run raw compression and gzip framing on a CPU worker.
-	void compressed(const Ref<R> &p_result); // Hand one compressed slice to the destination on the runtime.
-	void written(const Variant &p_result); // Resolve destination completion and propagate short writes.
+	void compressed(const Variant &p_value, const Variant &p_error); // Hand one compressed slice to the destination on the runtime.
+	void written(const Variant &p_value, const Variant &p_error); // Resolve destination completion and propagate short writes.
 	bool park(const Variant &p_value); // Retain a signal or suspended destination function.
 	void finish(); // Publish one result after removing its queue entry.
 protected:
@@ -49,7 +49,7 @@ public:
 	Dictionary get_header() const { return header; } // Read metadata to configure before the first write, flush, or close.
 	void set_header(const Dictionary &p_header) { header = p_header; } // Set metadata for the next unstarted member.
 	~GDGzipWriter(); // Release the native compressor after active jobs release ownership.
-	static Ref<R> create(const Ref<RefCounted> &p_target, int64_t p_level); // Validate a destination and compression level.
+	static VariantPair create(const Ref<RefCounted> &p_target, int64_t p_level); // Validate a destination and compression level.
 	Signal write(const PackedByteArray &p_bytes) { return enqueue(GDGzipCall::WRITE, p_bytes); } // Compress bytes and return the accepted input count.
 	Signal flush() { return enqueue(GDGzipCall::FLUSH); } // Flush compressed output without ending the member.
 	Signal close() { return enqueue(GDGzipCall::CLOSE); } // Finish the member without closing the destination.

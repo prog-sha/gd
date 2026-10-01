@@ -1084,6 +1084,19 @@ void GDScriptByteCodeGenerator::write_call(const Address &p_target, const Addres
 	ct.cleanup();
 }
 
+// Call a result function with separate destinations for its value and error.
+void GDScriptByteCodeGenerator::write_call_pair(const Address &p_value, const Address &p_error, const Address &p_base, const StringName &p_function_name, const Vector<Address> &p_arguments, bool p_async) {
+	append_opcode_and_argcount(p_async ? GDScriptFunction::OPCODE_CALL_PAIR_ASYNC : GDScriptFunction::OPCODE_CALL_PAIR, 3 + p_arguments.size());
+	for (int i = 0; i < p_arguments.size(); i++) {
+		append(p_arguments[i]);
+	}
+	append(p_base);
+	append(p_value);
+	append(p_error);
+	append(p_arguments.size());
+	append(p_function_name);
+}
+
 void GDScriptByteCodeGenerator::write_super_call(const Address &p_target, const StringName &p_function_name, const Vector<Address> &p_arguments) {
 	append_opcode_and_argcount(GDScriptFunction::OPCODE_CALL_SELF_BASE, 1 + p_arguments.size());
 	for (int i = 0; i < p_arguments.size(); i++) {
@@ -1094,6 +1107,18 @@ void GDScriptByteCodeGenerator::write_super_call(const Address &p_target, const 
 	append(p_arguments.size());
 	append(p_function_name);
 	ct.cleanup();
+}
+
+// Call an inherited method with independent value and error destinations.
+void GDScriptByteCodeGenerator::write_super_call_pair(const Address &p_value, const Address &p_error, const StringName &p_function_name, const Vector<Address> &p_arguments) {
+	append_opcode_and_argcount(GDScriptFunction::OPCODE_CALL_SELF_BASE_PAIR, 2 + p_arguments.size());
+	for (const Address &argument : p_arguments) {
+		append(argument);
+	}
+	append(p_value);
+	append(p_error);
+	append(p_arguments.size());
+	append(p_function_name);
 }
 
 void GDScriptByteCodeGenerator::write_call_async(const Address &p_target, const Address &p_base, const StringName &p_function_name, const Vector<Address> &p_arguments) {
@@ -1501,6 +1526,15 @@ void GDScriptByteCodeGenerator::write_await(const Address &p_target, const Addre
 	append(p_target);
 }
 
+// Resume a paired call into separate value and error addresses.
+void GDScriptByteCodeGenerator::write_await_pair(const Address &p_value, const Address &p_error, const Address &p_operand) {
+	append_opcode(GDScriptFunction::OPCODE_AWAIT);
+	append(p_operand);
+	append_opcode(GDScriptFunction::OPCODE_AWAIT_RESUME_PAIR);
+	append(p_value);
+	append(p_error);
+}
+
 void GDScriptByteCodeGenerator::write_if(const Address &p_condition) {
 	append_opcode(GDScriptFunction::OPCODE_JUMP_IF_NOT);
 	append(p_condition);
@@ -1822,6 +1856,13 @@ void GDScriptByteCodeGenerator::write_newline(int p_line) {
 		append(p_line);
 		current_line = p_line;
 	}
+}
+
+// Return a value and an error through separate VM result slots.
+void GDScriptByteCodeGenerator::write_return_pair(const Address &p_value, const Address &p_error) {
+	append_opcode(GDScriptFunction::OPCODE_RETURN_PAIR);
+	append(p_value);
+	append(p_error);
 }
 
 void GDScriptByteCodeGenerator::write_return(const Address &p_return_value, bool p_use_conversion) {

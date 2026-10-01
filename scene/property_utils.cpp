@@ -37,6 +37,10 @@
 #include "core/templates/local_vector.h"
 #include "scene/resources/packed_scene.h"
 
+#ifdef TOOLS_ENABLED
+#include "editor/editor_node.h"
+#endif // TOOLS_ENABLED
+
 bool PropertyUtils::is_property_value_different(const Object *p_object, const Variant &p_a, const Variant &p_b) {
 	if (p_a.get_type() == Variant::FLOAT && p_b.get_type() == Variant::FLOAT) {
 		// This must be done because, as some scenes save as text, there might be a tiny difference in floats due to numerical error.
@@ -240,6 +244,11 @@ Vector<SceneState::PackState> PropertyUtils::get_node_states_stack(const Node *p
 	LocalVector<_FastPackState> states_stack;
 	{
 		const Node *owner = p_owner;
+#ifdef TOOLS_ENABLED
+		if (!p_owner && Engine::get_singleton()->is_editor_hint()) {
+			owner = EditorNode::get_singleton()->get_edited_scene();
+		}
+#endif
 
 		const Node *n = p_node;
 		while (n) {

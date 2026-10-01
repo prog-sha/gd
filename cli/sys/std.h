@@ -6,10 +6,8 @@
 
 #pragma once
 
-// Core standard-library result and error types.
-// Carry failures as Err and R values rather than exceptions.
-// Use explicit result handling throughout script execution.
-// Deliver success and failure through the same return-value path.
+// Core standard-library error type and test assertions.
+// Carry failures as Err values in a separate return slot.
 
 #include "core/object/ref_counted.h"
 #include "core/variant/binder_common.h"
@@ -46,58 +44,73 @@ private:
 	Kind kind = NONE;
 	Dictionary info; // Machine-readable details supplied by the source.
 	Ref<Err> cause; // Wrapped original cause.
+	Vector<Ref<Err>> causes; // Independent failures grouped in one result.
+	Variant partial; // Value completed before the failure.
+	bool shared = false; // Whether this is a stable category value.
+	bool categorized = true; // Whether this value itself names an error category.
+	bool partial_wrapper = false; // Whether this value only attaches completed work to its cause.
+	Ref<Err> copy() const; // Copy this reason without sharing mutable return details.
+	static Ref<Err> named(const String &p_msg, Kind p_kind); // Reuse the shared kind when no detail is supplied.
 
 protected:
+	String _to_string() override; // Print the error description through ordinary value formatting.
 	static void _bind_methods();
 
 public:
-	static Ref<Err> make(const String &p_msg, Kind p_kind, const Dictionary &p_info = Dictionary());
+	static Ref<Err> make(const String &p_msg, Kind p_kind, const Dictionary &p_info = Dictionary(), const Variant &p_partial = Variant());
+	// Return the shared value that names an error category.
+	static Ref<Err> constant(const StringName &p_name);
+	static PackedStringArray names();
+	static void init_categories();
+	static Ref<Err> category(Kind p_kind);
+	static void clear_categories();
+	// Report a missing target with optional detail.
+	static Ref<Err> not_found(const String &p_msg = String());
+	// Report rejected access with optional detail.
+	static Ref<Err> permission_denied(const String &p_msg = String());
+	// Report a duplicate target with optional detail.
+	static Ref<Err> already_exists(const String &p_msg = String());
+	// Report malformed input with optional detail.
+	static Ref<Err> invalid_data(const String &p_msg = String());
+	// Report an expired deadline with optional detail.
+	static Ref<Err> timed_out(const String &p_msg = String());
+	// Report interrupted work with optional detail.
+	static Ref<Err> interrupted(const String &p_msg = String());
+	// Report unavailable behavior with optional detail.
+	static Ref<Err> unsupported(const String &p_msg = String());
+	// Report failed authentication with optional detail.
+	static Ref<Err> unauthenticated(const String &p_msg = String());
+	// Report exhausted capacity with optional detail.
+	static Ref<Err> limited(const String &p_msg = String());
+	// Turn a reason into Err while retaining an existing cause and category.
+	static Ref<Err> from(const Variant &p_reason, Kind p_kind = NONE);
+	static Ref<Err> from_value(const Variant &p_reason, const Ref<Err> &p_kind = Ref<Err>());
+	static Ref<Err> join(const Array &p_errors);
+	static Ref<Err> join(const Ref<Err> &p_first, const Ref<Err> &p_second);
 
 	String get_msg() const { return msg; }
 	Kind get_kind() const { return kind; }
+	bool is_shared() const { return shared; }
+	Ref<Err> get_category() const { return categorized ? category(kind) : Ref<Err>(); }
 	Dictionary get_info() const { return info; }
 	Ref<Err> get_cause() const { return cause; }
+	Array get_causes() const;
+	Variant get_partial() const { return partial; }
 
 	// Add operation context while retaining the original cause.
-	Ref<Err> note(const String &p_msg) const;
-	// Check whether the cause chain contains a category.
+	Ref<Err> note(const String &p_msg, const Dictionary &p_info = Dictionary()) const;
+	// Attach completed work to a new error without changing the original.
+	Ref<Err> with_partial(const Variant &p_value) const;
+	// Return the first matching error in the cause chain.
 	bool is(Kind p_kind) const;
-	// Return the first matching category in the cause chain.
-	Ref<Err> find(Kind p_kind) const;
+	Ref<Err> find_value(const Variant &p_target, const Dictionary &p_where = Dictionary()) const;
+	Ref<Err> as_category(const Ref<Err> &p_kind) const;
+	static String category_name(const Ref<Err> &p_kind);
 	// Return a one-line description including causes.
 	String text() const;
 };
 
 VARIANT_ENUM_CAST(Err::Kind);
-
-// Carry a processed value and failure reason, preserving partial completion.
-// The script dialect diagnoses discarded results and supports ?, !, and destructuring.
-class R : public RefCounted {
-	GDCLASS(R, RefCounted);
-
-	Variant v; // Success value, or the partial value obtained before failure.
-	Ref<Err> e; // Failure reason.
-
-protected:
-	static void _bind_methods();
-
-public:
-	static Ref<Err> unpack(Variant &r_value); // Unwrap nested results while preserving failures and detecting cycles.
-	static Ref<R> ok(const Variant &p_v = Variant());
-	// Return a fresh success directly to a variant-valued native caller.
-	static Variant okv(const Variant &p_v);
-	// Create failure from text or Err with an optional partial value.
-	static Ref<R> err(const Variant &p_reason, Err::Kind p_kind = Err::NONE, const Variant &p_v = Variant());
-
-	// Return the success value or the partial value retained on failure.
-	Variant get_v() const;
-	Ref<Err> get_e() const { return e; }
-	bool get_ok() const { return e.is_null(); }
-	// Return an alternative value on failure.
-	Variant v_or(const Variant &p_fallback) const;
-	// Add operation context to a failure.
-	Ref<R> note(const String &p_msg) const;
-};
 
 // Support test assertions whose final exit code determines success.
 // Count mismatches and reflect them in the final result.
@@ -120,9 +133,10 @@ public:
 	void no(bool p_cond, const String &p_label);
 	void close_to(double p_got, double p_want, double p_slack, const String &p_label);
 	void has(const Variant &p_box, const Variant &p_item, const String &p_label);
-	void succeeds(const Ref<R> &p_r, const String &p_label);
+	void succeeds(const Ref<Err> &p_error, const String &p_label);
 	// Supply kind to check the error category too.
-	void fails(const Ref<R> &p_r, Err::Kind p_kind, const String &p_label);
+	void fails(const Ref<Err> &p_error, Err::Kind p_kind, const String &p_label);
+	void fails_value(const Ref<Err> &p_error, const Ref<Err> &p_kind, const String &p_label);
 
 	int get_failures() const { return failures; }
 	int get_count() const { return count; }

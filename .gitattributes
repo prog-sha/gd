@@ -6,6 +6,7 @@ docs/index.html linguist-generated
 
 # patchは元sourceの空白を保存するため、本文自体の空白を検査しない。
 patches/godot/*.patch -whitespace
+cli/view/*.patch -whitespace
 
 # Normalize EOL for all files that Git considers text files
 * text=auto eol=lf

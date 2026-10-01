@@ -500,14 +500,32 @@ GodotTypeInfo::Metadata call_get_argument_metadata(int p_arg) {
 
 //////////////////////
 
+// Store a native method's results in the appropriate call slots.
+template <typename R>
+void call_store_result(R &&p_result, Variant &r_ret, Callable::CallError &r_error) {
+	if constexpr (std::is_same_v<std::decay_t<R>, VariantPair>) {
+		const Variant &failure = p_result.error;
+		const Object *object = failure.get_type() == Variant::OBJECT ? failure.get_validated_object() : nullptr;
+		const bool empty_error = failure.get_type() == Variant::NIL || (failure.get_type() == Variant::OBJECT && object == nullptr);
+		if (r_error.result_error == nullptr || (!empty_error && (!object || !object->is_class("Err")))) {
+			r_error.error = Callable::CallError::CALL_ERROR_INVALID_METHOD;
+		} else {
+			r_ret = p_result.value;
+			*r_error.result_error = empty_error ? Variant() : failure;
+		}
+	} else {
+		r_ret = VariantInternal::make(std::forward<R>(p_result));
+	}
+}
+
 template <typename T, typename R, typename... P, size_t... Is>
 void call_with_variant_args_ret_helper(T *p_instance, R (T::*p_method)(P...), const Variant **p_args, Variant &r_ret, Callable::CallError &r_error, IndexSequence<Is...>) {
 	r_error.error = Callable::CallError::CALL_OK;
 
 #ifdef DEBUG_ENABLED
-	r_ret = VariantInternal::make((p_instance->*p_method)(VariantCasterAndValidate<P>::cast(p_args, Is, r_error)...));
+	call_store_result((p_instance->*p_method)(VariantCasterAndValidate<P>::cast(p_args, Is, r_error)...), r_ret, r_error);
 #else
-	r_ret = VariantInternal::make((p_instance->*p_method)(VariantCaster<P>::cast(*p_args[Is])...));
+	call_store_result((p_instance->*p_method)(VariantCaster<P>::cast(*p_args[Is])...), r_ret, r_error);
 #endif
 }
 
@@ -516,9 +534,9 @@ void call_with_variant_args_static_ret(R (*p_method)(P...), const Variant **p_ar
 	r_error.error = Callable::CallError::CALL_OK;
 
 #ifdef DEBUG_ENABLED
-	r_ret = VariantInternal::make((p_method)(VariantCasterAndValidate<P>::cast(p_args, Is, r_error)...));
+	call_store_result((p_method)(VariantCasterAndValidate<P>::cast(p_args, Is, r_error)...), r_ret, r_error);
 #else
-	r_ret = VariantInternal::make((p_method)(VariantCaster<P>::cast(*p_args[Is])...));
+	call_store_result((p_method)(VariantCaster<P>::cast(*p_args[Is])...), r_ret, r_error);
 #endif // DEBUG_ENABLED
 }
 
@@ -556,9 +574,9 @@ void call_with_variant_args_retc_helper(T *p_instance, R (T::*p_method)(P...) co
 	r_error.error = Callable::CallError::CALL_OK;
 
 #ifdef DEBUG_ENABLED
-	r_ret = VariantInternal::make((p_instance->*p_method)(VariantCasterAndValidate<P>::cast(p_args, Is, r_error)...));
+	call_store_result((p_instance->*p_method)(VariantCasterAndValidate<P>::cast(p_args, Is, r_error)...), r_ret, r_error);
 #else
-	r_ret = VariantInternal::make((p_instance->*p_method)(VariantCaster<P>::cast(*p_args[Is])...));
+	call_store_result((p_instance->*p_method)(VariantCaster<P>::cast(*p_args[Is])...), r_ret, r_error);
 #endif // DEBUG_ENABLED
 	(void)p_args;
 }

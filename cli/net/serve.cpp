@@ -7,6 +7,7 @@
 // Implement routed HTTP applications declared in serve.h.
 
 #include "cli/net/serve.h"
+#include "cli/sys/gdtask.h"
 #include "cli/sys/pool.h"
 #include "cli/sys/clock.h"
 
@@ -33,14 +34,12 @@
 #include "core/os/os.h"
 
 #include "modules/gdscript/gdscript_function.h"
+#include "cli/sys/task.h"
 
 namespace {
 
 // Default content types when a handler supplies none.
 const char *TEXT_TYPE = "text/plain; charset=utf-8"; // Default for plain text responses.
-const char *HTML_TYPE = "text/html; charset=utf-8";
-const char *JSON_TYPE = "application/json";
-const char *BYTES_TYPE = "application/octet-stream"; // Default for raw byte responses.
 constexpr int COPY_BUFFER = 32 * 1024; // Buffer width for incremental copying.
 
 // Supply a measured HEAD length to the shared response framing without retaining body bytes.
@@ -57,34 +56,52 @@ public:
 };
 
 // Preserve encoding failures and wrap only a completed response.
-Ref<R> json_reply(const Variant &p_encoded, int64_t p_status) {
-	if (p_encoded.get_type() == Variant::PACKED_BYTE_ARRAY) return R::ok(Http::bytes_out(p_encoded, JSON_TYPE, p_status));
-	const Ref<R> result = p_encoded;
-	return result.is_valid() ? result : R::err("invalid JSON encoder result");
+VariantPair json_reply(const VariantPair &p_encoded, int64_t p_status) {
+	if (p_encoded.error.get_type() != Variant::NIL) return { Variant(), p_encoded.error };
+	if (p_encoded.value.get_type() != Variant::PACKED_BYTE_ARRAY) return { Variant(), Err::make("invalid JSON encoder result", Err::INVALID_DATA) };
+	return { GDWebResponse::make(p_status, HTTP_TYPE_JSON, p_encoded.value), Variant() };
 }
 
 // Preserve file errors while constructing the body needed by postprocessors.
-Ref<R> file_reply(const String &p_path) {
-	const Ref<R> read = Os::read_bytes(p_path);
-	if (!read->get_ok()) return read;
-	return R::ok(Http::bytes_out(read->get_v(), Media::by_path(p_path), 200));
+VariantPair file_reply(const String &p_path) {
+	const VariantPair read = Os::read_bytes(p_path);
+	if (Ref<Err>(read.error).is_valid()) return { Variant(), Ref<Err>(read.error)->with_partial(read.value) };
+	return { Http::bytes_out(read.value, Media::by_path(p_path), 200), Variant() };
 }
 
 // Convert dynamic callback failures into ordinary handler errors while preserving suspension.
 template <typename... Args>
-Variant web_call(const Callable &p_call, Args... p_args) {
+VariantPair web_call(bool &r_fault, const Callable &p_call, Args... p_args) {
 	const Variant values[2] = { Variant(p_args)... };
 	const Variant *args[] = { (&values[0]) + 0, (&values[0]) + 1 };
 	Variant out;
+	Variant failure;
 	Callable::CallError error;
+	error.result_error = &failure;
 	GDScriptFunction::SuspendableCall suspendable;
+	const uint64_t fault_before = GDScriptFunction::runtime_fault_epoch();
 	p_call.callp(args, sizeof...(p_args), out, error);
-	return error.error == Callable::CallError::CALL_OK ? out : Variant(R::err("web callback could not be invoked", Err::INVALID_DATA));
+	r_fault = error.runtime_failed || fault_before != GDScriptFunction::runtime_fault_epoch();
+	if (r_fault) return {};
+	if (error.error != Callable::CallError::CALL_OK) return { Variant(), Err::make("web callback could not be invoked", Err::INVALID_DATA) };
+	return { out, failure };
+}
+
+// Find a response field regardless of the spelling of its name.
+const Variant *find_header(const Dictionary &p_headers, const String &p_name) {
+	if (const Variant *exact = p_headers.getptr(p_name)) return exact;
+	for (const Variant &key : p_headers.keys()) {
+		if ((key.get_type() == Variant::STRING || key.get_type() == Variant::STRING_NAME) && String(key).nocasecmp_to(p_name) == 0) return p_headers.getptr(key);
+	}
+	return nullptr;
 }
 
 // Choose the compact response path when Content-Type is the only header.
 const Variant *only_type(const Dictionary &p_headers) {
-	return p_headers.size() == 1 ? p_headers.getptr(SNAME("Content-Type")) : nullptr;
+	if (p_headers.size() != 1) return nullptr;
+	// Reuse the interned name before checking alternate header spellings.
+	if (const Variant *type = p_headers.getptr(SNAME("Content-Type"))) return type;
+	return find_header(p_headers, "Content-Type");
 }
 
 // Recognize same-origin relative references, treating schemes and network paths as external.
@@ -169,6 +186,11 @@ String limit_name_error(const Dictionary &p_opts) {
 		if (!names.has(name)) {
 			return vformat("unknown web limit \"%s\"", name);
 		}
+		const Variant::Type type = p_opts[raw].get_type();
+		const bool duration = name == "job_timeout" || name == "header_timeout" || name == "body_timeout";
+		if (duration ? (type != Variant::INT && type != Variant::FLOAT) : type != Variant::INT) {
+			return vformat("web limit \"%s\" must be numeric", name);
+		}
 	}
 	return String();
 }
@@ -193,8 +215,8 @@ void GDWebBodyCall::schedule() {
 // the application reuse the request once its handler returns. This is not a separate
 // small-body parser: unavailable input, exhausted turns and conversion work retain
 // the same continuation. Explicit async calls defer so listeners can attach first.
-// The raw-completion probes in tests/net/encode cover both policies without auto-wait.
-Variant GDWebBodyCall::start(const Ref<GDWebRequest> &p_req, const Ref<GDWebServer> &p_srv, int p_id, int p_mode, int64_t p_want, const String &p_path, bool p_deferred) {
+// Raw-completion probes cover both policies without auto-wait.
+VariantPair GDWebBodyCall::start(const Ref<GDWebRequest> &p_req, const Ref<GDWebServer> &p_srv, int p_id, int p_mode, int64_t p_want, const String &p_path, bool p_deferred) {
 	self_hold = Ref<GDWebBodyCall>(this);
 	req = p_req;
 	srv = p_srv;
@@ -211,25 +233,29 @@ Variant GDWebBodyCall::start(const Ref<GDWebRequest> &p_req, const Ref<GDWebServ
 		starting = true;
 		step();
 		starting = false;
-		if (ready.is_valid()) return ready;
+		if (ready_done) return ready;
 	}
-	return Signal(this, "finished");
+	return { Signal(this, "finished"), Variant() };
 }
 
 // Deliver a result exactly once and release retained resources.
-void GDWebBodyCall::finish(const Ref<R> &p_value) {
+void GDWebBodyCall::finish(const VariantPair &p_value) {
 	if (self_hold.is_null()) return;
 	// Wait for an in-flight write before reporting its final partial count.
-	if (mode == SAVE && sink.is_valid() && !sink->done() && !p_value->get_ok()) {
-		if (failure.is_null()) failure = p_value->get_e();
+	const Ref<Err> why = p_value.error;
+	if (mode == SAVE && sink.is_valid() && !sink->done() && why.is_valid()) {
+		if (failure.is_null()) failure = why;
 		flushing = true;
 		sink->abort();
 		return;
 	}
-	Ref<R> p_result = p_value;
-	if (p_result.is_valid() && !p_result->get_ok() && p_result->get_v().get_type() == Variant::NIL) {
-		if (mode == SAVE && sink.is_valid()) p_result = R::err(p_result->get_e(), Err::NONE, sink->count());
-		else if (mode == READ || mode == BYTES) p_result = R::err(p_result->get_e(), Err::NONE, data);
+	VariantPair result = p_value;
+	if (why.is_valid() && result.value.get_type() == Variant::NIL) {
+		if (mode == SAVE && sink.is_valid()) result.value = sink->count();
+		else if (mode == READ || mode == BYTES) result.value = data;
+	}
+	if (why.is_valid()) {
+		result.error = why->with_partial(result.value);
 	}
 
 	if (self_hold.is_null()) {
@@ -250,9 +276,10 @@ void GDWebBodyCall::finish(const Ref<R> &p_value) {
 	// Inline completion has no signal listener yet; return its value without suspending
 	// the caller. Deferred completion must still notify exactly once on the main loop.
 	if (starting) {
-		ready = p_result;
+		ready = result;
+		ready_done = true;
 	} else {
-		emit_signal("finished", p_result);
+		Async::finish(this, SNAME("finished"), result.value, result.error);
 	}
 	if (sink.is_valid()) {
 		sink->set_ready_callback(Callable());
@@ -296,10 +323,12 @@ bool GDWebBodyCall::advance() {
 		if (!sink->done()) {
 			return false;
 		}
-		const Ref<Err> why = failure.is_valid() ? failure : sink->error();
+		Ref<Err> why = failure;
+		const Ref<Err> sink_error = sink->error();
+		why = Err::join(why, sink_error);
 		const int64_t written = sink->count();
 		sink.unref();
-		finish(why.is_null() ? R::ok(written) : R::err(why, Err::NONE, written));
+		finish({ written, why });
 		return false;
 	}
 	// Do not read another chunk until the writer catches up.
@@ -307,45 +336,47 @@ bool GDWebBodyCall::advance() {
 		return false;
 	}
 	if (srv.is_null() || !srv->has_conn(id)) {
-		finish(R::err("request body is no longer available", Err::INTERRUPTED));
+		finish({ Variant(), Err::make("request body is no longer available", Err::INTERRUPTED) });
 		return false;
 	}
 	PackedByteArray part;
 	const int state = srv->read_body(id, mode == READ ? want : COPY_BUFFER, part);
 	if (state == GDWebServer::BODY_READ_WAIT) {
 		if (!srv->wait_body(id, callable_mp(this, &GDWebBodyCall::schedule))) {
-			finish(R::err("request body is no longer available", Err::INTERRUPTED));
+			finish({ Variant(), Err::make("request body is no longer available", Err::INTERRUPTED) });
 		}
 		return false;
 	}
 	srv->clear_body_wait(id);
 	if (state == GDWebServer::BODY_READ_LIMIT) {
-		finish(R::err("http: request body too large", Err::LIMITED));
+		Dictionary info;
+		info["http_status"] = 413;
+		finish({ Variant(), Err::make("http: request body too large", Err::LIMITED, info) });
 		return false;
 	}
 	if (state == GDWebServer::BODY_READ_BAD) {
-		finish(R::err("request body ended before its boundary", Err::INVALID_DATA));
+		finish({ Variant(), Err::make("request body ended before its boundary", Err::INVALID_DATA) });
 		return false;
 	}
 	if (!part.is_empty()) {
 		total += part.size();
 		if (mode == SAVE) {
 			if (sink.is_null() || sink->error().is_valid()) {
-				finish(sink.is_valid() ? R::err(sink->error(), Err::NONE, sink->count()) : R::err("body writer unavailable", Err::INTERRUPTED, total));
+				finish({ sink.is_valid() ? Variant(sink->count()) : Variant(total), sink.is_valid() ? Variant(sink->error()) : Variant(Err::make("body writer unavailable", Err::INTERRUPTED)) });
 				return false;
 			}
 			sink->push(part);
 		} else {
 			const int64_t at = data.size();
 			if (at > INT64_MAX - part.size()) {
-				finish(R::err("request body is too large for an in-memory value", Err::LIMITED));
+				finish({ Variant(), Err::make("request body is too large for an in-memory value", Err::LIMITED) });
 				return false;
 			}
 			if (at == 0) {
 				data = part;
 			} else {
 				if (data.resize_uninitialized(at + part.size()) != OK) {
-					finish(R::err("cannot allocate request body", Err::LIMITED));
+					finish({ Variant(), Err::make("cannot allocate request body", Err::NONE) });
 					return false;
 				}
 				memcpy(data.ptrw() + at, part.ptr(), part.size());
@@ -353,27 +384,32 @@ bool GDWebBodyCall::advance() {
 		}
 	}
 	if (mode == READ && (!part.is_empty() || state == GDWebServer::BODY_READ_EOF)) {
-		finish(R::ok(data));
+		finish({ data, Variant() });
 		return false;
 	}
 	if (state != GDWebServer::BODY_READ_EOF) return true;
+	// Keep the complete body so repeated whole-body reads return the same content.
+	if (mode != SAVE && req.is_valid()) {
+		req->body_cache = data;
+		req->body_cached = true;
+	}
 	if (mode == SAVE) {
 		sink->close();
 		flushing = true;
 		return true; // Closure may already have completed before this turn.
 	} else {
 		if (mode == BYTES) {
-			finish(R::ok(data));
+			finish({ data, Variant() });
 			return false;
 		}
 		// Decode ready JSON locally while retaining the shared turn and resumable worker fallback.
 		if (mode == JSON) {
-			const Variant result = JsonData::decode_reply(data, GDScriptFunction::native_time_slice_deadline());
-			if (result.get_type() == Variant::SIGNAL) {
+			const VariantPair result = JsonData::decode_reply(data, GDScriptFunction::native_time_slice_deadline());
+			if (result.value.get_type() == Variant::SIGNAL) {
 				converting = true;
-				Signal(result).connect(callable_mp(this, &GDWebBodyCall::converted), Object::CONNECT_ONE_SHOT);
+				Signal(result.value).connect(callable_mp(this, &GDWebBodyCall::converted), Object::CONNECT_ONE_SHOT);
 			} else {
-				converted(result);
+				converted(result.value, result.error);
 			}
 			return false;
 		}
@@ -381,16 +417,17 @@ bool GDWebBodyCall::advance() {
 		const PackedByteArray body = data;
 		const Dictionary checked_rule = rule;
 		converting = true;
-		Signal converted_signal = GDValueCall::start([body, checked_rule, mode = mode]() -> Variant {
+		Signal converted_signal = GDPairCall::start([body, checked_rule, mode = mode]() -> VariantPair {
 			if (mode == TEXT) {
-				if (body.size() >= INT_MAX) return R::err("request body exceeds text conversion size", Err::LIMITED);
-				return R::ok(String::utf8((const char *)body.ptr(), body.size()));
+				if (body.size() >= INT_MAX) return { Variant(), Err::make("request body exceeds text conversion size", Err::LIMITED) };
+				return utf8_text(body.ptr(), body.size());
 			}
-			const Ref<R> decoded = json_of(body);
-			if (!decoded->get_ok()) {
+			const VariantPair decoded = json_of(body);
+			const Ref<Err> error = decoded.error;
+			if (error.is_valid()) {
 				return decoded;
 			}
-			return GDWebValid::check(decoded->get_v(), checked_rule);
+			return GDWebValid::check(decoded.value, checked_rule);
 		});
 		converted_signal.connect(callable_mp(this, &GDWebBodyCall::converted), Object::CONNECT_ONE_SHOT);
 	}
@@ -398,33 +435,28 @@ bool GDWebBodyCall::advance() {
 }
 
 // Return worker-converted body data to main-thread request state.
-void GDWebBodyCall::converted(const Variant &p_result) {
+void GDWebBodyCall::converted(const Variant &p_result, const Variant &p_error) {
 	if (self_hold.is_null()) {
 		return;
 	}
 	converting = false;
-	const Ref<R> result = p_result;
-	if (result.is_null()) {
-		finish(R::err("request body conversion failed", Err::INVALID_DATA));
+	if (mode == VALIDATE && p_error.get_type() == Variant::NIL && req.is_valid()) {
+		req->keep("valid:" + keep_name, p_result);
+		finish({ Variant(), Variant() });
 		return;
 	}
-	if (mode == VALIDATE && result->get_ok() && req.is_valid()) {
-		req->keep("valid:" + keep_name, result->get_v());
-		finish(R::ok());
-		return;
-	}
-	finish(result);
+	finish({ p_result, p_error });
 }
 
 // Cancel a body operation whose result is no longer awaited.
 void GDWebBodyCall::cancel() {
-	finish(R::err("request body read canceled", Err::INTERRUPTED));
+	finish({ Variant(), Err::make("request body read canceled", Err::INTERRUPTED) });
 }
 
 // Register the body-operation completion signal.
 void GDWebBodyCall::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDWebBodyCall::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value"), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
 // ---------------- Requests ----------------
@@ -449,7 +481,7 @@ Dictionary GDWebRequest::get_query() {
 			return query_map;
 		}
 		query_map = Dictionary();
-		query_values = Url::decode_query(query_txt)->get_v();
+		query_values = Url::decode_query(query_txt).value;
 		for (const Variant &key : query_values.keys()) {
 			const Array values = query_values[key];
 			if (!values.is_empty()) query_map[key] = values[0];
@@ -492,7 +524,13 @@ void GDWebRequest::reset(int p_id, const String &p_path, const Ref<GDAsyncContex
 	if (!store.is_empty()) {
 		store = Dictionary();
 	}
+	if (!reply_headers.is_empty()) {
+		reply_headers = Dictionary();
+	}
 	body_busy = false;
+	body_cache = PackedByteArray();
+	body_cached = false;
+	body_saved = false;
 }
 
 // Create cancellation monitoring on first use, including observation after completion.
@@ -535,6 +573,11 @@ void GDWebRequest::keep(const String &p_name, const Variant &p_value) {
 	store[p_name] = p_value;
 }
 
+// Retain middleware response metadata until the final response is sent.
+void GDWebRequest::set_reply_header(const String &p_name, const String &p_value) {
+	reply_headers[p_name] = p_value;
+}
+
 // Return a request-local stored value.
 Variant GDWebRequest::kept(const String &p_name, const Variant &p_fallback) const {
 	return store.get(p_name, p_fallback);
@@ -555,11 +598,41 @@ Dictionary GDWebRequest::headers() const {
 	return srv->get_headers(id);
 }
 
+// Convert the retained whole body in the requested form.
+VariantPair GDWebRequest::cached_body(int p_mode) const {
+	if (p_mode == GDWebBodyCall::TEXT) {
+		return utf8_text(body_cache.ptr(), body_cache.size());
+	}
+	if (p_mode == GDWebBodyCall::JSON) {
+		return json_of(body_cache);
+	}
+	return { body_cache, Variant() };
+}
+
+// Explain why the body stream cannot start another operation, or return null.
+Ref<Err> GDWebRequest::body_error() const {
+	if (body_busy) return Err::make("request body is already being read", Err::ALREADY_EXISTS);
+	if (srv.is_null() || !srv->has_conn(id)) return Err::make("request body is no longer available", Err::INTERRUPTED);
+	return Ref<Err>();
+}
+
+// Explain why the whole body cannot be read, since a saved body is no longer in the stream.
+Ref<Err> GDWebRequest::body_whole_error() const {
+	if (body_saved && !body_busy) return Err::make("request body was saved to a file; read that file instead", Err::INVALID_DATA);
+	return body_error();
+}
+
 // Start one body operation, preventing concurrent access to the same stream.
-Variant GDWebRequest::body_call(int p_mode, int64_t p_want, bool p_deferred) {
-	if (body_busy || srv.is_null() || !srv->has_conn(id)) {
-		const Ref<R> result = R::err(body_busy ? "request body is already being read" : "request body is no longer available", body_busy ? Err::ALREADY_EXISTS : Err::INTERRUPTED);
-		return p_deferred ? Variant(Async::ready(result)) : Variant(result);
+// A body already read whole is answered from the retained bytes.
+VariantPair GDWebRequest::body_call(int p_mode, int64_t p_want, bool p_deferred) {
+	if (body_cached && p_mode != GDWebBodyCall::READ && !body_busy) {
+		const VariantPair result = cached_body(p_mode);
+		return p_deferred ? VariantPair{ Async::ready_pair(result), Variant() } : result;
+	}
+	const Ref<Err> why = p_mode == GDWebBodyCall::READ ? body_error() : body_whole_error();
+	if (why.is_valid()) {
+		const VariantPair result{ Variant(), why };
+		return p_deferred ? VariantPair{ Async::ready_pair(result), Variant() } : result;
 	}
 	Ref<GDWebBodyCall> call;
 	call.instantiate();
@@ -569,27 +642,27 @@ Variant GDWebRequest::body_call(int p_mode, int64_t p_want, bool p_deferred) {
 }
 
 // Read one body chunk from the stream.
-Variant GDWebRequest::read(int64_t p_bytes) {
+VariantPair GDWebRequest::read(int64_t p_bytes) {
 	if (p_bytes < 1) {
-		return R::err("request body read size must be positive", Err::INVALID_DATA);
+		return { Variant(), Err::make("request body read size must be positive", Err::INVALID_DATA) };
 	}
 	return body_call(GDWebBodyCall::READ, p_bytes);
 }
 
 // Read all remaining body bytes.
-Variant GDWebRequest::bytes() {
+VariantPair GDWebRequest::bytes() {
 	return body_call(GDWebBodyCall::BYTES);
 }
 
 // Defer a partial read so listeners can attach before completion.
 Signal GDWebRequest::read_async(int64_t p_bytes) {
-	if (p_bytes < 1) return Async::ready(R::err("request body read size must be positive", Err::INVALID_DATA));
-	return body_call(GDWebBodyCall::READ, p_bytes, true);
+	if (p_bytes < 1) return Async::ready_pair({ Variant(), Err::make("request body read size must be positive", Err::INVALID_DATA) });
+	return body_call(GDWebBodyCall::READ, p_bytes, true).value;
 }
 
 // Defer collecting the remaining body bytes.
 Signal GDWebRequest::bytes_async() {
-	return body_call(GDWebBodyCall::BYTES, 0, true);
+	return body_call(GDWebBodyCall::BYTES, 0, true).value;
 }
 
 // Return the body length without reading a large body into memory.
@@ -598,66 +671,85 @@ int64_t GDWebRequest::body_size() const {
 }
 
 // Set this request's body-reader limit.
-Ref<R> GDWebRequest::limit(int64_t p_bytes) {
-	if (p_bytes < 0) return R::err("request body limit must be zero or greater", Err::INVALID_DATA);
-	if (body_busy) return R::err("request body limit must be set before reading", Err::INVALID_DATA);
-	if (srv.is_null() || !srv->set_request_body_limit(id, p_bytes)) return R::err("request body is no longer available", Err::INTERRUPTED);
-	return R::ok();
+Ref<Err> GDWebRequest::limit(int64_t p_bytes) {
+	if (p_bytes < 0) return Err::make("request body limit must be zero or greater", Err::INVALID_DATA);
+	if (body_busy) return Err::make("request body limit must be set before reading", Err::INVALID_DATA);
+	if (srv.is_null() || !srv->set_request_body_limit(id, p_bytes)) return Err::make("request body is no longer available", Err::INTERRUPTED);
+	return Ref<Err>();
 }
 
 // Save the body incrementally inside a mount.
 Signal GDWebRequest::save(const String &p_path) {
-	GD_PERM_FAIL_V(WRITE, p_path, Async::ready(R::err(vformat("cannot write %s", p_path), Err::PERMISSION_DENIED)));
+	GD_PERM_FAIL_V(WRITE, p_path, Async::ready_pair({ Variant(), Err::make(vformat("cannot write %s", p_path), Err::PERMISSION_DENIED) }));
 	String why;
 	const String real = Mount::resolve(p_path, true, why);
 	if (real.is_empty()) {
-		return Async::ready(R::err(why.is_empty() ? vformat("cannot write %s", p_path) : why, Err::PERMISSION_DENIED));
+		return Async::ready_pair({ Variant(), Err::make(why.is_empty() ? vformat("cannot write %s", p_path) : why, Err::PERMISSION_DENIED) });
 	}
-	if (body_busy || srv.is_null() || !srv->has_conn(id)) {
-		return Async::ready(R::err(body_busy ? "request body is already being read" : "request body is no longer available", body_busy ? Err::ALREADY_EXISTS : Err::INTERRUPTED));
-	}
+	const bool cached = body_cached && !body_busy; // A body already read whole is written from memory.
+	const Ref<Err> refused = cached ? Ref<Err>() : body_whole_error();
+	if (refused.is_valid()) return Async::ready_pair({ Variant(), refused });
 	Ref<GDWebBodyCall> call;
 	call.instantiate();
 	call->sink.instantiate();
 	// Delegate file open and writes to workers, keeping file I/O off the handler event loop.
 	call->sink->open(p_path, false);
+	if (cached) {
+		call->sink->push(body_cache);
+		call->sink->close();
+		call->flushing = true;
+	} else {
+		body_saved = true;
+	}
 	body_busy = true;
 	body_active = call;
-	return call->start(Ref<GDWebRequest>(this), srv, id, GDWebBodyCall::SAVE, 0, p_path);
+	return call->start(Ref<GDWebRequest>(this), srv, id, GDWebBodyCall::SAVE, 0, p_path).value;
 }
 
 // Decode the remaining body as UTF-8 text.
-Variant GDWebRequest::text() {
+VariantPair GDWebRequest::text() {
 	return body_call(GDWebBodyCall::TEXT);
 }
 
 // Decode the remaining body as JSON.
-Variant GDWebRequest::json() {
+VariantPair GDWebRequest::json() {
 	return body_call(GDWebBodyCall::JSON);
 }
 
 // Defer decoding the remaining body as text.
 Signal GDWebRequest::text_async() {
-	return body_call(GDWebBodyCall::TEXT, 0, true);
+	return body_call(GDWebBodyCall::TEXT, 0, true).value;
 }
 
 // Defer decoding the remaining body as JSON.
 Signal GDWebRequest::json_async() {
-	return body_call(GDWebBodyCall::JSON, 0, true);
+	return body_call(GDWebBodyCall::JSON, 0, true).value;
 }
 
 // Read JSON and apply middleware validation rules.
 Signal GDWebRequest::json_valid(const Dictionary &p_rule, const String &p_name) {
-	if (body_busy || srv.is_null() || !srv->has_conn(id)) {
-		return Async::ready(R::err(body_busy ? "request body is already being read" : "request body is no longer available", body_busy ? Err::ALREADY_EXISTS : Err::INTERRUPTED));
+	// Validate a body that an earlier stage already read whole.
+	if (body_cached && !body_busy) {
+		const VariantPair decoded = json_of(body_cache);
+		if (Ref<Err>(decoded.error).is_valid()) {
+			return Async::ready_pair(decoded);
+		}
+		const VariantPair checked = GDWebValid::check(decoded.value, p_rule);
+		if (checked.error.get_type() == Variant::NIL) {
+			keep("valid:" + p_name, checked.value);
+			return Async::ready_pair({ Variant(), Variant() });
+		}
+		return Async::ready_pair(checked);
 	}
+	const Ref<Err> why = body_whole_error();
+	if (why.is_valid()) return Async::ready_pair({ Variant(), why });
 	Ref<GDWebBodyCall> call;
 	call.instantiate();
 	call->rule = p_rule;
 	call->keep_name = p_name;
 	body_busy = true;
 	body_active = call;
-	return call->start(Ref<GDWebRequest>(this), srv, id, GDWebBodyCall::VALIDATE, 0, String());
+	return call->start(Ref<GDWebRequest>(this), srv, id, GDWebBodyCall::VALIDATE, 0, String()).value;
 }
 
 // Register public script methods and properties.
@@ -676,7 +768,6 @@ void GDWebRequest::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("bytes"), &GDWebRequest::bytes);
 	ClassDB::bind_method(D_METHOD("body_size"), &GDWebRequest::body_size);
 	ClassDB::bind_method(D_METHOD("limit", "bytes"), &GDWebRequest::limit);
-	ADD_RESULT("limit", "Variant");
 	ClassDB::bind_method(D_METHOD("save", "path"), &GDWebRequest::save);
 	ClassDB::bind_method(D_METHOD("text"), &GDWebRequest::text);
 	ClassDB::bind_method(D_METHOD("json"), &GDWebRequest::json);
@@ -685,16 +776,20 @@ void GDWebRequest::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("save_async", "path"), &GDWebRequest::save);
 	ClassDB::bind_method(D_METHOD("text_async"), &GDWebRequest::text_async);
 	ClassDB::bind_method(D_METHOD("json_async"), &GDWebRequest::json_async);
-	ADD_AWAIT("read", "R:PackedByteArray");
-	ADD_AWAIT("bytes", "R:PackedByteArray");
-	ADD_AWAIT("save", "R:int");
-	ADD_AWAIT("text", "R:String");
-	ADD_AWAIT("json", "R:Variant");
-	ADD_AWAIT("read_async", "R:PackedByteArray");
-	ADD_AWAIT("bytes_async", "R:PackedByteArray");
-	ADD_AWAIT("save_async", "R:int");
-	ADD_AWAIT("text_async", "R:String");
-	ADD_AWAIT("json_async", "R:Variant");
+	ADD_AWAIT("read", "Pair:PackedByteArray");
+	ADD_AWAIT("bytes", "Pair:PackedByteArray");
+	ADD_AWAIT("save", "Pair:int");
+	ADD_AWAIT("text", "Pair:String");
+	ADD_AWAIT("json", "Pair:Variant");
+	ADD_AWAIT("read_async", "Pair:PackedByteArray");
+	ADD_AWAIT("bytes_async", "Pair:PackedByteArray");
+	ADD_AWAIT("save_async", "Pair:int");
+	ADD_AWAIT("text_async", "Pair:String");
+	ADD_AWAIT("json_async", "Pair:Variant");
+	ADD_PAIR_RESULT("read", "PackedByteArray");
+	ADD_PAIR_RESULT("bytes", "PackedByteArray");
+	ADD_PAIR_RESULT("text", "String");
+	ADD_PAIR_RESULT("json", "Variant");
 	ADD_AUTO_WAIT("read");
 	ADD_AUTO_WAIT("bytes");
 	ADD_AUTO_WAIT("save");
@@ -726,38 +821,42 @@ Signal GDWebViewCall::start(const String &p_path, const Dictionary &p_data, int6
 	call->status = p_status;
 	call->renderer = p_renderer;
 	const Signal signal(call.ptr(), "finished");
-	GDFileCall::start([p_path]() { return Os::read_bytes(p_path); }).connect(callable_mp(call.ptr(), &GDWebViewCall::loaded), Object::CONNECT_ONE_SHOT);
+	GDPairCall::start([p_path]() { return Os::read_bytes(p_path); }, false).connect(callable_mp(call.ptr(), &GDWebViewCall::loaded), Object::CONNECT_ONE_SHOT);
 	return signal;
 }
 
 // Pass a loaded template to the default CPU renderer or a custom renderer.
-void GDWebViewCall::loaded(const Variant &p_result) {
+void GDWebViewCall::loaded(const Variant &p_value, const Variant &p_error) {
 	if (self_hold.is_null()) {
 		return;
 	}
-	const Ref<R> result = p_result;
-	if (result.is_null() || !result->get_ok()) {
-		finish(result.is_valid() ? result : R::err("invalid template read result"));
+	if (Ref<Err>(p_error).is_valid()) {
+		finish({ Variant(), Ref<Err>(p_error)->with_partial(p_value) });
 		return;
 	}
-	const PackedByteArray bytes = result->get_v();
+	const PackedByteArray bytes = p_value;
 	if (!renderer.is_valid()) {
 		if (!build) {
 			build = std::make_shared<HtmlBuild>();
 		}
 		GDValueCall::start([build = build, bytes, data = data, status = status]() -> Variant {
-			Error err = build->step(String::utf8((const char *)bytes.ptr(), bytes.size()));
+			const VariantPair decoded = utf8_text(bytes.ptr(), bytes.size());
+			if (decoded.error.get_type() != Variant::NIL) return decoded.error;
+			Error err = build->step(decoded.value);
 			if (err == ERR_BUSY) {
 				return build->needed();
 			}
 			String body;
 			if (err == OK) err = build->render(data, body);
 			if (err != OK) return build->failure(err);
-			return R::ok(Http::html(body, status));
+			return Http::html(body, status);
 		}).connect(callable_mp(this, &GDWebViewCall::prepared), Object::CONNECT_ONE_SHOT);
 		return;
 	}
-	GDValueCall::start([bytes]() -> Variant { return String::utf8((const char *)bytes.ptr(), bytes.size()); }).connect(callable_mp(this, &GDWebViewCall::custom_ready), Object::CONNECT_ONE_SHOT);
+	GDValueCall::start([bytes]() -> Variant {
+		const VariantPair decoded = utf8_text(bytes.ptr(), bytes.size());
+		return decoded.error.get_type() == Variant::NIL ? decoded.value : decoded.error;
+	}).connect(callable_mp(this, &GDWebViewCall::custom_ready), Object::CONNECT_ONE_SHOT);
 }
 
 // Queue only missing partials for I/O, retaining paused parsing state for CPU work.
@@ -766,20 +865,24 @@ void GDWebViewCall::prepared(const Variant &p_result) {
 		return;
 	}
 	if (p_result.get_type() != Variant::STRING) {
-		const Ref<R> failed = p_result;
-		finish(failed.is_valid() ? failed : R::err("invalid template build result"));
+		if (Ref<GDWebResponse>(p_result).is_valid()) {
+			finish({ p_result, Variant() });
+			return;
+		}
+		const Ref<Err> error = p_result;
+		finish({ Variant(), error.is_valid() ? Variant(error) : Variant(Err::make("invalid template build result", Err::INVALID_DATA)) });
 		return;
 	}
 	part = p_result;
 	const String root = path.get_base_dir();
 	const String name = part;
-	GDFileCall::start([root, name]() -> Ref<R> {
+	GDPairCall::start([root, name]() -> VariantPair {
 		if (!Html::partial_ok(name)) {
-			return R::err("invalid partial name", Err::INVALID_DATA);
+			return { Variant(), Err::make("invalid partial name", Err::INVALID_DATA) };
 		}
 		const String file = Path::under(root.path_join("partials"), name + ".html");
-		return file.is_empty() ? R::err("invalid partial path", Err::INVALID_DATA) : Os::read_bytes(file);
-	}).connect(callable_mp(this, &GDWebViewCall::loaded), Object::CONNECT_ONE_SHOT);
+		return file.is_empty() ? VariantPair{ Variant(), Err::make("invalid partial path", Err::INVALID_DATA) } : Os::read_bytes(file);
+	}, false).connect(callable_mp(this, &GDWebViewCall::loaded), Object::CONNECT_ONE_SHOT);
 }
 
 // After source conversion, run only custom rendering on the script scheduler.
@@ -789,13 +892,16 @@ void GDWebViewCall::custom_ready(const Variant &p_result) {
 	}
 	Ref<GDWebViewCall> keep(this);
 	if (p_result.get_type() != Variant::STRING) {
-		finish(Ref<R>(p_result).is_valid() ? Ref<R>(p_result) : R::err("invalid template source result"));
+		const Ref<Err> error = p_result;
+		finish({ Variant(), error.is_valid() ? Variant(error) : Variant(Err::make("invalid template source result", Err::INVALID_DATA)) });
 		return;
 	}
 	Variant args[3] = { p_result, data, path };
 	const Variant *argv[3] = { &args[0], &args[1], &args[2] };
 	Variant out;
+	Variant render_error;
 	Callable::CallError err;
+	err.result_error = &render_error;
 	const bool sliced = GDScriptFunction::begin_time_slice();
 	const Callable render = renderer;
 	{
@@ -809,46 +915,45 @@ void GDWebViewCall::custom_ready(const Variant &p_result) {
 	if (self_hold.is_null()) {
 		GDScriptFunctionState *state = Object::cast_to<GDScriptFunctionState>(out.get_validated_object());
 		if (state) {
-			state->_clear_connections();
+			state->cancel_awaited();
 		}
 		return;
 	}
-	if (err.error != Callable::CallError::CALL_OK) {
-		finish(R::err("template renderer failed", Err::INVALID_DATA));
+	if (err.error != Callable::CallError::CALL_OK || err.runtime_failed) {
+		finish({ Variant(), Err::make("template renderer failed", Err::INVALID_DATA) });
 		return;
 	}
 	GDScriptFunctionState *state = Object::cast_to<GDScriptFunctionState>(out.get_validated_object());
 	if (state) {
 		continuation = Ref<RefCounted>(state);
-		state->connect("completed", callable_mp(this, &GDWebViewCall::rendered), Object::CONNECT_ONE_SHOT);
+		state->connect("completed", state->is_pair_return() ? callable_mp(this, &GDWebViewCall::rendered_pair) : callable_mp(this, &GDWebViewCall::rendered), Object::CONNECT_ONE_SHOT);
 		return;
 	}
-	rendered(out);
+	rendered_pair(out, render_error);
 }
 
 // Convert rendered text into an HTML reply.
 void GDWebViewCall::rendered(const Variant &p_result) {
+	rendered_pair(p_result, Variant());
+}
+
+// Convert both renderer return slots into an HTML reply.
+void GDWebViewCall::rendered_pair(const Variant &p_result, const Variant &p_error) {
 	if (self_hold.is_null()) {
 		return;
 	}
 	continuation.unref();
-	Variant value = p_result;
-	const Ref<R> result = value;
-	if (result.is_valid()) {
-		if (!result->get_ok()) { finish(result); return; }
-		value = result->get_v();
-	}
-	const Ref<Err> why = value;
-	if (why.is_valid()) { finish(R::err(why)); return; }
-	if (value.get_type() != Variant::STRING) {
-		finish(R::err("template renderer must return text", Err::INVALID_DATA));
+	const Ref<Err> why = Ref<Err>(p_error).is_valid() ? Ref<Err>(p_error) : Ref<Err>(p_result);
+	if (why.is_valid()) { finish({ Variant(), why }); return; }
+	if (p_result.get_type() != Variant::STRING) {
+		finish({ Variant(), Err::make("template renderer must return text", Err::INVALID_DATA) });
 		return;
 	}
-	finish(R::ok(Http::html(value, status)));
+	finish({ Http::html(p_result, status), Variant() });
 }
 
 // Return the template reply exactly once and release retained references.
-void GDWebViewCall::finish(const Ref<R> &p_result) {
+void GDWebViewCall::finish(const VariantPair &p_result) {
 	if (self_hold.is_null()) {
 		return;
 	}
@@ -857,7 +962,7 @@ void GDWebViewCall::finish(const Ref<R> &p_result) {
 	data = Dictionary();
 	build.reset();
 	self_hold.unref();
-	emit_signal("finished", p_result);
+	Async::finish(this, SNAME("finished"), p_result.value, p_result.error);
 }
 
 // Stop a custom renderer continuation when its request disappears.
@@ -868,16 +973,16 @@ void GDWebViewCall::cancel() {
 	Ref<GDWebViewCall> keep(this);
 	GDScriptFunctionState *state = Object::cast_to<GDScriptFunctionState>(continuation.ptr());
 	if (state) {
-		state->_clear_connections();
+		state->cancel_awaited();
 	}
 	continuation.unref();
-	finish(R::err("template rendering canceled", Err::INTERRUPTED));
+	finish({ Variant(), Err::make("template rendering canceled", Err::INTERRUPTED) });
 }
 
 // Register completion and cancellation.
 void GDWebViewCall::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("cancel"), &GDWebViewCall::cancel);
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "reply", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT)));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "reply", PROPERTY_HINT_RESOURCE_TYPE, "GDWebResponse"), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
 // ---------------- Routed HTTP applications ----------------
@@ -1062,16 +1167,16 @@ void GDWebApp::otherwise(const Callable &p_handler) {
 }
 
 // Start listening at the selected address.
-Ref<R> GDWebApp::listen(int64_t p_port, const String &p_host) {
-	if (opening.is_valid() || srv.is_valid()) return R::err("server already started", Err::ALREADY_EXISTS);
+VariantPair GDWebApp::listen(int64_t p_port, const String &p_host) {
+	if (opening.is_valid() || srv.is_valid()) return { Variant(), Err::make("server already started", Err::ALREADY_EXISTS) };
 	return listen_at(p_port, p_host, Ref<GDTLSIdentity>());
 }
 
 // Apply identical HTTP limits and scheduling to plain and encrypted listeners.
-Ref<R> GDWebApp::listen_at(int64_t p_port, const String &p_host, const Ref<GDTLSIdentity> &p_identity) {
-	if (config_error.is_valid()) return R::err(config_error);
+VariantPair GDWebApp::listen_at(int64_t p_port, const String &p_host, const Ref<GDTLSIdentity> &p_identity) {
+	if (config_error.is_valid()) return { Variant(), config_error };
 	if (shutting) {
-		return R::err("server is shutting down", Err::ALREADY_EXISTS);
+		return { Variant(), Err::make("server is shutting down", Err::ALREADY_EXISTS) };
 	}
 	srv.instantiate();
 	srv->set_identity(p_identity);
@@ -1079,15 +1184,15 @@ Ref<R> GDWebApp::listen_at(int64_t p_port, const String &p_host, const Ref<GDTLS
 	srv->set_header_limits(header_bytes, header_values);
 	srv->set_header_timeout(head_seconds);
 	srv->set_body_timeout(body_seconds);
-	const Ref<R> opened = srv->listen(p_port, p_host);
-	if (!opened->get_ok()) {
+	const VariantPair opened = srv->listen(p_port, p_host);
+	if (Ref<Err>(opened.error).is_valid()) {
 		srv.unref();
 		return opened;
 	}
 	root_ctx = Async::ctx();
 	// Dispatch only kernel-ready connections to the runtime serve task.
 	srv->set_ready_callback(callable_mp(this, &GDWebApp::poll));
-	return R::ok();
+	return {};
 }
 
 // Return the application's actual listen port.
@@ -1098,14 +1203,14 @@ int GDWebApp::port() const {
 // Stop new accepts and keepalive reuse while retaining active requests.
 Signal GDWebApp::shutdown(const Ref<GDAsyncContext> &p_ctx) {
 	if (p_ctx.is_null()) {
-		return Async::ready(R::err("shutdown needs a context", Err::INVALID_DATA));
+		return Async::ready_pair({ Variant(), Err::make("shutdown needs a context", Err::INVALID_DATA) });
 	}
 	if (shutdown_wait.is_valid()) {
-		return Async::ready(R::err("shutdown is already waiting", Err::ALREADY_EXISTS));
+		return Async::ready_pair({ Variant(), Err::make("shutdown is already waiting", Err::ALREADY_EXISTS) });
 	}
 	if (srv.is_null()) {
 		opening.unref();
-		return Async::ready(R::ok());
+		return Async::ready_pair({ Variant(), Variant() });
 	}
 	shutting = true;
 	shutdown_ctx = p_ctx;
@@ -1114,16 +1219,16 @@ Signal GDWebApp::shutdown(const Ref<GDAsyncContext> &p_ctx) {
 	p_ctx->connect("canceled", callable_mp(this, &GDWebApp::poll), Object::CONNECT_ONE_SHOT);
 	srv->begin_shutdown();
 	post_poll(); // With only idle connections, finish immediately on the next runtime task.
-	return Signal(shutdown_wait.ptr(), "finished");
+	return Signal(shutdown_wait.ptr(), "finished_pair");
 }
 
 // Deliver one graceful-shutdown result and release its deadline.
-void GDWebApp::finish_shutdown(const Ref<R> &p_result) {
+void GDWebApp::finish_shutdown(const VariantPair &p_result) {
 	if (shutdown_wait.is_valid()) {
 		Ref<GDWait> wait = shutdown_wait;
 		shutdown_wait.unref();
 		shutdown_ctx.unref();
-		wait->done(p_result);
+		wait->done(p_result.value, &p_result.error);
 	}
 }
 
@@ -1141,11 +1246,11 @@ void GDWebApp::check_shutdown() {
 		srv->set_ready_callback(Callable());
 		srv.unref();
 		spare.unref();
-		finish_shutdown(R::ok());
+		finish_shutdown({ Variant(), Variant() });
 		return;
 	}
 	if (shutdown_wait.is_valid() && shutdown_ctx.is_valid() && shutdown_ctx->is_done()) {
-		finish_shutdown(R::err(shutdown_ctx->get_reason()));
+		finish_shutdown({ Variant(), shutdown_ctx->get_reason() });
 	}
 }
 
@@ -1198,7 +1303,7 @@ void GDWebApp::stop() {
 	busy--;
 	// Discard a reusable request's reference to the old server before restarting.
 	spare.unref();
-	finish_shutdown(R::err("server stopped", Err::INTERRUPTED));
+	finish_shutdown({ Variant(), Err::make("server stopped", Err::INTERRUPTED) });
 }
 
 // Report whether the application is listening.
@@ -1228,12 +1333,14 @@ void GDWebApp::poll() {
 		const int id = ready_ids[ready_at];
 		HashMap<int, Job>::Iterator waiting = jobs.find(id);
 		if (waiting) {
-			// Notify active handlers of FIN without discarding a response that can still be written.
-			if (waiting->value.stage != ENCODE && !srv->request_alive(id, waiting->value.req->get_context())) {
+			// Stop suspended work when its connection can no longer carry a response.
+			const Ref<GDAsyncContext> context = waiting->value.req->get_context();
+			if (waiting->value.stage != ENCODE && !srv->request_alive(id, context)) {
 				Job dead = waiting->value;
 				drop_job_time(id, dead);
 				jobs.erase(id);
 				cancel_job(dead);
+				srv->abort_request(id);
 				arm_jobs();
 			}
 			continue;
@@ -1257,7 +1364,7 @@ void GDWebApp::poll() {
 			}
 			job.req->reset(id, srv->get_path(id), root_ctx);
 			current_id = id;
-			run(id, job, Variant(), false, until);
+			run(id, job, { Variant(), Variant() }, false, until);
 			current_id = -1;
 	}
 	// Do not let continuously ready sockets consume every turn before retained handlers run.
@@ -1284,16 +1391,17 @@ void GDWebApp::post_poll() {
 }
 
 // Retain an incomplete asynchronous result until it can resume.
-bool GDWebApp::park(const Variant &p_ret, int p_id, Job &p_job) {
-	const bool signal_wait = p_ret.get_type() == Variant::SIGNAL;
-	Object *obj = signal_wait ? nullptr : p_ret.get_type() == Variant::OBJECT ? p_ret.get_validated_object() : nullptr;
+bool GDWebApp::park(const Variant &p_value, int p_id, Job &p_job) {
+	const Variant ret = GDTask::as_signal(p_value); // A handler may return a started task.
+	const bool signal_wait = ret.get_type() == Variant::SIGNAL;
+	Object *obj = signal_wait ? nullptr : ret.get_type() == Variant::OBJECT ? ret.get_validated_object() : nullptr;
 	if (!signal_wait && (!obj || !obj->is_class("GDScriptFunctionState"))) {
 		return false;
 	}
 	if (p_job.stage != ENCODE && job_max > 0 && awaiting >= job_max && !jobs.has(p_id)) {
 		// Reject additional suspension when the configured pending-work capacity is exhausted.
 		if (signal_wait) {
-			const Signal signal = p_ret;
+			const Signal signal = ret;
 			Object *owner = signal.get_object();
 			if (owner && owner->has_method("cancel")) {
 				owner->call("cancel");
@@ -1301,7 +1409,7 @@ bool GDWebApp::park(const Variant &p_ret, int p_id, Job &p_job) {
 		} else {
 			GDScriptFunctionState *state = Object::cast_to<GDScriptFunctionState>(obj);
 			if (state) {
-				state->_clear_connections();
+				state->cancel_awaited();
 			}
 		}
 		if (p_job.file.is_valid()) {
@@ -1313,12 +1421,24 @@ bool GDWebApp::park(const Variant &p_ret, int p_id, Job &p_job) {
 		return true;
 	}
 	if (signal_wait) {
-		p_job.wait_signal = p_ret;
+		p_job.wait_signal = ret;
 		p_job.hold = Ref<RefCounted>(Object::cast_to<RefCounted>(p_job.wait_signal.get_object()));
-		if (p_job.stage == ENCODE) utf8_watch(p_ret, callable_mp(srv.ptr(), &GDWebServer::has_request).bind(p_id));
+		if (p_job.stage == ENCODE) utf8_watch(ret, callable_mp(srv.ptr(), &GDWebServer::has_request).bind(p_id));
 	} else {
 		p_job.hold = Ref<RefCounted>(Object::cast_to<RefCounted>(obj));
 		p_job.wait_signal = Signal(obj, "completed");
+	}
+	Object *signal_owner = p_job.wait_signal.get_object();
+	const GDScriptFunctionState *state = Object::cast_to<GDScriptFunctionState>(signal_owner);
+	p_job.pair_pending = state && state->is_pair_return();
+	if (!p_job.pair_pending && signal_owner) {
+		List<MethodInfo> signals;
+		signal_owner->get_signal_list(&signals);
+		for (const MethodInfo &info : signals) {
+			if (info.name != p_job.wait_signal.get_name()) continue;
+			p_job.pair_pending = info.arguments.size() == 2 && info.arguments[1].type == Variant::OBJECT && info.arguments[1].hint_string == "Err";
+			break;
+		}
 	}
 	p_job.wait_call = Callable(this, "_resume_signal").bind(p_id);
 	if (p_job.made == 0) {
@@ -1335,15 +1455,17 @@ bool GDWebApp::park(const Variant &p_ret, int p_id, Job &p_job) {
 	arm_jobs();
 	Object *owner = p_job.wait_signal.get_object();
 	if (!owner || !owner->has_signal(p_job.wait_signal.get_name()) || p_job.wait_signal.connect(p_job.wait_call, Object::CONNECT_ONE_SHOT) != OK) {
-		Async::post(Ref<RefCounted>(this), callable_mp(this, &GDWebApp::resumed).bind(R::err("handler returned an unavailable signal"), p_id));
+		Async::post(Ref<RefCounted>(this), callable_mp(this, &GDWebApp::resumed_unavailable).bind(p_id));
 		return true;
 	}
-	// Cancel context-aware waits after FIN while keeping ordinary response work writable.
-	if (p_job.stage != ENCODE && !srv->request_alive(p_id, p_job.req->get_context())) {
+	// Keep a half-closed request writable while observing full disconnects.
+	const Ref<GDAsyncContext> context = p_job.req->get_context();
+	if (p_job.stage != ENCODE && !srv->request_alive(p_id, context)) {
 		Job dead = jobs[p_id];
 		drop_job_time(p_id, dead);
 		jobs.erase(p_id);
 		cancel_job(dead);
+		srv->abort_request(p_id);
 		arm_jobs();
 	}
 	return true;
@@ -1358,7 +1480,7 @@ void GDWebApp::cancel_job(Job &p_job) {
 	p_job.wait_call = Callable();
 	GDScriptFunctionState *state = Object::cast_to<GDScriptFunctionState>(p_job.hold.ptr());
 	if (state) {
-		state->_clear_connections();
+		state->cancel_awaited();
 	}
 	p_job.req->finish_context("request canceled");
 	if (!p_job.wait_signal.is_null()) {
@@ -1373,6 +1495,16 @@ void GDWebApp::cancel_job(Job &p_job) {
 		p_job.file.unref();
 	}
 	p_job.hold.unref();
+}
+
+// Send a generic failure before headers, then release the faulted request's work.
+void GDWebApp::fault_job(int p_id, Job &p_job) {
+	ERR_PRINT("web handler stopped after a script runtime fault");
+	if (srv.is_valid()) {
+		if (p_job.stage != ENCODE && srv->has_request(p_id)) srv->respond(p_id, 500, String("internal error").to_utf8_buffer(), TEXT_TYPE);
+		else srv->abort_request(p_id);
+	}
+	cancel_job(p_job);
 }
 
 // Release expired suspended work in deadline order.
@@ -1421,13 +1553,24 @@ void GDWebApp::arm_jobs() {
 Variant GDWebApp::resume_signal(const Variant **p_args, int p_count, Callable::CallError &r_err) {
 	r_err.error = Callable::CallError::CALL_OK;
 	if (p_count > 0) {
-		resumed(Async::signal_value(p_args, p_count - 1), int(*p_args[p_count - 1]));
+		const int id = *p_args[p_count - 1];
+		const auto job = jobs.find(id);
+		if (job && job->value.pair_pending) {
+			resumed(p_count == 3 ? VariantPair{ *p_args[0], *p_args[1] } : VariantPair{ Variant(), Err::make("callback returned an invalid result pair", Err::INVALID_DATA) }, id);
+		} else {
+			resumed({ Async::signal_value(p_args, p_count - 1), Variant() }, id);
+		}
 	}
 	return Variant();
 }
 
+// Report an unavailable signal through the ordinary request error path.
+void GDWebApp::resumed_unavailable(int p_id) {
+	resumed({ Variant(), Err::make("handler returned an unavailable signal", Err::INVALID_DATA) }, p_id);
+}
+
 // Resume request processing with an asynchronous result.
-void GDWebApp::resumed(const Variant &p_value, int p_id) {
+void GDWebApp::resumed(const VariantPair &p_result, int p_id) {
 	HashMap<int, Job>::Iterator it = jobs.find(p_id);
 	if (!it) {
 		return;
@@ -1436,9 +1579,16 @@ void GDWebApp::resumed(const Variant &p_value, int p_id) {
 	drop_job_time(p_id, job);
 	jobs.erase(p_id);
 	arm_jobs();
-	job.hold.unref();
+	GDScriptFunctionState *state = Object::cast_to<GDScriptFunctionState>(job.hold.ptr());
+	const bool faulted = state && state->is_runtime_faulted();
 	job.wait_signal = Signal();
 	job.wait_call = Callable();
+	if (faulted) {
+		fault_job(p_id, job);
+		if (shutting) post_poll();
+		return;
+	}
+	job.hold.unref();
 	if (job.stage == ENCODE && (srv.is_null() || !srv->has_request(p_id))) {
 		cancel_job(job);
 		if (shutting) post_poll();
@@ -1447,8 +1597,8 @@ void GDWebApp::resumed(const Variant &p_value, int p_id) {
 	busy++;
 	current_id = p_id;
 	// A completed coroutine may return another operation that must finish first.
-	if (!park(p_value, p_id, job)) {
-		run(p_id, job, p_value, true, GDClock::usec() + GD_SCHED_SLICE_USEC);
+	if (p_result.error.get_type() != Variant::NIL || !park(p_result.value, p_id, job)) {
+		run(p_id, job, p_result, true, GDClock::usec() + GD_SCHED_SLICE_USEC);
 	}
 	current_id = -1;
 	leave();
@@ -1458,23 +1608,25 @@ void GDWebApp::resumed(const Variant &p_value, int p_id) {
 }
 
 // Execute request middleware and handlers in order.
-void GDWebApp::run(int p_id, Job &p_job, const Variant &p_back, bool p_resumed, uint64_t p_until) {
+void GDWebApp::run(int p_id, Job &p_job, const VariantPair &p_back, bool p_resumed, uint64_t p_until) {
 	const bool sliced = GDScriptFunction::begin_time_slice(p_until);
 	const uint64_t outer = GDScriptFunction::native_time_slice_deadline();
 	if (outer) p_until = p_until ? MIN(p_until, outer) : outer;
 	if (p_resumed) {
+		p_job.pair_pending = false;
 		step(p_job, p_back);
 	}
 
 	// Advance the phase position after each call and return immediately on suspension.
 	while (p_job.stage != DONE) {
-		Variant ret;
+		VariantPair ret;
 		bool called = false;
+		bool faulted = false;
 
 		switch (p_job.stage) {
 			case PRE: {
 				if (p_job.at < (int)pres.size()) {
-					ret = web_call(pres[p_job.at].fn, p_job.req);
+					ret = web_call(faulted, pres[p_job.at].fn, p_job.req);
 					called = true;
 				} else {
 					pick(p_job);
@@ -1482,13 +1634,13 @@ void GDWebApp::run(int p_id, Job &p_job, const Variant &p_back, bool p_resumed, 
 			} break;
 
 			case STATIC: {
-				ret = pick_static(p_job);
-				called = ret.get_type() == Variant::SIGNAL;
+				ret = { pick_static(p_job), Variant() };
+				called = ret.value.get_type() == Variant::SIGNAL;
 			} break;
 
 			case USE: {
 				if (p_job.at < (int)uses.size()) {
-					ret = web_call(uses[p_job.at].fn, p_job.req);
+					ret = web_call(faulted, uses[p_job.at].fn, p_job.req);
 					called = true;
 				} else if (p_job.ready) {
 					p_job.stage = AFTER;
@@ -1502,7 +1654,7 @@ void GDWebApp::run(int p_id, Job &p_job, const Variant &p_back, bool p_resumed, 
 			case BAND: {
 				const LocalVector<Mid> &mid = bands[p_job.band].mids;
 				if (p_job.at < (int)mid.size()) {
-					ret = web_call(mid[p_job.at].fn, p_job.req);
+					ret = web_call(faulted, mid[p_job.at].fn, p_job.req);
 					called = true;
 				} else {
 					p_job.stage = ROUTE;
@@ -1512,7 +1664,7 @@ void GDWebApp::run(int p_id, Job &p_job, const Variant &p_back, bool p_resumed, 
 
 			case ROUTE: {
 				if (p_job.mids >= 0 && p_job.at < (int)route_mids[p_job.mids].size()) {
-					ret = web_call(route_mids[p_job.mids][p_job.at].fn, p_job.req);
+					ret = web_call(faulted, route_mids[p_job.mids][p_job.at].fn, p_job.req);
 					called = true;
 				} else {
 					p_job.stage = HANDLE;
@@ -1522,7 +1674,7 @@ void GDWebApp::run(int p_id, Job &p_job, const Variant &p_back, bool p_resumed, 
 
 			case HANDLE: {
 				if (p_job.handler.is_valid()) {
-					ret = web_call(p_job.handler, p_job.req);
+					ret = web_call(faulted, p_job.handler, p_job.req);
 					p_job.handler = Callable();
 					called = true;
 				} else {
@@ -1532,17 +1684,10 @@ void GDWebApp::run(int p_id, Job &p_job, const Variant &p_back, bool p_resumed, 
 			} break;
 
 			case FAIL: {
-				R *res = p_job.at == 0 ? Object::cast_to<R>(p_job.out) : nullptr;
-				// Treat a directly returned error reason like an R failure.
-				Ref<Err> why;
-				if (res != nullptr) {
-					why = res->get_e();
-				} else if (p_job.at == 0) {
-					why = Ref<Err>(p_job.out);
-				}
+				const Ref<Err> why = p_job.at == 0 ? Ref<Err>(p_job.out) : Ref<Err>();
 				if (why.is_valid()) {
 					if (on_fail.is_valid()) {
-						ret = web_call(on_fail, p_job.req, why);
+						ret = web_call(faulted, on_fail, p_job.req, why);
 						called = true;
 						break;
 					}
@@ -1560,8 +1705,6 @@ void GDWebApp::run(int p_id, Job &p_job, const Variant &p_back, bool p_resumed, 
 						}
 						p_job.out = Http::text(http_reason(code), code);
 					}
-				} else if (res != nullptr) {
-					p_job.out = res->get_v(); // Use the successful result's value directly as the response.
 				}
 				p_job.stage = AFTER;
 				p_job.at = p_job.after_at;
@@ -1569,7 +1712,7 @@ void GDWebApp::run(int p_id, Job &p_job, const Variant &p_back, bool p_resumed, 
 
 			case AFTER: {
 				if (p_job.at < (int)afters.size()) {
-					ret = web_call(afters[p_job.at], p_job.req, p_job.out);
+					ret = web_call(faulted, afters[p_job.at], p_job.req, p_job.out);
 					called = true;
 				} else {
 					p_job.stage = ENCODE;
@@ -1578,35 +1721,34 @@ void GDWebApp::run(int p_id, Job &p_job, const Variant &p_back, bool p_resumed, 
 
 			case ENCODE: {
 				// Reject unsent response failures before selecting an encoding path.
-				const Ref<Err> error = R::unpack(p_job.out);
+				const Ref<Err> error = p_job.out;
 				if (error.is_valid()) { failed(p_job, error); break; }
-				if (p_job.out.get_type() == Variant::OBJECT) {
+				const Ref<GDWebResponse> native = p_job.out;
+				if (p_job.out.get_type() == Variant::OBJECT && native.is_null()) {
 					failed(p_job, Err::make("response must be data or an envelope", Err::INVALID_DATA));
 					break;
 				}
-				// Preserve shared envelopes unless a wrapped body needs replacing.
-				if (p_job.out.get_type() == Variant::DICTIONARY) {
-					Dictionary response = p_job.out;
-					const Variant *body = response.getptr(SNAME("body"));
+				// Check wrapped object bodies before choosing an encoding path.
+				if (p_job.out.get_type() == Variant::DICTIONARY || native.is_valid()) {
+					static const Dictionary empty; // No per-reply dictionary for native responses.
+					Dictionary response = native.is_valid() ? empty : Dictionary(p_job.out);
+					const Variant *body = native.is_valid() ? &native->body_value() : response.getptr(SNAME("body"));
 					if (body && body->get_type() == Variant::OBJECT) {
-						Variant value = *body;
-						const Ref<Err> error = R::unpack(value);
+						const Variant value = *body;
+						const Ref<Err> error = value;
 						if (error.is_valid()) { failed(p_job, error); break; }
-						if (value.get_type() == Variant::OBJECT && Ref<GDBodySource>(value).is_null()) {
+						if (Ref<GDBodySource>(value).is_null()) {
 							failed(p_job, Err::make("response body must be data or a byte source", Err::INVALID_DATA));
 							break;
-						}
-						if (Ref<R>(*body).is_valid()) {
-							response = response.duplicate();
-							response["body"] = value;
-							p_job.out = response;
 						}
 					}
 				}
 				const Variant value = p_job.out;
-				// Borrow body storage only while the retained envelope is unchanged in this turn.
+				// Borrow body storage while the retained envelope is unchanged in this turn.
 				const Variant *content = nullptr;
-				if (value.get_type() == Variant::DICTIONARY) {
+				if (native.is_valid()) {
+					content = &native->body_value();
+				} else if (value.get_type() == Variant::DICTIONARY) {
 					const Dictionary response = value;
 					content = response.getptr(SNAME("body"));
 				}
@@ -1615,52 +1757,57 @@ void GDWebApp::run(int p_id, Job &p_job, const Variant &p_back, bool p_resumed, 
 					const Variant &text = content ? *content : value;
 					if (text.get_type() == Variant::STRING || text.get_type() == Variant::STRING_NAME) {
 						p_job.head_text = true;
-						ret = utf8_size(text, p_until);
+						ret = { utf8_size(text, p_until), Variant() };
 						called = true;
 						break;
 					}
 				}
-				// Scalar text does not need dictionary allocation or response-envelope lookups.
+				// Scalar text does not need response-envelope lookups.
 				if (value.get_type() == Variant::STRING || value.get_type() == Variant::STRING_NAME) {
-					p_job.encoded_type = TEXT_TYPE;
-					ret = utf8_reply(value, p_until, [](const PackedByteArray &p_bytes) -> Variant { return p_bytes; });
+					p_job.encoded_type = HTTP_TYPE_TEXT;
+					ret = { utf8_reply(value, p_until, [](const PackedByteArray &p_bytes) -> Variant { return p_bytes; }), Variant() };
 					called = true;
 					break;
 				}
 				const bool raw_json = value.get_type() == Variant::DICTIONARY && !content;
 				const bool text_body = content && content->get_type() != Variant::PACKED_BYTE_ARRAY && content->get_type() != Variant::OBJECT;
-				const bool plain_value = value.get_type() != Variant::DICTIONARY && value.get_type() != Variant::PACKED_BYTE_ARRAY && value.get_type() != Variant::NIL;
+				const bool plain_value = native.is_null() && value.get_type() != Variant::DICTIONARY && value.get_type() != Variant::PACKED_BYTE_ARRAY && value.get_type() != Variant::NIL;
 				if (!raw_json && !text_body && !plain_value) {
 					p_job.stage = DONE;
 					break;
 				}
 				// Keep resumable conversion local until its time slice requires a worker continuation.
 				if (raw_json) {
-					p_job.encoded_type = JSON_TYPE;
+					p_job.encoded_type = HTTP_TYPE_JSON;
 					ret = JsonData::encode_reply(value, p_until);
 					called = true;
 					break;
 				}
-				// Encode envelope text with the same resumable path as scalar text.
+				// Encode response text with the same resumable path as scalar text.
 				if (text_body && (content->get_type() == Variant::STRING || content->get_type() == Variant::STRING_NAME)) {
 					p_job.body_encoded = true;
-					ret = utf8_reply(*content, p_until, [](const PackedByteArray &p_bytes) -> Variant { return p_bytes; });
+					ret = { utf8_reply(*content, p_until, [](const PackedByteArray &p_bytes) -> Variant { return p_bytes; }), Variant() };
 					called = true;
 					break;
 				}
-				// User callbacks and non-resumable formatting retain their worker execution context.
+				// User callbacks and non-resumable formatting retain their worker context.
 				p_job.body_encoded = text_body;
-				p_job.encoded_type = TEXT_TYPE;
+				p_job.encoded_type = HTTP_TYPE_TEXT;
 				const Variant body = text_body ? *content : value;
-				ret = GDValueCall::start([body]() -> Variant { return Pool::text(body).to_utf8_buffer(); });
+				ret = { GDValueCall::start([body]() -> Variant { return Pool::text(body).to_utf8_buffer(); }), Variant() };
 				called = true;
 			} break;
 		}
 
+		if (faulted) {
+			fault_job(p_id, p_job);
+			if (sliced) GDScriptFunction::end_time_slice();
+			return;
+		}
 		if (!called) {
 			continue;
 		}
-		if (park(ret, p_id, p_job)) {
+		if (ret.error.get_type() == Variant::NIL && park(ret.value, p_id, p_job)) {
 			if (sliced) {
 				GDScriptFunction::end_time_slice();
 			}
@@ -1680,26 +1827,29 @@ void GDWebApp::failed(Job &p_job, const Ref<Err> &p_error) {
 	p_job.body = Variant();
 	p_job.body_encoded = false;
 	p_job.head_text = false;
-	p_job.encoded_type = nullptr;
+	p_job.encoded_type = HTTP_TYPE_CUSTOM;
 	if (p_job.failing) {
-		ERR_PRINT(vformat("error response failed: %s", LogState::flat(p_error->text())));
+		const Ref<Err> combined = Err::join(p_job.prior_error, p_error);
+		ERR_PRINT(vformat("error response failed: %s", LogState::flat(combined->text())));
 		p_job.out = Http::bytes_out(String("Internal Server Error").to_utf8_buffer(), TEXT_TYPE, 500);
 		p_job.stage = DONE;
 		return;
 	}
 	p_job.after_at = p_job.stage == AFTER ? p_job.at + 1 : p_job.stage == ENCODE ? afters.size() : 0;
 	p_job.failing = true;
+	p_job.prior_error = p_error;
 	p_job.out = p_error;
 	p_job.stage = FAIL;
 	p_job.at = 0;
 }
 
 // Advance the asynchronous processing state by one phase.
-void GDWebApp::step(Job &p_job, const Variant &p_value) {
-	Variant p_ret = p_value;
+void GDWebApp::step(Job &p_job, const VariantPair &p_result) {
+	const Variant &p_ret = p_result.value;
+	Ref<Err> result_error = p_result.error;
+	if (result_error.is_null()) result_error = Ref<Err>(p_ret);
 	if (p_job.stage != STATIC) {
-		const Ref<Err> error = R::unpack(p_ret);
-		if (error.is_valid()) { failed(p_job, error); return; }
+		if (result_error.is_valid()) { failed(p_job, result_error); return; }
 	}
 	switch (p_job.stage) {
 		case PRE:
@@ -1718,34 +1868,31 @@ void GDWebApp::step(Job &p_job, const Variant &p_value) {
 		} break;
 
 		case STATIC: {
-			const Ref<R> opened = p_ret;
-			if (opened.is_null() || !opened->get_ok()) {
-				if (p_job.file.is_valid()) {
+			if (p_job.file.is_valid()) {
+				const Ref<Err> error = result_error;
+				if (error.is_valid()) {
 					p_job.file->abort();
 					p_job.file.unref();
+					if (!error->is(Err::NOT_FOUND)) failed(p_job, error);
+					return;
 				}
-				const Ref<Err> error = opened.is_valid() ? opened->get_e() : Err::make("invalid static file result", Err::NONE);
-				if (!error->is(Err::NOT_FOUND)) failed(p_job, error);
-				return; // Missing files may be supplied by another static root.
-			}
-			if (p_job.file.is_null()) {
-				const Dictionary served = opened->get_v();
-				if (served.is_empty()) {
-					return; // Inspect the next static root.
-				}
-				p_job.out = served;
+				const HttpType kind = http_type_of(p_job.file_type);
+				p_job.out = GDWebResponse::make(200, kind, p_job.file, kind == HTTP_TYPE_CUSTOM ? p_job.file_type : String());
 				p_job.ready = true;
 				p_job.stage = USE;
 				p_job.at = 0;
 				break;
 			}
-			Dictionary headers;
-			headers["Content-Type"] = p_job.file_type;
-			Dictionary out;
-			out["status"] = 200;
-			out["headers"] = headers;
-			out["body"] = p_job.file;
-			p_job.out = out;
+			const Ref<Err> error = result_error;
+			if (error.is_valid()) {
+				if (!error->is(Err::NOT_FOUND)) failed(p_job, error);
+				return; // Missing files may be supplied by another static root.
+			}
+			const Ref<GDWebResponse> served = p_ret;
+			if (served.is_null()) {
+				return; // Inspect the next static root.
+			}
+			p_job.out = served;
 			p_job.ready = true;
 			p_job.stage = USE;
 			p_job.at = 0;
@@ -1795,46 +1942,36 @@ void GDWebApp::step(Job &p_job, const Variant &p_value) {
 // Select a route and handler matching the request.
 void GDWebApp::pick(Job &p_job) {
 	GDWebRequest *req = p_job.req.ptr();
-	String method = req->get_method();
-	// Dispatch HEAD through GET routes with the same headers but no body.
-	// The transport suppresses the body; separate routing would incorrectly return 404.
-	const bool head_only = (method == "HEAD");
-	if (head_only) {
-		method = "GET";
-	}
-
-	// Resolve exact routes with one dictionary lookup on the common path.
-	HashMap<String, LocalVector<Slot>>::ConstIterator hit = exact.find(req->route_txt);
-	if (hit) {
-		for (const Slot &slot : hit->value) {
-			if (slot.method != method) {
-				continue;
+	// Prefer an explicit HEAD route; GET supplies its metadata when no HEAD route exists.
+	auto select = [&](const String &p_method) -> bool {
+		const auto hit = exact.find(req->route_txt);
+		if (hit) {
+			for (const Slot &slot : hit->value) {
+				if (slot.method != p_method) continue;
+				p_job.handler = slot.handler;
+				p_job.band = slot.group;
+				p_job.mids = slot.mids;
+				p_job.stage = USE;
+				p_job.at = 0;
+				return true;
 			}
-			p_job.handler = slot.handler;
-			p_job.band = slot.group;
-			p_job.mids = slot.mids;
+		}
+		if (!routes.is_empty() && req->path_parts.is_empty()) {
+			req->path_parts = req->path_txt.split("/", true); // Split only when named routes can use the segments.
+		}
+		for (const Route &route : routes) {
+			if (route.method != p_method || !match(route, req->path_parts, req)) continue;
+			p_job.handler = route.handler;
+			p_job.band = route.group;
+			p_job.mids = route.mids;
 			p_job.stage = USE;
 			p_job.at = 0;
-			return;
+			return true;
 		}
-	}
-
-	// Match routes with named captures.
-	if (!routes.is_empty() && req->path_parts.is_empty()) {
-		req->path_parts = req->path_txt.split("/", true); // Split only when a named-capture route can consume the segments.
-	}
-	const PackedStringArray &target = req->path_parts;
-	for (const Route &r : routes) {
-		if (r.method != method || !match(r, target, req)) {
-			continue;
-		}
-		p_job.handler = r.handler;
-		p_job.band = r.group;
-		p_job.mids = r.mids;
-		p_job.stage = USE;
-		p_job.at = 0;
-		return;
-	}
+		return false;
+	};
+	const String method = req->get_method();
+	if (select(method) || (method == "HEAD" && select("GET"))) return;
 
 	// If no route matches, inspect static files on a worker.
 	p_job.static_at = 0;
@@ -1845,13 +1982,22 @@ void GDWebApp::pick(Job &p_job) {
 Variant GDWebApp::pick_static(Job &p_job) {
 	GDWebRequest *req = p_job.req.ptr();
 	const String method = req->get_method();
+	// Collect route methods only when a request has missed dispatch.
+	auto route_methods = [&]() {
+		PackedStringArray allowed;
+		auto add = [&allowed](const String &p_method) {
+			if (!allowed.has(p_method)) allowed.push_back(p_method);
+		};
+		const auto hit = exact.find(req->route_txt);
+		if (hit) for (const Slot &slot : hit->value) add(slot.method);
+		for (const Route &route : routes) {
+			if (match(route, req->path_parts, nullptr)) add(route.method);
+		}
+		if (allowed.has("GET")) add("HEAD");
+		return allowed;
+	};
 	for (; p_job.static_at < (int)statics.size(); p_job.static_at++) {
 		const Pair<String, String> &st = statics[p_job.static_at];
-		if (method != "GET") {
-			if (method != "HEAD") {
-				break;
-			}
-		}
 		if (!req->route_txt.begins_with(st.first) || (req->route_txt.length() > st.first.length() && req->route_txt[st.first.length()] != '/')) {
 			continue;
 		}
@@ -1866,9 +2012,20 @@ Variant GDWebApp::pick_static(Job &p_job) {
 			continue;
 		}
 		p_job.static_at++;
+		if (method != "GET" && method != "HEAD") {
+			// Inspect only the matching file; absent paths still resolve to 404.
+			PackedStringArray allowed = route_methods();
+			if (!allowed.has("GET")) allowed.push_back("GET");
+			if (!allowed.has("HEAD")) allowed.push_back("HEAD");
+			allowed.sort();
+			return GDPairCall::start([full, allowed]() -> VariantPair {
+				if (!GDFile::exists(full)) return { Dictionary(), Variant() };
+				return { Http::head(Http::text("method not allowed", 405), "Allow", String(", ").join(allowed)), Variant() };
+			});
+		}
 		if (!afters.is_empty()) {
 			// Build the reply dictionary expected by postprocessors while offloading file I/O.
-			return GDFileCall::start([full]() { return file_reply(full); });
+			return GDPairCall::start([full]() { return file_reply(full); }, false);
 		}
 		p_job.file.instantiate();
 		p_job.file_type = Media::by_path(full);
@@ -1878,6 +2035,16 @@ Variant GDWebApp::pick_static(Job &p_job) {
 	if (fallback.is_valid()) {
 		p_job.handler = fallback;
 		p_job.band = -1;
+		p_job.stage = USE;
+		p_job.at = 0;
+		return Variant();
+	}
+	// Identify methods for a known route only after static lookup has missed.
+	PackedStringArray allowed = route_methods();
+	if (!allowed.is_empty()) {
+		allowed.sort();
+		p_job.out = Http::head(Http::text("method not allowed", 405), "Allow", String(", ").join(allowed));
+		p_job.ready = true;
 		p_job.stage = USE;
 		p_job.at = 0;
 		return Variant();
@@ -1899,33 +2066,44 @@ bool GDWebApp::match(const Route &p_route, const PackedStringArray &p_target, GD
 		const String part = p_route.parts[i];
 		if (part.begins_with(":")) {
 			// Pass once-decoded request segments directly into route captures.
-			got[part.substr(1)] = p_target[i];
+			if (p_req) got[part.substr(1)] = p_target[i];
 		} else if (part != p_target[i]) {
 			return false;
 		}
 	}
-	p_req->params_map = got;
+	if (p_req) p_req->params_map = got;
 	return true;
 }
 
 // Read a file on the I/O queue and preserve its original result.
 Signal GDWebApp::file_at(const String &p_path) const {
-	return GDFileCall::start([p_path]() { return file_reply(p_path); });
+	return GDPairCall::start([p_path]() { return file_reply(p_path); }, false);
 }
 
 // Complete processing and release request resources.
 void GDWebApp::finish(int p_id, Job &p_job) {
+	const Dictionary &reply_headers = p_job.req->reply_headers;
+	// Preserve the fixed-response path when middleware supplied no headers.
+	auto send_fixed = [&](int p_status, const PackedByteArray &p_body, HttpType p_type) {
+		if (reply_headers.is_empty()) {
+			srv->respond_fixed(p_id, p_status, p_body, p_type);
+		} else {
+			Dictionary headers = reply_headers.duplicate();
+			headers[SNAME("Content-Type")] = String(http_type_bytes(p_type));
+			srv->respond_with(p_id, p_status, headers, p_body);
+		}
+	};
 	// Do not stringify unsupported objects into public responses; retain details only in logs.
-	if (p_job.out.get_type() == Variant::OBJECT) {
-		const Ref<R> res = p_job.out;
-		const Ref<Err> why = res.is_valid() ? res->get_e() : Ref<Err>(p_job.out);
+	const Ref<GDWebResponse> native = p_job.out;
+	if (p_job.out.get_type() == Variant::OBJECT && native.is_null()) {
+		const Ref<Err> why = p_job.out;
 		const String detail = why.is_valid() ? why->text() : String("returned an object");
 		ERR_PRINT(vformat("handler failed: %s", LogState::flat(detail)));
 		if (p_job.file.is_valid()) {
 			p_job.file->abort();
 			p_job.file.unref();
 		}
-		srv->respond(p_id, 500, String("internal error").to_utf8_buffer(), TEXT_TYPE);
+		send_fixed(500, String("internal error").to_utf8_buffer(), HTTP_TYPE_TEXT);
 		p_job.req->finish_context("request finished");
 		if (p_job.req->get_reference_count() == 1) {
 			spare = p_job.req;
@@ -1934,19 +2112,38 @@ void GDWebApp::finish(int p_id, Job &p_job) {
 	}
 	const Variant &p_out = p_job.out;
 	bool streaming = false;
-	if (p_out.get_type() == Variant::DICTIONARY) {
-		const Dictionary out = p_out;
-		const Variant *content = out.getptr(SNAME("body"));
+	if (p_out.get_type() == Variant::DICTIONARY || native.is_valid()) {
+		static const Dictionary empty; // No per-reply dictionary for native responses.
+		const Dictionary out = native.is_valid() ? empty : Dictionary(p_out);
+		const Variant *content = native.is_valid() ? &native->body_value() : out.getptr(SNAME("body"));
 		bool sent = false;
 		if (content) {
 			// Read final metadata after encoding, preserving shared-envelope updates during await.
-			const Variant *status_value = out.getptr(SNAME("status"));
-			const Variant *header_value = out.getptr(SNAME("headers"));
-			const int status = status_value ? safe_status(*status_value) : 200;
+			const Variant *status_value = native.is_valid() ? nullptr : out.getptr(SNAME("status"));
+			const Variant *header_value = native.is_valid() ? nullptr : out.getptr(SNAME("headers"));
+			const Variant *type_value = native.is_valid() ? nullptr : out.getptr(SNAME("type"));
+			const int status = native.is_valid() ? safe_status(native->get_status()) : status_value ? safe_status(*status_value) : 200;
+			const HttpType kind = native.is_valid() ? native->get_type() : HTTP_TYPE_CUSTOM;
+			static const String text_type(TEXT_TYPE); // Share the default type across replies.
+			const String custom_type = native.is_valid() ? native->get_custom_type() : type_value ? String(*type_value) : text_type;
 			const Variant body = p_job.body_encoded ? p_job.body : *content;
 			const Ref<GDBodySource> source = body;
-			if (header_value) {
-				const Dictionary headers = *header_value;
+			if (header_value || (native.is_valid() && native->has_extra()) || !reply_headers.is_empty()) {
+				// Borrow existing headers without allocating an empty dictionary first.
+				Dictionary headers = native.is_valid() && native->has_extra() ? *native->extra_headers() : header_value ? Dictionary(*header_value) : Dictionary();
+				if (!reply_headers.is_empty()) {
+					headers = headers.duplicate();
+					for (const Variant &key : reply_headers.keys()) {
+						if (!find_header(headers, String(key))) headers[key] = reply_headers[key];
+					}
+				}
+				if ((type_value || native.is_valid()) && !find_header(headers, "Content-Type")) {
+					const String type_name = kind == HTTP_TYPE_CUSTOM ? custom_type : String(http_type_bytes(kind));
+					if (!type_name.is_empty()) {
+						headers = headers.duplicate();
+						headers[SNAME("Content-Type")] = type_name;
+					}
+				}
 				const Variant *type = only_type(headers);
 				if (source.is_valid()) {
 					streaming = source->watch_disconnect();
@@ -1966,25 +2163,36 @@ void GDWebApp::finish(int p_id, Job &p_job) {
 					}
 					sent = true;
 				}
-			} else if (body.get_type() == Variant::PACKED_BYTE_ARRAY) {
-				srv->respond(p_id, status, body, TEXT_TYPE);
+			} else if (source.is_valid()) {
+				streaming = source->watch_disconnect();
+				if (streaming) source->set_context(p_job.req->get_context());
+				if (kind != HTTP_TYPE_CUSTOM) srv->respond_file_fixed(p_id, status, source, kind);
+				else srv->respond_file_plain(p_id, status, source, custom_type);
+				p_job.file.unref();
 				sent = true;
-			} else if (p_job.head_text && source.is_valid()) {
-				srv->respond_file(p_id, status, Dictionary(), source, TEXT_TYPE);
+			} else if (body.get_type() == Variant::PACKED_BYTE_ARRAY) {
+				if (kind != HTTP_TYPE_CUSTOM) srv->respond_fixed(p_id, status, body, kind);
+				else srv->respond(p_id, status, body, custom_type);
 				sent = true;
 			}
 		}
 		if (!sent) {
-			srv->respond(p_id, 500, String("invalid response").to_utf8_buffer(), TEXT_TYPE);
+			send_fixed(500, String("invalid response").to_utf8_buffer(), HTTP_TYPE_TEXT);
 		}
 	} else if (p_job.head_text && p_job.body_encoded) {
-		srv->respond_file(p_id, 200, Dictionary(), p_job.body, TEXT_TYPE);
+		if (reply_headers.is_empty()) {
+			srv->respond_file_fixed(p_id, 200, p_job.body, HTTP_TYPE_TEXT);
+		} else {
+			Dictionary headers = reply_headers.duplicate();
+			headers[SNAME("Content-Type")] = String(http_type_bytes(HTTP_TYPE_TEXT));
+			srv->respond_file(p_id, 200, headers, p_job.body, String());
+		}
 	} else if (p_out.get_type() == Variant::PACKED_BYTE_ARRAY) {
-		srv->respond(p_id, 200, p_out, p_job.encoded_type ? p_job.encoded_type : BYTES_TYPE);
+		send_fixed(200, p_out, p_job.encoded_type == HTTP_TYPE_CUSTOM ? HTTP_TYPE_BYTES : p_job.encoded_type);
 	} else if (p_out.get_type() == Variant::NIL) {
-		srv->respond(p_id, 204, PackedByteArray(), TEXT_TYPE); // No response body.
+		send_fixed(204, PackedByteArray(), HTTP_TYPE_TEXT); // No response body.
 	} else {
-		srv->respond(p_id, 500, String("invalid response").to_utf8_buffer(), TEXT_TYPE);
+		send_fixed(500, String("invalid response").to_utf8_buffer(), HTTP_TYPE_TEXT);
 	}
 	if (p_job.file.is_valid()) {
 		p_job.file->abort(); // Middleware replaced the static body.
@@ -2039,43 +2247,118 @@ void GDWebApp::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("fallback", "handler"), &GDWebApp::otherwise);
 	ClassDB::bind_method(D_METHOD("file_at", "path"), &GDWebApp::file_at);
 	ClassDB::bind_method(D_METHOD("file_at_async", "path"), &GDWebApp::file_at);
-	ADD_AWAIT("file_at_async", "R:Dictionary");
-	ADD_AWAIT("file_at", "R:Dictionary");
+	ADD_AWAIT("file_at_async", "Pair:GDWebResponse");
+	ADD_AWAIT("file_at", "Pair:GDWebResponse");
 	ADD_AUTO_WAIT("file_at");
 	ClassDB::bind_method(D_METHOD("listen", "port", "host"), &GDWebApp::listen, DEFVAL("127.0.0.1"));
 	ClassDB::bind_method(D_METHOD("listen_tls", "port", "cert", "key", "host", "opts"), &GDWebApp::listen_tls, DEFVAL("127.0.0.1"), DEFVAL(Dictionary()));
 	ClassDB::bind_method(D_METHOD("listen_tls_async", "port", "cert", "key", "host", "opts"), &GDWebApp::listen_tls, DEFVAL("127.0.0.1"), DEFVAL(Dictionary()));
-	ADD_AWAIT("listen_tls", "R:Variant");
-	ADD_AWAIT("listen_tls_async", "R:Variant");
+	ADD_AWAIT("listen_tls", "Pair:Variant");
+	ADD_AWAIT("listen_tls_async", "Pair:Variant");
 	ADD_AUTO_WAIT("listen_tls");
-	ADD_RESULT("listen", "Variant");
+	ADD_PAIR_RESULT("listen", "Variant");
 	ClassDB::bind_method(D_METHOD("port"), &GDWebApp::port);
 	ClassDB::bind_method(D_METHOD("shutdown", "context"), &GDWebApp::shutdown);
 	ClassDB::bind_method(D_METHOD("shutdown_async", "context"), &GDWebApp::shutdown);
-	ADD_AWAIT("shutdown", "R:Variant");
-	ADD_AWAIT("shutdown_async", "R:Variant");
+	ADD_AWAIT("shutdown", "Pair:Variant");
+	ADD_AWAIT("shutdown_async", "Pair:Variant");
 	ADD_AUTO_WAIT("shutdown");
 	ClassDB::bind_method(D_METHOD("stop"), &GDWebApp::stop);
 	ClassDB::bind_method(D_METHOD("is_listening"), &GDWebApp::is_listening);
+	ClassDB::bind_method(D_METHOD("serve_error"), &GDWebApp::serve_error);
 	ClassDB::bind_method(D_METHOD("poll"), &GDWebApp::poll);
 }
 
 // ---------------- Response constructors ----------------
 
-namespace {
-
-// Normalize handler return values into HTTP responses.
-Dictionary reply(int64_t p_status, const String &p_type, const Variant &p_body) {
-	Dictionary headers;
-	headers["Content-Type"] = p_type;
-	Dictionary out;
-	out["status"] = safe_status(p_status);
-	out["headers"] = headers;
-	out["body"] = p_body;
+// Construct a response with numeric metadata and no header dictionary.
+Ref<GDWebResponse> GDWebResponse::make(int64_t p_status, HttpType p_type, const Variant &p_body, const String &p_custom) {
+	Ref<GDWebResponse> out;
+	out.instantiate();
+	out->status = safe_status(p_status);
+	out->type = p_type;
+	out->custom_type = p_custom;
+	out->body = p_body;
 	return out;
 }
 
-} // namespace
+// Keep mutable status values within the transport's valid range.
+void GDWebResponse::set_status(int64_t p_status) {
+	status = safe_status(p_status);
+}
+
+// Expose a content type only when script code inspects response metadata.
+String GDWebResponse::type_name() const {
+	if (extra) {
+		if (const Variant *override = find_header(*extra, "Content-Type")) return String(*override);
+	}
+	return type == HTTP_TYPE_CUSTOM ? custom_type : String(http_type_bytes(type));
+}
+
+// Materialize headers only for explicit inspection or modification.
+Dictionary GDWebResponse::get_headers() const {
+	Dictionary headers = extra ? extra->duplicate(true) : Dictionary();
+	if (!find_header(headers, "Content-Type") && (type != HTTP_TYPE_CUSTOM || !custom_type.is_empty())) headers["Content-Type"] = type_name();
+	return headers;
+}
+
+// Replace optional header storage while preserving numeric default metadata.
+void GDWebResponse::set_headers(const Dictionary &p_headers) {
+	extra = p_headers.is_empty() ? nullptr : std::make_unique<Dictionary>(p_headers.duplicate(true));
+}
+
+// Copy response metadata before changing a single header.
+Ref<GDWebResponse> GDWebResponse::with_header(const String &p_name, const Variant &p_value, bool p_append) const {
+	Ref<GDWebResponse> out = make(status, type, body, custom_type);
+	out->extra = std::make_unique<Dictionary>(extra ? extra->duplicate(true) : Dictionary());
+	const Variant *prior = find_header(*out->extra, p_name);
+	if (p_append && prior) {
+		Array values;
+		if (prior->get_type() == Variant::ARRAY) values = Array(*prior).duplicate();
+		else values.push_back(*prior);
+		values.push_back(p_value);
+		for (const Variant &key : out->extra->keys()) if (String(key).nocasecmp_to(p_name) == 0) out->extra->erase(key);
+		(*out->extra)[p_name] = values;
+		return out;
+	}
+	for (const Variant &key : out->extra->keys()) if (String(key).nocasecmp_to(p_name) == 0) out->extra->erase(key);
+	(*out->extra)[p_name] = p_value;
+	return out;
+}
+
+// Add protective headers without replacing explicit caller values.
+Ref<GDWebResponse> GDWebResponse::guarded() const {
+	static const char *pairs[][2] = {
+		{ "X-Content-Type-Options", "nosniff" }, // Reject content sniffing.
+		{ "X-Frame-Options", "DENY" }, // Block embedding in frames.
+		{ "Referrer-Policy", "no-referrer" }, // Omit referrer details.
+		{ "Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'" }, // Restrict content origins.
+		{ "Strict-Transport-Security", "max-age=15552000; includeSubDomains" }, // Retain HTTPS preference.
+		{ "Permissions-Policy", "geolocation=(), microphone=(), camera=()" }, // Disable browser features.
+		{ "Cross-Origin-Opener-Policy", "same-origin" }, // Isolate opener access.
+		{ "Cross-Origin-Resource-Policy", "same-origin" }, // Restrict resource reuse.
+		{ "X-Permitted-Cross-Domain-Policies", "none" }, // Reject legacy policy files.
+	};
+	Ref<GDWebResponse> out = make(status, type, body, custom_type);
+	out->extra = std::make_unique<Dictionary>(extra ? extra->duplicate(true) : Dictionary());
+	for (const char *const *one : pairs) if (!find_header(*out->extra, one[0])) (*out->extra)[one[0]] = one[1];
+	return out;
+}
+
+// Bind editable response fields for postprocessors and script inspection.
+void GDWebResponse::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("get_status"), &GDWebResponse::get_status);
+	ClassDB::bind_method(D_METHOD("set_status", "status"), &GDWebResponse::set_status);
+	ClassDB::bind_method(D_METHOD("get_body"), &GDWebResponse::get_body);
+	ClassDB::bind_method(D_METHOD("set_body", "body"), &GDWebResponse::set_body);
+	ClassDB::bind_method(D_METHOD("get_headers"), &GDWebResponse::get_headers);
+	ClassDB::bind_method(D_METHOD("set_headers", "headers"), &GDWebResponse::set_headers);
+	ClassDB::bind_method(D_METHOD("get_type"), &GDWebResponse::type_name);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "status"), "set_status", "get_status");
+	ADD_PROPERTY(PropertyInfo(Variant::NIL, "body"), "set_body", "get_body");
+	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "headers"), "set_headers", "get_headers");
+	ADD_PROPERTY(PropertyInfo(Variant::STRING, "type"), "", "get_type");
+}
 
 // Send an HTTP request and return an asynchronous response.
 Signal Http::fetch(const String &p_url, const Dictionary &p_opts, const Ref<GDHTTPTransport> &p_transport) {
@@ -2086,62 +2369,37 @@ Signal Http::fetch(const String &p_url, const Dictionary &p_opts, const Ref<GDHT
 }
 
 // Return retained content as text.
-Dictionary Http::text(const String &p_body, int64_t p_status) {
-	return reply(p_status, TEXT_TYPE, p_body);
+Ref<GDWebResponse> Http::text(const String &p_body, int64_t p_status) {
+	return GDWebResponse::make(p_status, HTTP_TYPE_TEXT, p_body);
 }
 
 // Create an HTML response.
-Dictionary Http::html(const String &p_body, int64_t p_status) {
-	return reply(p_status, HTML_TYPE, p_body);
+Ref<GDWebResponse> Http::html(const String &p_body, int64_t p_status) {
+	return GDWebResponse::make(p_status, HTTP_TYPE_HTML, p_body);
 }
 
 // Create the response on the encoding path that completes its body.
-Variant Http::json_out(const Variant &p_data, int64_t p_status, uint64_t p_until) {
-	return JsonData::encode_reply(p_data, p_until, [p_status](const Variant &p_encoded) -> Variant {
+VariantPair Http::json_out(const Variant &p_data, int64_t p_status, uint64_t p_until) {
+	return JsonData::encode_reply(p_data, p_until, [p_status](const VariantPair &p_encoded) -> VariantPair {
 		return json_reply(p_encoded, p_status);
 	});
 }
 
 // Return assembled content without an intermediate text conversion.
-Dictionary Http::bytes_out(const PackedByteArray &p_body, const String &p_type, int64_t p_status) {
-	return reply(p_status, p_type, p_body);
+Ref<GDWebResponse> Http::bytes_out(const PackedByteArray &p_body, const String &p_type, int64_t p_status) {
+	const HttpType type = http_type_of(p_type);
+	return GDWebResponse::make(p_status, type, p_body, type == HTTP_TYPE_CUSTOM ? p_type : String());
 }
 
-// Add protective headers and return the same reply dictionary for chaining.
-Dictionary Http::guard(const Dictionary &p_reply) {
-	// Add security defaults without overwriting caller-supplied values.
-	// Cover content interpretation, framing, referrer leakage, and cross-origin isolation.
-	// Also restrict browser features and require secure transport after an HTTPS response.
-	static const char *pairs[][2] = {
-		{ "X-Content-Type-Options", "nosniff" }, // Disable content-type sniffing.
-		{ "X-Frame-Options", "DENY" }, // Disallow embedding in frames.
-		{ "Referrer-Policy", "no-referrer" }, // Do not expose the referring URL.
-		// Default to same-origin content sources to reduce the impact of injected content.
-		{ "Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'" },
-		// Require HTTPS for subsequent visits; browsers ignore this header over plaintext HTTP.
-		// This applies when deployed behind TLS termination and lasts 180 days.
-		{ "Strict-Transport-Security", "max-age=15552000; includeSubDomains" },
-		// Disable powerful browser features unless the page explicitly enables them.
-		{ "Permissions-Policy", "geolocation=(), microphone=(), camera=()" },
-		{ "Cross-Origin-Opener-Policy", "same-origin" }, // Do not share opener context across origins.
-		{ "Cross-Origin-Resource-Policy", "same-origin" }, // Disallow cross-origin resource access.
-		{ "X-Permitted-Cross-Domain-Policies", "none" }, // Disable legacy cross-domain policy files.
-	};
-	Dictionary out = p_reply;
-	Dictionary headers = out.get("headers", Dictionary());
-	for (const char *const *one : pairs) {
-		if (!headers.has(one[0])) {
-			headers[one[0]] = one[1];
-		}
-	}
-	out["headers"] = headers;
-	return out;
+// Add protective headers to a copied response.
+Ref<GDWebResponse> Http::guard(const Ref<GDWebResponse> &p_reply) {
+	return p_reply.is_valid() ? p_reply->guarded() : Ref<GDWebResponse>();
 }
 
 // Default redirects to the same origin to avoid trusting external input as a destination.
 // An unchecked external destination can disguise a phishing redirect behind a trusted origin.
 // Callers must explicitly set away to permit external redirects.
-Dictionary Http::redirect(const String &p_to, int64_t p_status, bool p_away) {
+Ref<GDWebResponse> Http::redirect(const String &p_to, int64_t p_status, bool p_away) {
 	String to = p_to;
 	if (!p_away) {
 		// Reject external schemes and network paths while preserving same-origin relative references.
@@ -2149,52 +2407,33 @@ Dictionary Http::redirect(const String &p_to, int64_t p_status, bool p_away) {
 			to = "/"; // Replace an untrusted target with the local root.
 		}
 	}
-	Dictionary headers;
-	headers["Location"] = to;
-	Dictionary out;
-	out["status"] = safe_status(p_status);
-	out["headers"] = headers;
-	out["body"] = "";
-	return out;
+	return head(GDWebResponse::make(p_status, HTTP_TYPE_CUSTOM, String()), "Location", to);
 }
 
 // Create a 404 response.
-Dictionary Http::not_found(const String &p_msg) {
-	return reply(404, TEXT_TYPE, p_msg);
+Ref<GDWebResponse> Http::not_found(const String &p_msg) {
+	return text(p_msg, 404);
 }
 
 // Replace a response header.
-Dictionary Http::head(const Dictionary &p_reply, const String &p_name, const Variant &p_value) {
-	Dictionary headers = p_reply.get("headers", Dictionary());
-	headers[p_name] = p_value; // Sequence values produce multiple fields with the same name.
-	Dictionary out = p_reply;
-	out["headers"] = headers;
-	return out;
+Ref<GDWebResponse> Http::head(const Ref<GDWebResponse> &p_reply, const String &p_name, const Variant &p_value) {
+	return p_reply.is_valid() ? p_reply->with_header(p_name, p_value, false) : Ref<GDWebResponse>();
 }
 
 // Append without removing existing values; dictionaries retain one value per key.
 // Promote the second occurrence to a sequence.
-Dictionary Http::add_head(const Dictionary &p_reply, const String &p_name, const Variant &p_value) {
-	Dictionary headers = p_reply.get("headers", Dictionary());
-	if (!headers.has(p_name)) {
-		return head(p_reply, p_name, p_value);
-	}
-	const Variant had = headers[p_name];
-	Array vals;
-	if (had.get_type() == Variant::ARRAY) {
-		vals = had;
-		vals = vals.duplicate(); // Do not mutate the caller's sequence.
-	} else {
-		vals.push_back(had);
-	}
-	vals.push_back(p_value);
-	return head(p_reply, p_name, vals);
+Ref<GDWebResponse> Http::add_head(const Ref<GDWebResponse> &p_reply, const String &p_name, const Variant &p_value) {
+	return p_reply.is_valid() ? p_reply->with_header(p_name, p_value, true) : Ref<GDWebResponse>();
 }
 
 // Return the HTTP status corresponding to an Err.
 int Http::status_of(const Ref<Err> &p_err) {
 	if (p_err.is_null()) {
 		return 500;
+	}
+	const Variant explicit_status = p_err->get_info().get("http_status", Variant());
+	if (explicit_status.get_type() == Variant::INT && int64_t(explicit_status) >= 400 && int64_t(explicit_status) <= 599) {
+		return int(int64_t(explicit_status));
 	}
 	switch (p_err->get_kind()) {
 		case Err::NOT_FOUND:

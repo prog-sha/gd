@@ -31,6 +31,9 @@
 #include "os.h"
 
 #include "cli/sys/mount.h"
+#ifdef GD_VIEW
+#include "core/config/engine.h"
+#endif
 
 #include "core/config/project_settings.h"
 #include "core/io/dir_access.h"
@@ -356,6 +359,24 @@ String OS::expand_path(const String &p_path) const {
 	return p_path;
 }
 
+#ifdef GD_VIEW
+void OS::create_lock_file() {
+	if (Engine::get_singleton()->is_recovery_mode_hint()) {
+		return;
+	}
+	String lock_file_path = get_user_data_dir().path_join(".recovery_mode_lock");
+	Ref<FileAccess> lock_file = FileAccess::open(lock_file_path, FileAccess::WRITE);
+	if (lock_file.is_valid()) {
+		lock_file->close();
+	}
+}
+
+void OS::remove_lock_file() {
+	String lock_file_path = get_user_data_dir().path_join(".recovery_mode_lock");
+	DirAccess::remove_absolute(lock_file_path);
+}
+#endif
+
 Error OS::shell_open(const String &p_uri) {
 	return ERR_UNAVAILABLE;
 }
@@ -450,7 +471,8 @@ bool OS::has_feature(const String &p_feature) {
 		return _writing_movie;
 	}
 
-#ifdef DEBUG_ENABLED
+// Release executables keep debug diagnostics, but features describe the distribution target.
+#if defined(DEBUG_ENABLED) && !defined(GD_RELEASE_TARGET)
 	if (p_feature == "debug") {
 		return true;
 	}
@@ -471,7 +493,7 @@ bool OS::has_feature(const String &p_feature) {
 	if (p_feature == "template") {
 		return true;
 	}
-#ifdef DEBUG_ENABLED
+#if defined(DEBUG_ENABLED) && !defined(GD_RELEASE_TARGET)
 	if (p_feature == "template_debug") {
 		return true;
 	}

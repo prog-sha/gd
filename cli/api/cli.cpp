@@ -33,14 +33,18 @@ namespace {
 List<Ref<GDLogCall>> log_calls; // Main-thread-owned log queue in submission order.
 
 // Write one line to the terminal and optional file from the ordered worker.
-Ref<R> write_log_lines(bool p_err, const String &p_console, const String &p_path, const String &p_body) {
+Ref<Err> write_log_lines(bool p_err, const String &p_console, const String &p_path, const String &p_body) {
 	const CharString raw = p_console.utf8();
 	FILE *stream = p_err ? stderr : stdout;
 	const size_t wrote = fwrite(raw.get_data(), 1, raw.length(), stream);
 	if (wrote != size_t(raw.length()) || fflush(stream) != 0) {
-		return R::err("log output failed");
+		return Err::make("log output failed", Err::INVALID_DATA);
 	}
-	return p_path.is_empty() ? R::ok() : Os::append_text(p_path, p_body);
+	if (p_path.is_empty()) {
+		return Ref<Err>();
+	}
+	const VariantPair appended = Os::append_text(p_path, p_body);
+	return appended.error;
 }
 
 // Convert only supported textual forms to booleans.
@@ -173,7 +177,7 @@ void GDCLIFlags::flag_int(const String &p_name, int64_t p_fallback, const String
 }
 
 // Parse supplied arguments against declared flags.
-Ref<R> GDCLIFlags::parse(const Array &p_args) {
+VariantPair GDCLIFlags::parse(const Array &p_args) {
 	values = Dictionary();
 	rest = PackedStringArray();
 	int i = 0;
@@ -204,12 +208,12 @@ Ref<R> GDCLIFlags::parse(const Array &p_args) {
 
 		HashMap<String, Def>::ConstIterator found = defs.find(key);
 		if (!found) {
-			return R::err(vformat("unknown flag \"--%s\"", key), Err::INVALID_DATA);
+			return { Variant(), Err::make(vformat("unknown flag \"--%s\"", key), Err::INVALID_DATA) };
 		}
 		if (found->value.type == Variant::BOOL) {
 			bool value = true;
 			if (has_inline && !flag_bool_of(inline_val, value)) {
-				return R::err(vformat("invalid boolean value \"%s\" for flag \"--%s\"", inline_val, key), Err::INVALID_DATA);
+				return { Variant(), Err::make(vformat("invalid boolean value \"%s\" for flag \"--%s\"", inline_val, key), Err::INVALID_DATA) };
 			}
 			values[key] = value;
 			i++;
@@ -219,7 +223,7 @@ Ref<R> GDCLIFlags::parse(const Array &p_args) {
 		String raw = inline_val;
 		if (!has_inline) {
 			if (i + 1 >= p_args.size()) {
-				return R::err(vformat("flag \"--%s\" needs a value", key), Err::INVALID_DATA);
+				return { Variant(), Err::make(vformat("flag \"--%s\" needs a value", key), Err::INVALID_DATA) };
 			}
 			raw = p_args[i + 1];
 			i++;
@@ -228,14 +232,14 @@ Ref<R> GDCLIFlags::parse(const Array &p_args) {
 		if (found->value.type == Variant::INT) {
 			int64_t value = 0;
 			if (!flag_int_of(raw, value)) {
-				return R::err(vformat("invalid value \"%s\" for flag \"--%s\"", raw, key), Err::INVALID_DATA);
+				return { Variant(), Err::make(vformat("invalid value \"%s\" for flag \"--%s\"", raw, key), Err::INVALID_DATA) };
 			}
 			values[key] = value;
 		} else {
 			values[key] = raw;
 		}
 	}
-	return R::ok();
+	return {};
 }
 
 // Return a boolean flag's current value.
@@ -278,6 +282,7 @@ void GDCLIFlags::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("flag_str", "name", "fallback", "help"), &GDCLIFlags::flag_str, DEFVAL(""));
 	ClassDB::bind_method(D_METHOD("flag_int", "name", "fallback", "help"), &GDCLIFlags::flag_int, DEFVAL(""));
 	ClassDB::bind_method(D_METHOD("parse", "args"), &GDCLIFlags::parse);
+	ADD_PAIR_RESULT("parse", "Variant");
 	ClassDB::bind_method(D_METHOD("get_bool", "name"), &GDCLIFlags::get_bool);
 	ClassDB::bind_method(D_METHOD("get_str", "name"), &GDCLIFlags::get_str);
 	ClassDB::bind_method(D_METHOD("get_int", "name"), &GDCLIFlags::get_int);
@@ -288,9 +293,9 @@ void GDCLIFlags::_bind_methods() {
 // ---------------- Logging ----------------
 
 // Reserve submission order before scheduling CPU formatting.
-Signal GDLogCall::start(std::function<Ref<R>()> p_format, std::function<Ref<R>(const Ref<R> &)> p_write) {
+Signal GDLogCall::start(std::function<VariantPair()> p_format, std::function<Ref<Err>(const Variant &)> p_write) {
 	if (Pool::is_stopping(true) || Pool::is_stopping(false, true)) {
-		return Async::ready(R::err("worker pool stopped", Err::INTERRUPTED));
+		return Async::ready_pair({ Variant(), Err::make("worker pool stopped", Err::INTERRUPTED) });
 	}
 	Ref<GDLogCall> call;
 	call.instantiate();
@@ -300,47 +305,48 @@ Signal GDLogCall::start(std::function<Ref<R>()> p_format, std::function<Ref<R>(c
 	const Signal signal(call.ptr(), "finished");
 	// Represent flush barriers as worker jobs so shutdown also delivers their completion.
 	if (!p_format) {
-		p_format = []() { return R::ok(); };
+		p_format = []() { return VariantPair(); };
 	}
-	GDFileCall::start(std::move(p_format), true).connect(callable_mp(call.ptr(), &GDLogCall::prepared), Object::CONNECT_ONE_SHOT);
+	GDPairCall::start(std::move(p_format), true).connect(callable_mp(call.ptr(), &GDLogCall::prepared), Object::CONNECT_ONE_SHOT);
 	return signal;
 }
 
 // Retain results to restore submission order after out-of-order CPU completion.
-void GDLogCall::prepared(const Ref<R> &p_value) {
-	value = p_value;
+void GDLogCall::prepared(const Variant &p_value, const Variant &p_error) {
+	value = { p_value, p_error };
+	prepared_ready = true;
 	drain();
 }
 
 // Transfer only a contiguous formatted prefix to the write queue.
 void GDLogCall::drain() {
-	while (!log_calls.is_empty() && log_calls.front()->get()->value.is_valid()) {
+	while (!log_calls.is_empty() && log_calls.front()->get()->prepared_ready) {
 		Ref<GDLogCall> call = log_calls.front()->get();
 		log_calls.pop_front();
 		if (Pool::is_stopping(false, true)) {
-			call->written(R::err("worker pool stopped", Err::INTERRUPTED));
+			call->written(Variant(), Err::make("worker pool stopped", Err::INTERRUPTED));
 			continue;
 		}
-		const Ref<R> value = call->value;
+		const VariantPair value = call->value;
 		auto writer = std::move(call->writer);
-		GDFileCall::start([value, writer]() {
-			return value->get_ok() && writer ? writer(value) : value;
+		GDPairCall::start([value, writer]() -> VariantPair {
+			return { Variant(), Ref<Err>(value.error).is_valid() || !writer ? value.error : Variant(writer(value.value)) };
 		}, false, true).connect(callable_mp(call.ptr(), &GDLogCall::written), Object::CONNECT_ONE_SHOT);
 	}
 }
 
 // Deliver the write result once and release the line.
-void GDLogCall::written(const Ref<R> &p_result) {
+void GDLogCall::written(const Variant &p_value, const Variant &p_error) {
 	Ref<GDLogCall> keep(this);
-	value.unref();
+	value = VariantPair();
 	writer = nullptr;
 	self_hold.unref();
-	emit_signal("finished", p_result);
+	Async::finish(this, SNAME("finished"), p_value, p_error);
 }
 
 // Register the signal carrying the caller's write result.
 void GDLogCall::_bind_methods() {
-	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R")));
+	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
 // Wait through the current submission boundary, including formatting in progress.
@@ -411,9 +417,9 @@ String LogState::format(Level p_at, const String &p_msg, const Variant &p_extra)
 	const int64_t time = with_time ? Datetime::now() : 0;
 	String extra;
 	if (p_extra.get_type() != Variant::NIL) {
-		const Ref<R> encoded = JsonData::encode(p_extra);
-		if (encoded->get_ok()) {
-			const PackedByteArray raw = encoded->get_v();
+		const VariantPair encoded = JsonData::encode(p_extra);
+		if (encoded.error.get_type() == Variant::NIL) {
+			const PackedByteArray raw = encoded.value;
 			extra = String::utf8((const char *)raw.ptr(), raw.size());
 		} else {
 			extra = String(p_extra);
@@ -467,7 +473,7 @@ String LogState::_line(Level p_at, const String &p_msg, const String &p_extra, b
 // Output one log record at the selected severity.
 Signal LogState::emit(Level p_at, const String &p_msg, const Variant &p_extra) {
 	if (p_at < level) {
-		return Async::ready(R::ok());
+		return Async::ready_pair({});
 	}
 	const bool err = p_at >= WARN;
 	const bool color = with_color && (err ? Text::stderr_tty() : Text::stdout_tty());
@@ -478,18 +484,19 @@ Signal LogState::emit(Level p_at, const String &p_msg, const Variant &p_extra) {
 	return GDLogCall::start([state, p_at, p_msg, p_extra, path, time, color]() {
 		String extra;
 		if (p_extra.get_type() != Variant::NIL) {
-			const Ref<R> encoded = JsonData::encode(p_extra);
-			if (!encoded->get_ok()) {
-				return encoded;
+			const VariantPair encoded = JsonData::encode(p_extra);
+			const Ref<Err> error = encoded.error;
+			if (error.is_valid()) {
+				return VariantPair{ Variant(), error };
 			}
-			const PackedByteArray raw = encoded->get_v();
+			const PackedByteArray raw = encoded.value;
 			extra = String::utf8((const char *)raw.ptr(), raw.size());
 		}
 		const String console = state._line(p_at, p_msg, extra, color, time) + "\n";
 		const String body = path.is_empty() ? String() : color ? state._line(p_at, p_msg, extra, false, time) + "\n" : console;
-		return R::ok(PackedStringArray{ console, body });
-	}, [err, path](const Ref<R> &p_value) {
-		const PackedStringArray lines = p_value->get_v();
+		return VariantPair{ PackedStringArray{ console, body }, Variant() };
+	}, [err, path](const Variant &p_value) {
+		const PackedStringArray lines = p_value;
 		return write_log_lines(err, lines[0], path, lines[1]);
 	});
 }
@@ -515,11 +522,11 @@ Signal LogState::error(const String &p_msg, const Variant &p_extra) {
 }
 
 // Choose log severity from the result's success or failure.
-Signal LogState::result(const Ref<R> &p_r, const String &p_msg) {
-	if (p_r.is_valid() && p_r->get_e().is_valid()) {
-		return emit(ERROR, vformat("%s: %s", p_msg, p_r->get_e()->text()), Variant());
+Signal LogState::result(const Ref<Err> &p_error, const String &p_msg) {
+	if (p_error.is_valid()) {
+		return emit(ERROR, vformat("%s: %s", p_msg, p_error->text()), Variant());
 	}
-	return Async::ready(R::ok());
+	return Async::ready_pair({});
 }
 
 // Write through a named logger at the selected severity.
@@ -533,43 +540,45 @@ bool Net::is_free(int64_t p_port, const String &p_host) {
 	if (p_port < Limit::PORT_MIN || p_port > Limit::PORT_MAX) {
 		return false;
 	}
-	const Ref<R> opened = GDTCPListener::listen(p_host, p_port);
-	if (!opened->get_ok()) {
+	const VariantPair opened = GDTCPListener::listen(p_host, p_port);
+	if (opened.error.get_type() != Variant::NIL) {
 		return false;
 	}
-	const Ref<GDTCPListener> srv = opened->get_v();
+	const Ref<GDTCPListener> srv = opened.value;
 	srv->close();
 	return true;
 }
 
 // Find an available TCP port.
-Ref<R> Net::free_port(int64_t p_from, const String &p_host) {
+VariantPair Net::free_port(int64_t p_from, const String &p_host) {
 	if (p_from < 0 || p_from > Limit::PORT_MAX) {
-		return R::err(vformat("invalid port %d", p_from), Err::INVALID_DATA);
+		return { Variant(), Err::make(vformat("invalid port %d", p_from), Err::INVALID_DATA) };
 	}
 	if (p_from == 0) {
 		// Pass port zero to let the kernel choose an unused port.
-		const Ref<R> opened = GDTCPListener::listen(p_host, 0);
-		if (!opened->get_ok()) {
+		const VariantPair opened = GDTCPListener::listen(p_host, 0);
+		if (opened.error.get_type() != Variant::NIL) {
 			return opened;
 		}
-		const Ref<GDTCPListener> srv = opened->get_v();
+		const Ref<GDTCPListener> srv = opened.value;
 		const int port = srv->addr().get("port", 0);
 		srv->close();
-		return R::ok(port);
+		return { port, Variant() };
 	}
 	for (int at = int(p_from); at <= Limit::PORT_MAX; at++) {
 		if (is_free(at, p_host)) {
-			return R::ok(at);
+			return { at, Variant() };
 		}
 	}
-	return R::err(vformat("no free port from %d", p_from), Err::NOT_FOUND);
+	return { Variant(), Err::make(vformat("no free port from %d", p_from), Err::NOT_FOUND) };
 }
 
 // Return local network addresses.
-Ref<R> Net::local_addresses() {
+VariantPair Net::local_addresses() {
 	// Require system permission because interface addresses reveal host metadata.
-	GD_PERM_FAIL_V(SYS, "networkInterfaces", R::err("local address access is denied", Err::PERMISSION_DENIED));
+	if (!Perm::check(Perm::SYS, "networkInterfaces")) {
+		return { PackedStringArray(), Err::make("local address access is denied", Err::PERMISSION_DENIED) };
+	}
 	return GDAddress::local();
 }
 

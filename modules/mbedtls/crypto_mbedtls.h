@@ -144,6 +144,7 @@ public:
 
 	PackedByteArray generate_random_bytes(int p_bytes) override;
 	Ref<CryptoKey> generate_rsa(int p_bytes) override;
+	Ref<CryptoKey> generate_ec() override;
 	Ref<X509Certificate> generate_self_signed_certificate(Ref<CryptoKey> p_key, const String &p_issuer_name, const String &p_not_before, const String &p_not_after) override;
 	Vector<uint8_t> sign(HashingContext::HashType p_hash_type, const Vector<uint8_t> &p_hash, Ref<CryptoKey> p_key) override;
 	bool verify(HashingContext::HashType p_hash_type, const Vector<uint8_t> &p_hash, const Vector<uint8_t> &p_signature, Ref<CryptoKey> p_key) override;

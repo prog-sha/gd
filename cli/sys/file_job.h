@@ -18,27 +18,6 @@
 
 #include <functional>
 
-// One file operation returning its result through finished.
-class GDFileCall : public PoolJob {
-	GDCLASS(GDFileCall, PoolJob);
-
-	std::function<Ref<R>()> work; // Os operation executed on the worker thread.
-	Ref<R> outcome; // Worker-produced result delivered on the main thread.
-
-protected:
-	static void _bind_methods();
-
-	// Run on the worker, accessing only this job's owned state.
-	virtual void run() override;
-	// Deliver the result through a signal on the main thread.
-	virtual void finish() override;
-
-public:
-	// Submit work and return its completion signal.
-	// Set p_cpu for parsing work to separate it from the I/O queue.
-	static Signal start(std::function<Ref<R>()> p_work, bool p_cpu = false, bool p_serial = false);
-};
-
 // One worker computation with an unrestricted result type.
 class GDValueCall : public PoolJob {
 	GDCLASS(GDValueCall, PoolJob);
@@ -54,6 +33,22 @@ protected:
 public:
 	// Submit a computation and return its completion signal.
 	static Signal start(std::function<Variant()> p_work, bool p_cpu = true);
+};
+
+// Complete a worker computation through two signal arguments.
+class GDPairCall : public PoolJob {
+	GDCLASS(GDPairCall, PoolJob);
+
+	std::function<VariantPair()> work; // Computation performed by the worker.
+	VariantPair outcome; // Value and error delivered on the main thread.
+
+protected:
+	static void _bind_methods();
+	virtual void run() override;
+	virtual void finish() override;
+
+public:
+	static Signal start(std::function<VariantPair()> p_work, bool p_cpu = true, bool p_serial = false);
 };
 
 class GDFormatCall;
@@ -76,14 +71,14 @@ protected:
 class GDFormatCall : public RefCounted {
 	GDCLASS(GDFormatCall, RefCounted);
 
-	std::function<Ref<R>(const Ref<R> &)> parse; // Parser executed by a CPU worker.
-	Ref<R> input; // Content returned by the I/O worker.
-	Ref<R> outcome; // Result returned by the CPU worker.
+	std::function<VariantPair(const Variant &)> parse; // Parser executed by a CPU worker.
+	VariantPair input; // Content returned by the I/O worker.
+	VariantPair outcome; // Result returned by the CPU worker.
 	Ref<GDFormatCall> self_hold; // Retain this operation through result delivery.
 
 	friend class GDFormatJob;
 
-	void loaded(const Ref<R> &p_input); // Receive file-read results.
+	void loaded(const Variant &p_value, const Variant &p_error); // Receive file-read results.
 	void parse_on_worker(); // Parse the format on a CPU worker.
 	void parsed(); // Deliver the final result on the main thread.
 
@@ -92,5 +87,5 @@ protected:
 
 public:
 	// Run reading and parsing sequentially on separate worker queues.
-	static Signal start(std::function<Ref<R>()> p_read, std::function<Ref<R>(const Ref<R> &)> p_parse);
+	static Signal start(std::function<VariantPair()> p_read, std::function<VariantPair(const Variant &)> p_parse);
 };

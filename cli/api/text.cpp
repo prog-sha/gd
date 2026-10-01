@@ -1565,9 +1565,9 @@ Error HtmlBuild::render(const Dictionary &p_data, String &r_out) {
 }
 
 // Retain the parse or render location without exposing it as an HTTP response.
-Ref<R> HtmlBuild::failure(Error p_error) const {
+Ref<Err> HtmlBuild::failure(Error p_error) const {
 	const HtmlBuildState &build = *static_cast<const HtmlBuildState *>(state);
-	return R::err(vformat("template failed near \"%s\"", build.bad), template_error(p_error));
+	return Err::make(vformat("template failed near \"%s\"", build.bad), template_error(p_error));
 }
 
 // Release parsed instructions.
@@ -1579,35 +1579,35 @@ GDHTMLTemplate::~GDHTMLTemplate() {
 }
 
 // Render new values using the same immutable parsed program.
-Ref<R> GDHTMLTemplate::execute(const Dictionary &p_data) const {
+VariantPair GDHTMLTemplate::execute(const Dictionary &p_data) const {
 	if (!program) {
-		return R::err("template is not initialized", Err::INTERRUPTED);
+		return { String(), Err::make("template is not initialized", Err::INTERRUPTED) };
 	}
 	String out;
 	String bad;
 	const Error err = render_program(*static_cast<const HtmlProgram *>(program), p_data, out, bad);
-	return err == OK ? R::ok(out) : R::err(vformat("template execution failed near \"%s\"", bad.left(128)), template_error(err));
+	return err == OK ? VariantPair{ out, Variant() } : VariantPair{ String(), Err::make(vformat("template execution failed near \"%s\"", bad.left(128)), template_error(err)) };
 }
 
 // Render directly into response-ready UTF-8 while sharing the immutable parsed program.
-Ref<R> GDHTMLTemplate::execute_bytes(const Dictionary &p_data) const {
-	if (!program) return R::err("template is not initialized", Err::INTERRUPTED);
+VariantPair GDHTMLTemplate::execute_bytes(const Dictionary &p_data) const {
+	if (!program) return { PackedByteArray(), Err::make("template is not initialized", Err::INTERRUPTED) };
 	PackedByteArray out;
 	String bad;
 	const Error err = render_program<ByteRender>(*static_cast<const HtmlProgram *>(program), p_data, out, bad);
-	return err == OK ? R::ok(out) : R::err(vformat("template execution failed near \"%s\"", bad.left(128)), template_error(err));
+	return err == OK ? VariantPair{ out, Variant() } : VariantPair{ PackedByteArray(), Err::make(vformat("template execution failed near \"%s\"", bad.left(128)), template_error(err)) };
 }
 
 // Register the parsed-template execution API.
 void GDHTMLTemplate::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("execute", "data"), &GDHTMLTemplate::execute);
 	ClassDB::bind_method(D_METHOD("execute_bytes", "data"), &GDHTMLTemplate::execute_bytes);
-	ADD_RESULT("execute", "String");
-	ADD_RESULT("execute_bytes", "PackedByteArray");
+	ADD_PAIR_RESULT("execute", "String");
+	ADD_PAIR_RESULT("execute_bytes", "PackedByteArray");
 }
 
 // Analyze template and partial HTML contexts into an immutable renderer.
-Ref<R> Html::template_of(const String &p_tpl, const Dictionary &p_partials) {
+VariantPair Html::template_of(const String &p_tpl, const Dictionary &p_partials) {
 	Vector<Piece> pieces;
 	String bad;
 	Error err = compiled_of(p_tpl, pieces, bad);
@@ -1622,7 +1622,7 @@ Ref<R> Html::template_of(const String &p_tpl, const Dictionary &p_partials) {
 	}
 	if (err != OK) {
 		clear_piece_tree(pieces);
-		return R::err(vformat("invalid template near \"%s\"", bad.left(128)), template_error(err));
+		return { Variant(), Err::make(vformat("invalid template near \"%s\"", bad.left(128)), template_error(err)) };
 	}
 	Ref<GDHTMLTemplate> out;
 	out.instantiate();
@@ -1630,15 +1630,15 @@ Ref<R> Html::template_of(const String &p_tpl, const Dictionary &p_partials) {
 	program->pieces = static_cast<Vector<Piece> &&>(pieces);
 	program->parts = static_cast<HashMap<String, Vector<Piece>> &&>(prepared.derived);
 	out->program = program;
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // Render a template and preserve syntax failures as explicit results.
-Ref<R> Html::fill(const String &p_tpl, const Dictionary &p_data, const Dictionary &p_partials) {
+VariantPair Html::fill(const String &p_tpl, const Dictionary &p_data, const Dictionary &p_partials) {
 	String out;
 	String bad;
 	const Error err = fill_checked(p_tpl, p_data, p_partials, out, bad);
-	return err == OK ? R::ok(out) : R::err(vformat("invalid template near \"%s\"", bad), template_error(err));
+	return err == OK ? VariantPair{ out, Variant() } : VariantPair{ String(), Err::make(vformat("invalid template near \"%s\"", bad), template_error(err)) };
 }
 
 // Render with distinct load and syntax failures for the HTTP layer.
@@ -1910,6 +1910,16 @@ bool url_host_ok(const String &p_host, bool p_bracketed) {
 	return true;
 }
 
+// Validate escape syntax while preserving the raw path and fragment bytes.
+bool url_escapes_ok(const String &p_text) {
+	for (int i = 0; i < p_text.length(); i++) {
+		if (p_text[i] != '%') continue;
+		if (i + 2 >= p_text.length() || !is_hex_digit(p_text[i + 1]) || !is_hex_digit(p_text[i + 2])) return false;
+		i += 2;
+	}
+	return true;
+}
+
 // Decode the next byte; return false for a malformed percent escape.
 bool next_byte(const uint8_t *p_data, int p_len, bool p_plus_space, int &r_i, uint8_t &r_b) {
 	const uint8_t c = p_data[r_i];
@@ -1928,24 +1938,22 @@ bool next_byte(const uint8_t *p_data, int p_len, bool p_plus_space, int &r_i, ui
 }
 
 // Decode query bytes without applying path or host restrictions.
-Ref<R> query_part(const String &p_raw) {
+VariantPair query_part(const String &p_raw) {
 	const CharString src = p_raw.utf8();
 	PackedByteArray bytes;
-	if (bytes.resize(src.length()) != OK) return R::err("cannot allocate query value", Err::LIMITED);
+	if (bytes.resize(src.length()) != OK) return { Variant(), Err::make("cannot allocate query value", Err::LIMITED) };
 	int at = 0, used = 0;
 	while (at < src.length()) {
 		if (!next_byte((const uint8_t *)src.ptr(), src.length(), true, at, bytes.ptrw()[used])) {
-			return R::err("query contains a bad percent escape", Err::INVALID_DATA);
+			return { Variant(), Err::make("query contains a bad percent escape", Err::INVALID_DATA) };
 		}
 		used++;
 	}
-	const Variant value = utf8_value(bytes.ptr(), used);
-	const Ref<R> result = value;
-	return result.is_valid() ? result : R::ok(value);
+	return utf8_value(bytes.ptr(), used);
 }
 
 // Decode independent pairs, retaining valid entries and the first failure.
-Ref<R> decode_query_inner(const String &p_raw) {
+VariantPair decode_query_inner(const String &p_raw) {
 	Dictionary out;
 	Ref<Err> error;
 	int from = 0;
@@ -1959,23 +1967,23 @@ Ref<R> decode_query_inner(const String &p_raw) {
 			if (error.is_null()) error = Err::make("query contains an unescaped semicolon", Err::INVALID_DATA);
 			continue;
 		}
-		const Ref<R> key = query_part(eq < 0 ? pair : pair.substr(0, eq));
-		const Ref<R> value = key->get_ok() ? query_part(eq < 0 ? String() : pair.substr(eq + 1)) : key;
-		if (!value->get_ok()) {
-			if (error.is_null()) error = value->get_e();
+		const VariantPair key = query_part(eq < 0 ? pair : pair.substr(0, eq));
+		const VariantPair value = key.error.get_type() == Variant::NIL ? query_part(eq < 0 ? String() : pair.substr(eq + 1)) : key;
+		if (value.error.get_type() != Variant::NIL) {
+			if (error.is_null()) error = value.error;
 			continue;
 		}
-		Array values = out.get(key->get_v(), Array());
-		values.push_back(value->get_v());
-		out[key->get_v()] = values;
+		Array values = out.get(key.value, Array());
+		values.push_back(value.value);
+		out[key.value] = values;
 	}
-	return error.is_valid() ? R::err(error, Err::NONE, out) : R::ok(out);
+	return { out, error };
 }
 
 } // namespace
 
 // Decode a URL query into a key-value dictionary.
-Ref<R> Url::decode_query(const String &p_raw) {
+VariantPair Url::decode_query(const String &p_raw) {
 	return decode_query_inner(p_raw);
 }
 
@@ -2185,20 +2193,20 @@ Dictionary Url::split_host(const String &p_text, int64_t p_default_port) {
 }
 
 // Parse a URL into its components.
-Ref<R> Url::parse(const String &p_raw) {
+VariantPair Url::parse(const String &p_raw) {
 	for (int i = 0; i < p_raw.length(); i++) {
 		if (p_raw[i] < 0x20 || p_raw[i] == 0x7f) {
-			return R::err("URL contains a control character", Err::INVALID_DATA);
+			return { Dictionary(), Err::make("URL contains a control character", Err::INVALID_DATA) };
 		}
 	}
 	String rest = p_raw;
 	const int sep = rest.find("://");
 	if (sep < 0) {
-		return R::err("URL has no scheme", Err::INVALID_DATA);
+		return { Dictionary(), Err::make("URL has no scheme", Err::INVALID_DATA) };
 	}
 	const String scheme = rest.substr(0, sep).to_lower();
 	if (scheme != "http" && scheme != "https") {
-		return R::err("URL scheme must be http or https", Err::INVALID_DATA);
+		return { Dictionary(), Err::make("URL scheme must be http or https", Err::INVALID_DATA) };
 	}
 	rest = rest.substr(sep + 3);
 
@@ -2214,7 +2222,7 @@ Ref<R> Url::parse(const String &p_raw) {
 	const int q_at = rest.find_char('?');
 	if (q_at >= 0) {
 		raw_query = rest.substr(q_at + 1);
-		query = decode_query_inner(raw_query)->get_v();
+		query = decode_query_inner(raw_query).value;
 		rest = rest.substr(0, q_at);
 	}
 
@@ -2224,10 +2232,13 @@ Ref<R> Url::parse(const String &p_raw) {
 		path = rest.substr(slash);
 		rest = rest.substr(0, slash);
 	}
+	if (!url_escapes_ok(path) || !url_escapes_ok(fragment)) {
+		return { Variant(), Err::make("URL contains a bad percent escape", Err::INVALID_DATA) };
+	}
 
 	const Dictionary hp = split_host(rest, default_port(scheme));
 	if (hp.is_empty()) {
-		return R::err("URL host is invalid", Err::INVALID_DATA);
+		return { Dictionary(), Err::make("URL host is invalid", Err::INVALID_DATA) };
 	}
 
 	Dictionary u;
@@ -2242,7 +2253,7 @@ Ref<R> Url::parse(const String &p_raw) {
 	u["query"] = query;
 	if (q_at >= 0) u["raw_query"] = raw_query;
 	u["fragment"] = fragment;
-	return R::ok(u);
+	return { u, Variant() };
 }
 
 // Build an HTTP request target from URL components.
@@ -2284,8 +2295,17 @@ String Url::build(const Dictionary &p_url) {
 
 namespace {
 
+// Identify numeric version segments without limiting their digit count.
+bool numeric_part(const String &p_text) {
+	if (p_text.is_empty()) return false;
+	for (int i = 0; i < p_text.length(); i++) {
+		if (p_text[i] < '0' || p_text[i] > '9') return false;
+	}
+	return true;
+}
+
 // Parse a semantic version into its components.
-Ref<R> ver_of(const String &p_raw) {
+VariantPair ver_of(const String &p_raw) {
 	String s = p_raw.strip_edges().lstrip("vV=");
 	Dictionary v;
 	String build;
@@ -2302,25 +2322,44 @@ Ref<R> ver_of(const String &p_raw) {
 		s = s.substr(0, dash);
 	}
 	const PackedStringArray nums = s.split(".");
-	if (nums.size() < 1 || !nums[0].is_valid_int()) {
-		return R::err(vformat("invalid version \"%s\"", p_raw), Err::INVALID_DATA);
+	if (nums.size() < 1 || !numeric_part(nums[0])) {
+		return { Dictionary(), Err::make(vformat("invalid version \"%s\"", p_raw), Err::INVALID_DATA) };
 	}
-	v["major"] = nums[0].to_int();
-	v["minor"] = (nums.size() > 1 && nums[1].is_valid_int()) ? nums[1].to_int() : 0;
-	v["patch"] = (nums.size() > 2 && nums[2].is_valid_int()) ? nums[2].to_int() : 0;
+	int64_t parts[3] = {};
+	for (int i = 0; i < MIN(nums.size(), 3); i++) {
+		if (!numeric_part(nums[i])) continue; // Optional range components keep their zero value.
+		for (int j = 0; j < nums[i].length(); j++) {
+			const int digit = nums[i][j] - '0';
+			if (parts[i] > (INT64_MAX - digit) / 10) {
+				return { Variant(), Err::make(vformat("invalid version \"%s\"", p_raw), Err::INVALID_DATA) };
+			}
+			parts[i] = parts[i] * 10 + digit;
+		}
+	}
+	v["major"] = parts[0];
+	v["minor"] = parts[1];
+	v["patch"] = parts[2];
 	v["pre"] = pre;
 	v["build"] = build;
-	return R::ok(v);
+	return { v, Variant() };
 }
 
-// Compare prerelease segments numerically when both are numbers, otherwise lexically.
+// Compare prerelease segments by numeric magnitude or lexical order.
 int cmp_part(const String &a, const String &b) {
-	const bool an = a.is_valid_int();
-	const bool bn = b.is_valid_int();
+	const bool an = numeric_part(a);
+	const bool bn = numeric_part(b);
 	if (an && bn) {
-		const int64_t x = a.to_int();
-		const int64_t y = b.to_int();
-		return x == y ? 0 : (x < y ? -1 : 1);
+		int ai = 0;
+		int bi = 0;
+		while (ai + 1 < a.length() && a[ai] == '0') ai++;
+		while (bi + 1 < b.length() && b[bi] == '0') bi++;
+		const int al = a.length() - ai;
+		const int bl = b.length() - bi;
+		if (al != bl) return al < bl ? -1 : 1;
+		for (int i = 0; i < al; i++) {
+			if (a[ai + i] != b[bi + i]) return a[ai + i] < b[bi + i] ? -1 : 1;
+		}
+		return 0;
 	}
 	if (an) {
 		return -1; // Numeric identifiers sort before nonnumeric identifiers.
@@ -2385,16 +2424,24 @@ bool one_cond(const Dictionary &v, const String &cond) {
 			break;
 		}
 	}
-	const Ref<R> parsed = ver_of(rest);
-	if (parsed->get_e().is_valid()) {
+	const VariantPair parsed = ver_of(rest);
+	if (parsed.error.get_type() != Variant::NIL) {
 		return false;
 	}
-	const Dictionary other = parsed->get_v();
+	const Dictionary other = parsed.value;
 	const int c = ver_cmp(v, other);
 	const int64_t omaj = other.get("major", 0);
 	const int64_t omin = other.get("minor", 0);
+	const int64_t opat = other.get("patch", 0);
 	const int64_t vmaj = v.get("major", 0);
 	const int64_t vmin = v.get("minor", 0);
+	const int64_t vpat = v.get("patch", 0);
+	// Preserve omitted components so short ranges can widen at their last specified digit.
+	String spelling = rest.strip_edges().lstrip("vV=");
+	spelling = spelling.get_slice("+", 0).get_slice("-", 0);
+	const PackedStringArray digits = spelling.split(".");
+	const bool fixed_minor = digits.size() > 1 && digits[1].is_valid_int();
+	const bool fixed_patch = digits.size() > 2 && digits[2].is_valid_int();
 
 	if (op == ">=") {
 		return c >= 0;
@@ -2409,17 +2456,20 @@ bool one_cond(const Dictionary &v, const String &cond) {
 		return c < 0;
 	}
 	if (op == "^") {
-		// Keep the leading version component unchanged; for 0.x, preserve the minor component.
+		// Keep the leftmost specified nonzero component, or the exact patch of 0.0.patch.
 		if (omaj > 0) {
 			return c >= 0 && vmaj == omaj;
+		}
+		if (!fixed_minor) {
+			return c >= 0 && vmaj == 0;
 		}
 		if (omin > 0) {
 			return c >= 0 && vmaj == 0 && vmin == omin;
 		}
-		return c >= 0 && vmaj == 0 && vmin == 0;
+		return c >= 0 && vmaj == 0 && vmin == 0 && (!fixed_patch || vpat == opat);
 	}
 	if (op == "~") {
-		return c >= 0 && vmaj == omaj && vmin == omin;
+		return c >= 0 && vmaj == omaj && (!fixed_minor || vmin == omin);
 	}
 	return c == 0;
 }
@@ -2448,17 +2498,17 @@ bool Semver::satisfies(const Dictionary &p_v, const String &p_range) {
 }
 
 // Parse a semantic version into a result value.
-Ref<R> Semver::parse(const String &p_raw) {
+VariantPair Semver::parse(const String &p_raw) {
 	return ver_of(p_raw);
 }
 
 // Require an unambiguous complete semantic version for package versions.
 bool Semver::is_canonical(const String &p_raw) {
-	const Ref<R> got = ver_of(p_raw);
-	if (got->get_e().is_valid()) {
+	const VariantPair got = ver_of(p_raw);
+	if (got.error.get_type() != Variant::NIL) {
 		return false;
 	}
-	const Dictionary v = got->get_v();
+	const Dictionary v = got.value;
 	if ((int64_t)v.get("major", -1) < 0 || (int64_t)v.get("minor", -1) < 0 || (int64_t)v.get("patch", -1) < 0 || text(v) != p_raw) {
 		return false;
 	}
@@ -2504,16 +2554,16 @@ String Semver::text(const Dictionary &p_v) {
 }
 
 // Select the best version satisfying a range.
-Ref<R> Semver::best(const PackedStringArray &p_list, const String &p_range) {
+VariantPair Semver::best(const PackedStringArray &p_list, const String &p_range) {
 	Dictionary top;
 	String top_text;
 	bool found = false;
 	for (const String &raw : p_list) {
-		const Ref<R> got = ver_of(raw);
-		if (got->get_e().is_valid()) {
+		const VariantPair got = ver_of(raw);
+		if (got.error.get_type() != Variant::NIL) {
 			continue;
 		}
-		const Dictionary v = got->get_v();
+		const Dictionary v = got.value;
 		if (!satisfies(v, p_range)) {
 			continue;
 		}
@@ -2530,9 +2580,9 @@ Ref<R> Semver::best(const PackedStringArray &p_list, const String &p_range) {
 		found = true;
 	}
 	if (!found) {
-		return R::err(vformat("no version matches \"%s\"", p_range), Err::NOT_FOUND);
+		return { Dictionary(), Err::make(vformat("no version matches \"%s\"", p_range), Err::NOT_FOUND) };
 	}
-	return R::ok(top);
+	return { top, Variant() };
 }
 
 // ---------------- Media types ----------------
@@ -2590,10 +2640,10 @@ const MediaPair MEDIA_TABLE[] = {
 	{ nullptr, nullptr },
 };
 
-// Identify textual media prefixes that receive a charset.
+// Identify textual media types outside the text family.
 const char *MEDIA_TEXTUAL[] = {
-	"text", "application/json", "application/xml", "application/yaml",
-	"application/toml", "image/svg+xml", "text/javascript", nullptr
+	"application/json", "application/xml", "application/yaml",
+	"application/toml", "image/svg+xml", nullptr
 };
 
 } // namespace
@@ -2611,8 +2661,12 @@ String Media::by_extension(const String &p_ext) {
 
 // Check whether a media type is primarily textual.
 bool Media::is_textual(const String &p_kind) {
+	const String kind = p_kind.get_slice(";", 0).strip_edges().to_lower();
+	if (kind.begins_with("text/")) {
+		return true;
+	}
 	for (int i = 0; MEDIA_TEXTUAL[i]; i++) {
-		if (p_kind.begins_with(MEDIA_TEXTUAL[i])) {
+		if (kind == MEDIA_TEXTUAL[i]) {
 			return true;
 		}
 	}

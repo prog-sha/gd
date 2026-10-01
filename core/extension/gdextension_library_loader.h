@@ -60,7 +60,6 @@ private:
 	// Read manifest metadata required by the script type checker.
 	Vector<String> declared_classes; // Class declarations from [classes].
 	HashMap<String, String> await_classes; // Post-await types indexed by class and method from [await].
-	HashMap<String, String> result_classes; // Successful R value types indexed by class and method from [result].
 
 #ifdef TOOLS_ENABLED
 	uint64_t resource_last_modified_time = 0;

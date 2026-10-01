@@ -30,7 +30,7 @@
 
 namespace {
 std::once_flag roots_once; // Initialize immutable system trust once per process.
-Ref<R> roots_cache; // Retain shared trust until all cryptographic workers have stopped.
+Ref<GDTrust> roots_cache; // Retain shared trust until all cryptographic workers have stopped.
 
 // Append independently parsed anchors, accepting exact DER only when no textual certificate was found.
 bool anchors(GDCrypto::CertStore &store, GDCrypto::Bytes input) {
@@ -177,14 +177,14 @@ GDTrust::GDTrust() : roots(std::make_unique<GDCrypto::CertStore>()) {}
 GDTrust::~GDTrust() = default;
 
 // Keep explicit CA authority separate from cached platform trust and parse files only on the worker.
-Ref<R> GDTrust::load(const String &p_path) {
+VariantPair GDTrust::load(const String &p_path) {
 	if (p_path.is_empty()) {
 		std::call_once(roots_once,[]() {
 			const Perm::Trusted authority; // Read operator-selected system roots without granting script file access.
 			Ref<GDTrust> trust; trust.instantiate();
 			const String file = GDSystem::env("SSL_CERT_FILE"), dir = GDSystem::env("SSL_CERT_DIR");
 #if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
-			if (file.is_empty() && dir.is_empty()) {roots_cache = R::ok(trust); return;}
+			if (file.is_empty() && dir.is_empty()) {roots_cache = trust; return;}
 #endif
 			trust->system = false;
 			std::vector<String> files;
@@ -196,14 +196,14 @@ Ref<R> GDTrust::load(const String &p_path) {
 			if (!file.is_empty()) files = {file};
 			for (const auto &path : files) if (root_file(*trust->roots,path)) break;
 			root_directories(*trust->roots,directories);
-			roots_cache = R::ok(trust);
+			roots_cache = trust;
 		});
-		return roots_cache;
+		return { roots_cache, Variant() };
 	}
-	if (!Perm::check(Perm::READ,p_path)) return R::err("TLS CA read is not allowed",Err::PERMISSION_DENIED);
-	const Ref<R> loaded = Os::read_bytes(p_path); if (!loaded->get_ok()) return loaded;
-	const PackedByteArray bytes = loaded->get_v(); Ref<GDTrust> trust; trust.instantiate(); trust->system = false;
-	return anchors(*trust->roots,{bytes.ptr(),size_t(bytes.size())}) ? R::ok(trust) : R::err("invalid TLS CA",Err::INVALID_DATA);
+	if (!Perm::check(Perm::READ,p_path)) return { Variant(), Err::make("TLS CA read is not allowed", Err::PERMISSION_DENIED) };
+	const VariantPair loaded = Os::read_bytes(p_path); if (Ref<Err>(loaded.error).is_valid()) return { Variant(), Ref<Err>(loaded.error)->with_partial(loaded.value) };
+	const PackedByteArray bytes = loaded.value; Ref<GDTrust> trust; trust.instantiate(); trust->system = false;
+	return anchors(*trust->roots,{bytes.ptr(),size_t(bytes.size())}) ? VariantPair{ trust, Variant() } : VariantPair{ Variant(), Err::make("invalid TLS CA", Err::INVALID_DATA) };
 }
 
 // Drop cached configuration only after active workers have completed.
@@ -212,7 +212,7 @@ void GDTrust::shutdown() { roots_cache.unref(); }
 std::vector<std::vector<uint8_t>> GDTrust::names() const { return roots->names(); }
 
 // Authenticate names and full explicit paths without exposing unverified peers to application I/O.
-Ref<R> GDTrust::verify(const std::vector<GDCrypto::Cert::Ptr> &p_chain, const String &p_host, bool p_server) const {
+Ref<Err> GDTrust::verify(const std::vector<GDCrypto::Cert::Ptr> &p_chain, const String &p_host, bool p_server) const {
 	GDCrypto::Cert::Ptr leaf; GDCrypto::CertStore intermediates;
 	bool valid = !p_chain.empty() && (!p_server || !p_host.is_empty());
 	for (const auto &cert : p_chain) {
@@ -227,5 +227,5 @@ Ref<R> GDTrust::verify(const std::vector<GDCrypto::Cert::Ptr> &p_chain, const St
 		if (!p_server) options.usages.push_back({client_auth,sizeof(client_auth)});
 		GDCrypto::ChainResult result; valid = GDCrypto::verify_chain(std::move(leaf),*roots,intermediates,options,result);
 	}
-	return valid ? R::ok() : R::err("TLS certificate verification failed",Err::UNAUTHENTICATED);
+	return valid ? Ref<Err>() : Err::make("TLS certificate verification failed", Err::UNAUTHENTICATED);
 }

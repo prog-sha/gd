@@ -7,6 +7,7 @@
 // Implement asynchronous waits and cancellation declared in task.h.
 
 #include "cli/sys/task.h"
+#include "cli/sys/gdtask.h"
 #include "cli/run/loop.h"
 #include "cli/sys/clock.h"
 
@@ -50,6 +51,17 @@ SafeFlag posted_ready; // Publish whether the FIFO can be read without first tak
 HashMap<Callable, uint64_t> observers; // Observers for backends without per-operation callbacks.
 uint64_t observer_seq = 0; // Generation distinguishing removal and re-registration during delivery.
 SafeFlag notified; // Backend state-change notification.
+thread_local uint64_t current_scope = 0; // Logical coroutine scope on this execution thread.
+
+// One completion emitted while a task was preempted and nobody was listening yet.
+struct Held {
+	Ref<RefCounted> keep; // Operation kept alive until its completion is delivered.
+	ObjectID id; // Operation emitting the completion.
+	StringName signal; // Completion signal name.
+	Vector<Variant> args; // Completion arguments.
+};
+LocalVector<Held> held; // Completions waiting for preempted tasks to reach await.
+int preempted_tasks = 0; // Tasks suspended by a time slice rather than by await.
 
 // Wake only when the publishing thread can race the runtime's final queue check.
 void wake_posted() {
@@ -69,6 +81,16 @@ uint64_t deadline_after(double p_sec) {
 }
 
 } // namespace
+
+// Return the scope inherited by work executing in this coroutine.
+uint64_t Async::scope() {
+	return current_scope;
+}
+
+// Restore the caller's scope after a coroutine or spawned callable returns.
+void Async::set_scope(uint64_t p_scope) {
+	current_scope = p_scope;
+}
 
 // ---------------- Individual waits ----------------
 
@@ -101,23 +123,33 @@ void GDWait::time(bool p_on) {
 }
 
 // Resolve immediate and suspended Callable results through the same completion path.
-void GDWait::spawn_result(const Variant &p_value) {
+void GDWait::spawn_result(const Variant &p_value, const Variant &p_error) {
+	if (pair_ready && p_error.get_type() != Variant::NIL) {
+		done(p_value, &p_error);
+		return;
+	}
 	Signal signal;
-	Object *obj = p_value.get_type() == Variant::OBJECT ? p_value.get_validated_object() : nullptr;
+	const Variant value = GDTask::as_signal(p_value);
+	Object *obj = value.get_type() == Variant::OBJECT ? value.get_validated_object() : nullptr;
 	spawn_resume = obj && obj->has_signal("completed");
-	if (p_value.get_type() == Variant::SIGNAL) {
-		signal = p_value;
+	if (value.get_type() == Variant::SIGNAL) {
+		signal = value;
 	} else if (spawn_resume) {
 		signal = Signal(obj, "completed");
 	} else {
-		done(p_value);
+		done(p_value, pair_ready ? &p_error : nullptr);
 		return;
 	}
 	mode = ONE;
 	hold_obj = Ref<RefCounted>(Object::cast_to<RefCounted>(signal.get_object()));
 	if (signal.get_object() && signal.connect(Callable(this, "rang").bind(0), Object::CONNECT_ONE_SHOT) == OK) return;
 	hold_obj.unref();
-	done(R::err("callable returned an unavailable signal", Err::INVALID_DATA));
+	if (pair_ready) {
+		const Variant error = Err::make("callable returned an unavailable signal", Err::INVALID_DATA);
+		done(Variant(), &error);
+	} else {
+		done(Err::make("callable returned an unavailable signal", Err::INVALID_DATA));
+	}
 }
 
 // Advance the asynchronous wait state.
@@ -128,9 +160,13 @@ void GDWait::step() {
 	}
 	if (mode == SPAWN) {
 		Variant ret;
+		Variant result_error;
 		Callable::CallError err;
+		if (pair_ready) err.result_error = &result_error;
 		const Callable fn = spawn_fn;
 		spawn_fn = Callable();
+		const uint64_t previous_scope = Async::scope();
+		Async::set_scope(scope);
 		const bool sliced = GDScriptFunction::begin_time_slice();
 		{
 			GDScriptFunction::SuspendableCall suspendable;
@@ -139,7 +175,13 @@ void GDWait::step() {
 		if (sliced) {
 			GDScriptFunction::end_time_slice();
 		}
-		spawn_result(err.error == Callable::CallError::CALL_OK ? ret : Variant(R::err("cannot start the callable", Err::INVALID_DATA)));
+		Async::set_scope(previous_scope);
+		const bool succeeded = err.error == Callable::CallError::CALL_OK && !err.runtime_failed;
+		if (pair_ready) {
+			spawn_result(succeeded ? ret : Variant(), succeeded ? result_error : Variant(Err::make("cannot start the callable", Err::INVALID_DATA)));
+		} else {
+			spawn_result(succeeded ? ret : Variant(Err::make("cannot start the callable", Err::INVALID_DATA)));
+		}
 		return;
 	}
 	if (cancel_pending) {
@@ -149,7 +191,11 @@ void GDWait::step() {
 	}
 	if (pending) {
 		// With nothing to await, deliver the aggregate or already-ready value.
-		done(has_ready_value ? ready_value : Variant(values));
+		if (pair_ready) {
+			done(ready_value, &ready_error);
+		} else {
+			done(has_ready_value ? ready_value : Variant(values));
+		}
 		return;
 	}
 	if (GDClock::msec() < due) {
@@ -188,11 +234,35 @@ Variant GDWait::rang(const Variant **p_args, int p_count, Callable::CallError &r
 		return Variant();
 	}
 	if (mode == ONE) {
+		if (pair_ready) {
+			Variant value = p_count > 1 ? *p_args[0] : Variant();
+			Variant error = p_count > 2 ? *p_args[1] : Variant();
+			GDScriptFunctionState *state = Object::cast_to<GDScriptFunctionState>(hold_obj.ptr());
+			if (state && state->is_runtime_faulted()) {
+				value = Variant();
+				error = Err::make("callable stopped after a script runtime fault", Err::INVALID_DATA);
+			}
+			Ref<GDAsyncContext> ctx = cancel_context;
+			if (error.get_type() != Variant::NIL && ctx.is_valid() && ctx->is_done() && ctx->get_reason().is_valid()) {
+				error = ctx->get_reason()->with_partial(value);
+			}
+			hold_obj.unref();
+			if (defer_one) {
+				ready_value = value;
+				ready_error = error;
+				has_ready_value = true;
+				pending = true;
+				post();
+			} else {
+				done(value, &error);
+			}
+			return Variant();
+		}
 		// An operation stopped by the context reports the context's reason, which names why it was stopped.
-		Ref<R> failed = p_value;
+		Ref<Err> failed = p_value;
 		Ref<GDAsyncContext> ctx = cancel_context;
-		if (failed.is_valid() && !failed->get_ok() && ctx.is_valid() && ctx->is_done() && ctx->get_reason().is_valid()) {
-			p_value = R::err(ctx->get_reason(), Err::NONE, failed->get_v());
+		if (failed.is_valid() && ctx.is_valid() && ctx->is_done() && ctx->get_reason().is_valid()) {
+			p_value = ctx->get_reason()->with_partial(failed->get_partial());
 		}
 		// Defer synchronous context cancellation until the caller can connect on the next turn.
 		hold_obj.unref();
@@ -225,9 +295,40 @@ Variant GDWait::rang(const Variant **p_args, int p_count, Callable::CallError &r
 // Forward context cancellation to the retained operation.
 void GDWait::cancel_target() {
 	Ref<GDWait> keep(this);
+	if (self_hold.is_null()) {
+		return;
+	}
+	Ref<GDAsyncContext> ctx = cancel_context;
 	if (hold_obj.is_valid() && hold_obj->has_method("cancel")) {
 		hold_obj->call("cancel");
 	}
+	if (self_hold.is_null() || pending) {
+		return;
+	}
+	// Complete a canceled wait even when its operation has already emitted its one-shot signal.
+	const Variant reason = ctx.is_valid() && ctx->get_reason().is_valid() ? Variant(ctx->get_reason()) : Variant(Err::make("wait was canceled", Err::INTERRUPTED));
+	drop_observed();
+	hold_obj.unref();
+	if (pair_ready) {
+		ready_value = Variant();
+		ready_error = reason;
+	} else {
+		ready_value = reason;
+	}
+	has_ready_value = true;
+	pending = true;
+	post();
+}
+
+// Remove a context wrapper's completion callback before releasing its target.
+void GDWait::drop_observed() {
+	if (observed.get_object()) {
+		const Callable callback = Callable(this, "rang").bind(0);
+		if (observed.is_connected(callback)) {
+			observed.disconnect(callback);
+		}
+	}
+	observed = Signal();
 }
 
 // Stop owned GDWait inputs without modifying arbitrary external signal sources.
@@ -261,7 +362,7 @@ void GDWait::drop_rivals() {
 }
 
 // Complete the wait and deliver its result.
-void GDWait::done(const Variant &p_value) {
+void GDWait::done(const Variant &p_value, const Variant *p_error) {
 	if (self_hold.is_null()) {
 		return; // Repeated completion does nothing.
 	}
@@ -269,6 +370,7 @@ void GDWait::done(const Variant &p_value) {
 	// The temporary reference keeps it alive until this function returns.
 	Ref<GDWait> keep(this);
 	time(false);
+	drop_observed();
 	if (cancel_context.is_valid()) {
 		const Callable stop = callable_mp(this, &GDWait::cancel_target);
 		if (cancel_context->is_connected("canceled", stop)) {
@@ -283,7 +385,11 @@ void GDWait::done(const Variant &p_value) {
 	}
 	drop_rivals();
 	live_waits.erase(this);
-	emit_signal("finished", p_value);
+	if (p_error) {
+		Async::finish(this, SNAME("finished_pair"), p_value, *p_error);
+	} else {
+		Async::finish(this, SNAME("finished"), p_value);
+	}
 	self_hold.unref(); // Release self-ownership.
 }
 
@@ -294,6 +400,7 @@ void GDWait::abandon() {
 	}
 	Ref<GDWait> keep(this);
 	time(false);
+	drop_observed();
 	if (cancel_context.is_valid()) {
 		const Callable stop = callable_mp(this, &GDWait::cancel_target);
 		if (cancel_context->is_connected("canceled", stop)) {
@@ -327,6 +434,7 @@ void GDWait::_bind_methods() {
 	}
 	ClassDB::bind_method(D_METHOD("cancel"), &GDWait::cancel);
 	ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::NIL, "value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT)));
+	ADD_SIGNAL(MethodInfo("finished_pair", PropertyInfo(Variant::NIL, "value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err")));
 }
 
 // Stop waiting on behalf of a cancelled context and report the interruption to the awaiting caller.
@@ -335,7 +443,12 @@ void GDWait::cancel() {
 		return;
 	}
 	drop_rivals();
-	done(R::err("wait was canceled", Err::INTERRUPTED));
+	if (pair_ready) {
+		const Variant error = Err::make("wait was canceled", Err::INTERRUPTED);
+		done(Variant(), &error);
+	} else {
+		done(Err::make("wait was canceled", Err::INTERRUPTED));
+	}
 }
 
 // ---------------- Wait construction ----------------
@@ -445,11 +558,46 @@ void Async::drain() {
 	if (post.call.is_valid()) {
 		post.call.call();
 	}
+	if (preempted_tasks == 0 && !held.is_empty()) {
+		release_held();
+	}
+}
+
+// Count tasks suspended by a time slice rather than by await.
+void Async::preempted(bool p_on) {
+	preempted_tasks = MAX(0, preempted_tasks + (p_on ? 1 : -1));
+}
+
+// Hold a completion only while a preempted task might still connect to it.
+bool Async::must_hold(Object *p_obj, const StringName &p_signal) {
+	return preempted_tasks > 0 && p_obj && !p_obj->has_connections(p_signal);
+}
+
+// Keep a completion and its operation until preempted tasks have reached await.
+void Async::hold(Object *p_obj, const StringName &p_signal, const Vector<Variant> &p_args) {
+	held.push_back(Held{ Ref<RefCounted>(Object::cast_to<RefCounted>(p_obj)), p_obj->get_instance_id(), p_signal, p_args });
+}
+
+// Emit held completions in order, now that every task has reached await or finished.
+void Async::release_held() {
+	LocalVector<Held> ready = std::move(held);
+	held.clear();
+	for (const Held &entry : ready) {
+		Object *obj = ObjectDB::get_instance(entry.id);
+		if (!obj) {
+			continue;
+		}
+		LocalVector<const Variant *> args;
+		for (const Variant &arg : entry.args) {
+			args.push_back(&arg);
+		}
+		obj->emit_signalp(entry.signal, args.ptr(), args.size());
+	}
 }
 
 // Report undelivered work in the runtime ready queue.
 bool Async::has_ready() {
-	return notified.is_set() || posted_ready.is_set() || (!timed_waits.is_empty() && timed_waits.front()->get().due <= GDClock::msec());
+	return notified.is_set() || posted_ready.is_set() || (preempted_tasks == 0 && !held.is_empty()) || (!timed_waits.is_empty() && timed_waits.front()->get().due <= GDClock::msec());
 }
 
 // Release undelivered targets during process shutdown.
@@ -458,6 +606,8 @@ void Async::shutdown() {
 	notified.clear();
 	posted_calls.clear();
 	posted_at = 0;
+	held.clear();
+	preempted_tasks = 0;
 	posted_ready.clear();
 	deadline_calls.clear();
 	timed_waits.clear();
@@ -493,6 +643,21 @@ Signal Async::ready(const Variant &p_value) {
 	return Signal(w.ptr(), "finished");
 }
 
+// Publish an immediate native result through separate value and error signal arguments.
+Signal Async::ready_pair(const VariantPair &p_pair) {
+	Ref<GDWait> w;
+	w.instantiate();
+	w->retain();
+	w->mode = GDWait::ALL;
+	w->pending = true;
+	w->ready_value = p_pair.value;
+	w->ready_error = p_pair.error;
+	w->has_ready_value = true;
+	w->pair_ready = true;
+	w->post();
+	return Signal(w.ptr(), "finished_pair");
+}
+
 // Start a Callable and return its completion signal.
 // Retain coroutine state and forward its completed result.
 // For immediate completion, deliver the returned value on the next turn.
@@ -503,8 +668,22 @@ Signal Async::spawn(const Callable &p_fn) {
 	w->retain();
 	w->mode = GDWait::SPAWN;
 	w->spawn_fn = p_fn;
+	w->scope = scope();
 	w->post();
 	return Signal(w.ptr(), "finished");
+}
+
+// Start a Callable and preserve two completion arguments through a suspension.
+Signal Async::spawn_pair(const Callable &p_fn) {
+	Ref<GDWait> w;
+	w.instantiate();
+	w->retain();
+	w->mode = GDWait::SPAWN;
+	w->pair_ready = true;
+	w->spawn_fn = p_fn;
+	w->scope = scope();
+	w->post();
+	return Signal(w.ptr(), "finished_pair");
 }
 
 // Return the first asynchronous completion.
@@ -525,10 +704,10 @@ Ref<GDWait> Async::start_race(const Array &p_signals) {
 	w.instantiate();
 	w->retain();
 	w->mode = GDWait::RACE;
-	w->rivals = p_signals;
 	for (int i = 0; i < p_signals.size(); i++) {
 		// Bind the input index while accepting any number of signal values.
-		Signal s = p_signals[i];
+		Signal s = GDTask::signal_of(p_signals[i]);
+		w->rivals.push_back(s);
 		s.connect(Callable(w.ptr(), "rang").bind(i), Object::CONNECT_ONE_SHOT);
 	}
 	return w;
@@ -542,12 +721,14 @@ Signal Async::all(const Array &p_signals) {
 	w->mode = GDWait::ALL;
 	w->left = p_signals.size();
 	w->values.resize(p_signals.size());
+	LocalVector<Signal> inputs; // Completion signal chosen for each input, for spotting repeats.
 	for (int i = 0; i < p_signals.size(); i++) {
 		const Variant item = p_signals[i];
-		Signal s = item.get_type() == Variant::CALLABLE ? spawn(item) : (item.get_type() == Variant::SIGNAL ? Signal(item) : Signal());
+		Signal s = item.get_type() == Variant::CALLABLE ? spawn(item) : GDTask::signal_of(item);
+		inputs.push_back(s);
 		int earlier = -1;
 		for (int j = 0; j < i && earlier < 0; j++) {
-			if (p_signals[j].get_type() == Variant::SIGNAL && Signal(p_signals[j]) == s) {
+			if (s.get_object() && inputs[j] == s) {
 				earlier = j;
 			}
 		}
@@ -556,8 +737,23 @@ Signal Async::all(const Array &p_signals) {
 			w->left--;
 			continue;
 		}
-		if (!s.get_object() || s.connect(Callable(w.ptr(), "rang").bind(i), Object::CONNECT_ONE_SHOT) != OK) {
-			w->values[i] = R::err("all needs a live Signal or Callable", Err::INVALID_DATA);
+		// Report which input cannot be awaited and why, so a lost completion is traceable.
+		String why;
+		if (item.get_type() == Variant::CALLABLE && !s.get_object()) {
+			why = "its Callable could not be started";
+		} else if (Object::cast_to<GDTask>(item.get_validated_object()) && !s.get_object()) {
+			why = "its GDTask's operation cannot be followed";
+		} else if (item.get_type() == Variant::SIGNAL && !s.get_object()) {
+			why = "its Signal's operation no longer exists; pass the GDTask from the _async method instead";
+		} else if (!s.get_object()) {
+			why = vformat("it is %s, not a GDTask, Signal or Callable", item.get_type() == Variant::OBJECT && item.get_validated_object() ? String(item.get_validated_object()->get_class()) : Variant::get_type_name(item.get_type()));
+		} else if (s.connect(Callable(w.ptr(), "rang").bind(i), Object::CONNECT_ONE_SHOT) != OK) {
+			why = vformat("signal %s cannot be connected", s.get_name());
+		}
+		if (!why.is_empty()) {
+			Dictionary info;
+			info["index"] = i;
+			w->values[i] = Err::make(vformat("all cannot wait for input %d: %s", i, why), Err::INVALID_DATA, info);
 			w->left--;
 		}
 	}
@@ -581,30 +777,38 @@ Signal Async::with_timeout(const Signal &p_signal, double p_sec) {
 }
 
 // Forward context cancellation to a cancellable asynchronous operation.
-Signal Async::with_context(const Ref<GDAsyncContext> &p_context, const Signal &p_signal) {
-	ERR_FAIL_COND_V_MSG(p_context.is_null(), Signal(), "with_context needs a GDAsyncContext.");
+Signal Async::with_context(const Ref<GDAsyncContext> &p_context, const Signal &p_signal, bool p_pair) {
+	// Report invalid wrappers through their declared completion signal.
+	auto invalid = [&](const char *p_message) -> Signal {
+		const Variant error = Err::make(p_message, Err::INVALID_DATA);
+		return p_pair ? ready_pair({ Variant(), error }) : ready(error);
+	};
+	if (p_context.is_null()) return invalid("with_context needs a GDAsyncContext");
 	Object *target = p_signal.get_object();
-	ERR_FAIL_NULL_V_MSG(target, Signal(), "with_context needs a live Signal.");
-	ERR_FAIL_COND_V_MSG(!target->has_method("cancel"), Signal(), "with_context needs a cancelable operation.");
+	if (!target) return invalid("with_context needs a live Signal");
+	if (!target->has_method("cancel")) return invalid("with_context needs a cancelable operation");
 	Ref<RefCounted> held = Ref<RefCounted>(Object::cast_to<RefCounted>(target));
-	ERR_FAIL_COND_V_MSG(held.is_null(), Signal(), "with_context needs a reference-counted operation.");
+	if (held.is_null()) return invalid("with_context needs a reference-counted operation");
 	Ref<GDWait> w;
 	w.instantiate();
 	w->retain();
 	w->mode = GDWait::ONE;
+	w->pair_ready = p_pair;
 	w->defer_one = true;
 	w->hold_obj = held;
 	w->cancel_context = p_context;
-	Signal operation = p_signal;
-	operation.connect(Callable(w.ptr(), "rang").bind(0), Object::CONNECT_ONE_SHOT);
+	w->observed = p_signal;
 	const Callable stop = callable_mp(w.ptr(), &GDWait::cancel_target);
 	if (p_context->is_done()) {
+		// An already canceled context stops the operation and reports its reason, not the operation's result.
 		w->cancel_pending = true;
 		w->post(); // Return cancellation only after the caller can connect to the signal.
 	} else {
+		Signal operation = p_signal;
+		operation.connect(Callable(w.ptr(), "rang").bind(0), Object::CONNECT_ONE_SHOT);
 		p_context->connect("canceled", stop, Object::CONNECT_ONE_SHOT);
 	}
-	return Signal(w.ptr(), "finished");
+	return Signal(w.ptr(), p_pair ? "finished_pair" : "finished");
 }
 
 // Return seconds until the nearest asynchronous timer.
@@ -664,6 +868,11 @@ void GDAsyncContext::cancel(const String &p_msg, Err::Kind p_kind) {
 	reason = Err::make(p_msg, p_kind == Err::NONE ? Err::INTERRUPTED : p_kind);
 	detach();
 	emit_signal("canceled");
+}
+
+// Cancel a script context with a shared error category.
+void GDAsyncContext::cancel_value(const String &p_msg, const Ref<Err> &p_kind) {
+	cancel(p_msg, p_kind.is_valid() ? p_kind->get_kind() : Err::NONE);
 }
 
 // Report context deadline expiry.
@@ -729,7 +938,7 @@ GDAsyncContext::~GDAsyncContext() {
 
 // Register public script methods and properties.
 void GDAsyncContext::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("cancel", "msg", "kind"), &GDAsyncContext::cancel, DEFVAL("canceled"), DEFVAL(Err::NONE));
+	ClassDB::bind_method(D_METHOD("cancel", "msg", "kind"), &GDAsyncContext::cancel_value, DEFVAL("canceled"), DEFVAL(Ref<Err>()));
 	ClassDB::bind_method(D_METHOD("with_cancel"), &GDAsyncContext::with_cancel);
 	ClassDB::bind_method(D_METHOD("with_timeout", "sec"), &GDAsyncContext::with_timeout);
 	ClassDB::bind_method(D_METHOD("is_done"), &GDAsyncContext::is_done);

@@ -314,7 +314,8 @@ def configure(env: "SConsEnvironment"):
                 )
                 env["angle"] = False
 
-    env.Append(LINKFLAGS=["-rpath", "@executable_path/../Frameworks", "-rpath", "@executable_path"])
+    # Find system Swift overlays that the SDK links by run path on older deployment targets.
+    env.Append(LINKFLAGS=["-rpath", "@executable_path/../Frameworks", "-rpath", "@executable_path", "-rpath", "/usr/lib/swift"])
 
     if env["metal"] and env["arch"] != "arm64":
         print_warning("Target architecture '{}' does not support the Metal rendering driver".format(env["arch"]))

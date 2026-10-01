@@ -18,7 +18,6 @@
 #include "core/object/ref_counted.h"
 #include "core/templates/list.h"
 
-class R;
 class GDWait;
 
 // Internal transport reusing HTTP connections by origin.
@@ -75,9 +74,10 @@ public:
 	int get_status() const { return status_code; }
 	Dictionary get_headers() const { return head; }
 	PackedByteArray get_body() const { return body; }
+	// Return true for HTTP status codes from 200 through 299; transport success alone does not imply this result.
 	bool ok() const { return status_code >= 200 && status_code < 300; }
 	String text() const;
-	Ref<R> json() const; // Distinguish valid JSON null from parsing failure through R.
+	VariantPair json() const; // Distinguish valid JSON null from parsing failure.
 };
 
 // One request, delivering its response through finished.
@@ -99,8 +99,10 @@ class GDHTTPCall : public RefCounted {
 	Ref<GDHTTPTransport> transport; // Shared transport reusing connections between requests.
 	Ref<GDHTTPResponse> res;
 	Ref<Err> error; // Failure retained independently of the partial response.
+	Ref<Err> save_error; // Read failure waiting for the asynchronous file writer to finish.
 	Ref<GDHTTPCall> self_hold; // Retain the call until completion even if scripts release it.
 	Ref<GDWait> retry_wait; // Backoff timer, abandoned when the request finishes or is cancelled.
+	Ref<GDWait> handshake_wait; // TLS handshake deadline after the TCP connection succeeds.
 	unsigned retries = 0; // Completed multiplexed replay decisions before response headers.
 	Stage stage = CONNECTING;
 	uint64_t deadline = 0; // Time after which the request fails.
@@ -125,12 +127,14 @@ class GDHTTPCall : public RefCounted {
 	int64_t received = 0; // Total received body bytes.
 
 	void step(); // Advance the request on event-loop notifications.
-	void moved(const Ref<R> &p_result); // Receive the worker's rename result.
+	void moved(const Variant &p_value, const Variant &p_error); // Receive the worker's rename result.
 	void done(const Ref<Err> &p_error);
 	void done(const String &p_why, Err::Kind p_kind = Err::NONE); // Clean up and emit finished.
 	bool open_client(); // Create a new connection.
 	bool retry(); // Replay unprocessed requests or safe requests on stale reused connections.
 	void retry_ready(); // Reopen the destination after cancellable backoff.
+	void handshake_timeout(); // Fail a TLS handshake that has not completed in time.
+	void clear_handshake(); // Cancel an obsolete TLS handshake timer.
 	void set_due(uint64_t p_wait); // Register the deadline with the kernel wait.
 	void watch(bool p_on); // Attach or detach event-loop notifications.
 

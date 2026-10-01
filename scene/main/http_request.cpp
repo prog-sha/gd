@@ -315,8 +315,8 @@ bool HTTPRequest::_is_automatic_redirect() const {
 		// We change unsafe methods to GET for 301, 302, and 303, so these are always redirected.
 		// 305 is deprecated and treated as equivalent to 302.
 		return true;
-	} else if ((response_code == 307 || response_code == 308) && _is_method_safe()) {
-		// We only automatically redirect for safe methods on method-preserving status codes.
+	} else if (response_code == 307 || response_code == 308) {
+		// Reuse the stored request body for method-preserving redirects.
 		return true;
 	} else {
 		return false;
@@ -385,7 +385,7 @@ bool HTTPRequest::_handle_response(bool *ret_value) {
 
 			// Drop credentials when scheme, host, or port changes.
 			const bool same_origin = old_tls == use_tls && old_port == port && old_url.nocasecmp_to(url) == 0;
-			const bool drop_content = !_is_method_safe();
+			const bool drop_content = !_is_method_safe() && response_code != 307 && response_code != 308;
 			Vector<String> req_headers;
 			_get_redirect_headers(&req_headers, same_origin, drop_content);
 			headers = req_headers;

@@ -31,6 +31,7 @@
 #include "os_windows.h"
 
 #include "core/profiling/profiling.h"
+#include "cli/view/handoff.h"
 #include "main/main.h"
 
 #include <clocale>
@@ -84,6 +85,21 @@ int widechar_main(int argc, wchar_t **argv) {
 	for (int i = 0; i < argc; ++i) {
 		argv_utf8[i] = wc_to_utf8(argv[i]);
 	}
+
+	// Leave this process before engine startup when a display command is present.
+	int handed = View::handoff(argc, argv_utf8);
+	if (handed != 0) {
+		for (int i = 0; i < argc; ++i) {
+			delete[] argv_utf8[i];
+		}
+		delete[] argv_utf8;
+		return handed;
+	}
+
+#ifdef GD_VIEW
+	// Leave before project startup when recorded unit tests were requested.
+	TEST_MAIN_PARAM_OVERRIDE(argc, argv_utf8)
+#endif
 
 	Error err = Main::setup(argv_utf8[0], argc - 1, &argv_utf8[1]);
 

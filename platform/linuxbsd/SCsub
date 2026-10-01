@@ -41,11 +41,11 @@ if env["dbus"]:
         common_linuxbsd.append("dbus-so_wrap.c")
 
 if env["library_type"] == "static_library":
-    prog = env.add_library("#bin/gd", common_linuxbsd)
+    prog = env.add_library("#bin/" + env["bin_stem"], common_linuxbsd)
 elif env["library_type"] == "shared_library":
-    prog = env.add_shared_library("#bin/gd", common_linuxbsd)
+    prog = env.add_shared_library("#bin/" + env["bin_stem"], common_linuxbsd)
 else:
-    prog = env.add_program("#bin/gd", common_linuxbsd)
+    prog = env.add_program("#bin/" + env["bin_stem"], common_linuxbsd)
 
 if env["debug_symbols"] and env["separate_debug_symbols"]:
     env.AddPostAction(prog, env.Run(platform_linuxbsd_builders.make_debug_linuxbsd))

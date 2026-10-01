@@ -129,6 +129,7 @@ public:
 
 	virtual PackedByteArray generate_random_bytes(int p_bytes) = 0;
 	virtual Ref<CryptoKey> generate_rsa(int p_bytes) = 0;
+	virtual Ref<CryptoKey> generate_ec() = 0; // P-256 key; generated instantly, suited to throwaway certificates.
 	virtual Ref<X509Certificate> generate_self_signed_certificate(Ref<CryptoKey> p_key, const String &p_issuer_name, const String &p_not_before, const String &p_not_after) = 0;
 
 	virtual Vector<uint8_t> sign(HashingContext::HashType p_hash_type, const Vector<uint8_t> &p_hash, Ref<CryptoKey> p_key) = 0;

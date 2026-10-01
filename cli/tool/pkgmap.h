@@ -96,18 +96,22 @@ class GDPkgMap {
 	// Register an alias for a local checkout or a url package, which have no canonical id.
 	// A checkout is copied under pkg/<alias>/ with its scripts relocated; it is stale, and
 	// copied again by gd install whenever its source snapshot differs.
-	static void _map_plain(const String &p_alias, const String &p_spec, bool p_local, bool p_embedded, bool &r_missing) {
+	static void _map_plain(const String &p_alias, const String &p_spec, bool p_local, bool p_embedded, bool p_snapshot, bool &r_missing) {
 		String root;
 		if (_is_local(p_spec)) {
 			root = _copy_root(p_alias);
 			Mount::set_pkg(p_alias, root);
 			// The copy is this package whether or not a lock names it, so both spellings share one identity.
 			PkgScope::set_dir(p_alias, "local:" + p_alias);
-			if (p_embedded) {
+			if (p_embedded || p_snapshot) {
+				// A copied standalone entry has a source stamp even without a package manifest.
+				r_missing = !FileAccess::exists(String(LOCAL).path_join(p_alias).path_join(p_snapshot ? ".gd-source" : "gd.json"));
 				return;
 			}
-			const String source = p_spec.is_absolute_path() ? p_spec : GDSystem::cwd().path_join(p_spec).simplify_path();
-			const String copy = GDSystem::cwd().path_join("pkg").path_join(p_alias);
+			const String project = ProjectSettings::get_singleton()->get_resource_path();
+			const String source = p_spec.is_absolute_path() ? p_spec : project.path_join(p_spec).simplify_path();
+			// An explicit editor-project installation keeps its copies under addons/.
+			const String copy = project.path_join(Cmd::for_godot() ? "addons" : "pkg").path_join(p_alias);
 			const Perm::Trusted trust; // The checkout gd.json names sits outside the jail.
 			const String stamp = PkgSource::stamp(source);
 			Ref<FileAccess> saved = FileAccess::open(copy.path_join(".gd-source"), FileAccess::READ);
@@ -143,7 +147,8 @@ class GDPkgMap {
 				continue; // Url packages are keyed by alias and mapped from gd.json.
 			}
 			const Dictionary entry = p_packages[k];
-			const String leaf = String(entry.has("url") ? entry["url"] : Variant("")).get_file();
+			// A registry release names files by fingerprint, so the lock keeps the entry's name.
+			const String leaf = entry.has("leaf") ? String(entry["leaf"]) : String(entry.has("url") ? entry["url"] : Variant("")).get_file();
 			const bool ext = leaf.ends_with(".gdextension");
 			const String dir = PkgScope::dir_of(id);
 			PkgScope::set_dir(dir, id);
@@ -207,7 +212,7 @@ class GDPkgMap {
 			const String spec = String(p_imports[k]);
 			if (!_is_registry(spec)) {
 				bool absent = false;
-				_map_plain(alias, spec, p_local, p_embedded, absent);
+				_map_plain(alias, spec, p_local, p_embedded, p_cfg.has("global_command"), absent);
 				missing = missing || absent;
 				continue;
 			}
@@ -259,6 +264,11 @@ class GDPkgMap {
 		List<String> args;
 		for (const String &flag : Cmd::flags) {
 			args.push_back(flag);
+		}
+		const String root = ProjectSettings::get_singleton()->get_resource_path();
+		if (root.is_absolute_path()) {
+			args.push_back("--path");
+			args.push_back(root); // Keep package recovery inside the selected resource root.
 		}
 		args.push_back("install");
 		args.push_back("--sync"); // Fetch what is missing and refresh changed checkouts, without re-verifying the rest.

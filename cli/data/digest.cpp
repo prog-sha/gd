@@ -25,14 +25,13 @@ PackedByteArray GDDigest::finish() {
 }
 
 // Enforce MD5's fixed width and report computation failure rather than success.
-Ref<R> GDDigest::md5(const PackedByteArray &p_data) {
+Ref<Err> GDDigest::md5(const PackedByteArray &p_data, PackedByteArray &r_out) {
 	constexpr int bytes = 16; // Fixed MD5 digest width.
-	PackedByteArray out;
-	if (out.resize(bytes) != OK) return R::err("cannot allocate MD5 digest", Err::LIMITED);
+	if (r_out.resize(bytes) != OK) return Err::make("cannot allocate MD5 digest", Err::LIMITED);
 	GDCrypto::Hash32 hash(GDCrypto::Hash32::MD5);
 	hash.write(p_data.ptr(), p_data.size());
-	hash.sum(out.ptrw());
-	return R::ok(out);
+	hash.sum(r_out.ptrw());
+	return Ref<Err>();
 }
 
 // Return the requested cryptographic bytes without exposing partial results on failure.

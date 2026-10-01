@@ -47,6 +47,7 @@
 #include "cli/sys/pkgscope.h"
 #include "cli/sys/pool.h"
 #include "cli/sys/task.h"
+#include "cli/sys/system.h"
 #include "cli/sys/wait.h"
 #include "cli/tool/compile.h"
 #include "cli/tool/fmt.h"
@@ -121,6 +122,8 @@
 #include "modules/gdscript/gdscript_function.h"
 #endif // MODULE_GDSCRIPT_ENABLED
 
+#include <cstdio>
+
 /* Static members */
 
 // Singletons
@@ -153,7 +156,6 @@ static PhysicsServer3D *physics_server_3d = nullptr;
 #endif // PHYSICS_3D_DISABLED
 // We error out if setup2() doesn't turn this true
 static bool _start_success = false;
-static bool show_help = false;
 static bool dump_extension_api = false; // Write extension_api.json after ClassDB is complete.
 
 static Object *gd_entry = nullptr; // Entry object for the running script.
@@ -166,11 +168,6 @@ static int frame_delay = 0;
 bool profile_gpu = false;
 
 /* Helper methods */
-
-// Decode command-line escapes into argument values.
-static String unescape_cmdline(const String &p_str) {
-	return p_str.replace("%20", " ");
-}
 
 // Return the complete runtime version string.
 static String get_full_version_string() {
@@ -316,7 +313,7 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 	List<String> args;
 	List<String> main_args;
 	List<String> user_args;
-	bool adding_user_args = false;
+	bool tooling = false; // Management commands ignore strictness before flags establish permissions.
 	List<String> platform_args = OS::get_singleton()->get_cmdline_platform_args();
 
 	// Add command line arguments.
@@ -331,12 +328,8 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 
 	List<String>::Element *I = args.front();
 
-	while (I) {
-		I->get() = unescape_cmdline(I->get().strip_edges());
-		I = I->next();
-	}
-
 	String project_path = "."; // Resource root at the invocation directory.
+	bool selected_project_path = false; // Whether --path named an editor project explicitly.
 	bool quiet_stdout = false;
 	int separate_thread_render = -1; // Tri-state: -1 = not set, 0 = false, 1 = true.
 	bool load_shell_env = false;
@@ -366,56 +359,42 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 	for (const String &arg : args) {
 		Cmd::raw.push_back(arg);
 	}
+	if (!Cmd::installed_args(args)) {
+		OS::get_singleton()->printerr("Invalid installed command metadata.\n");
+		goto error;
+	}
+	{
+		String topic;
+		bool help = false;
+		if (!Cmd::parse(args, GDCompile::has_embedded(), topic, help)) goto error;
+		if (help) {
+			if (topic.is_empty()) Help::show();
+			else if (!Help::command(topic)) {
+				OS::get_singleton()->printerr("error: unknown command: %s\n", topic.utf8().get_data());
+				goto error;
+			}
+			exit_err = ERR_HELP;
+			goto error;
+		}
+	}
+	tooling = Cmd::tooling;
+	user_args = Cmd::args;
+	dump_extension_api = Cmd::name == "dump-extension-api";
 	I = args.front();
 	while (I) {
 		List<String>::Element *N = I->next();
 
 		const String &arg = I->get();
 
-#ifdef MACOS_ENABLED
-		// Ignore the process serial number argument passed by macOS Gatekeeper.
-		// Otherwise, the first start would try to open a nonexistent project and abort.
-		if (arg.begins_with("-psn_")) {
-			I = N;
-			continue;
-		}
-#endif
-
-		// Reject unknown flags before they reach the engine argument parser.
-		// Otherwise undocumented flags could remain active outside --help.
-		// Leave arguments after -- or ++ untouched for the script.
-		if (!adding_user_args && arg.begins_with("-") && !Cmd::takes_flag(arg)) {
-			// Suggest a supported spelling when an unrecognized flag has a known alternative.
-			const String advice = Perm::flag_advice(arg);
-			if (!advice.is_empty()) {
-				OS::get_singleton()->printerr("%s\n", advice.utf8().get_data());
-			} else {
-				OS::get_singleton()->printerr("Unknown option: %s\nRun with --help to see what gd takes.\n", arg.utf8().get_data());
-			}
-			goto error;
-		}
-
-		if (adding_user_args) {
-			Cmd::args.push_back(arg);
-			user_args.push_back(arg);
-		} else if (arg == "-h" || arg == "--help") { // display help
-
-			show_help = true;
-			exit_err = ERR_HELP; // Hack to force an early exit in `main()` with a success code.
-			goto error;
-
-		} else if (arg == "--version") {
+		if (arg == "--version") {
 			print_line(get_cli_version_string());
 			exit_err = ERR_HELP; // Hack to force an early exit in `main()` with a success code.
 			goto error;
 
-		} else if (arg == "--dump-extension-api") {
-			dump_extension_api = true; // Need registered classes; dump after setup2.
-
-		} else if (arg == "-v" || arg == "--verbose") { // verbose output
+		} else if (arg == "--verbose") { // verbose output
 
 			OS::get_singleton()->_verbose_stdout = true;
-		} else if (arg == "-q" || arg == "--quiet") { // quieter output
+		} else if (arg == "--quiet") { // quieter output
 
 			quiet_stdout = true;
 
@@ -440,31 +419,28 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 				}
 				Cmd::workers = int(count);
 			}
-		} else if (arg == "--output" || arg == "-o") {
-			// Read the compile output filename from -o.
-			// Do not let the option become a script argument and silently leave the default output name.
-			if (N) {
-				Cmd::output = N->get();
-				N = N->next();
+		} else if (arg == "--output") {
+			Cmd::output = N->get(); // The parser has already required a value.
+			N = N->next();
+		} else if (arg == "--path") {
+			if (!N || !N->get().is_absolute_path() || !DirAccess::exists(N->get())) {
+				OS::get_singleton()->printerr("--path needs an existing absolute directory.\n");
+				goto error;
 			}
+			project_path = N->get(); // Bind resources without changing the caller's working directory.
+			selected_project_path = true;
+			N = N->next();
 		} else if (arg == "--header") {
 			Engine::get_singleton()->_print_header = true; // Enable version-header display.
 		} else if (arg == "--strict") {
 			// Enable stricter file, I/O, and Variant checks together.
-			Mount::set_strict();
-			Perm::set_strict();
-			Cmd::strict = true;
-			Cmd::flags.push_back(arg);
-		} else if (arg == "--mount" && N) {
-			// Parse mounts as name=path:access, accepting a separate option value.
-			// Reject malformed specifications rather than running without the intended mount.
-			const String one = "--mount=" + String(N->get());
-			if (Mount::parse_flag(one) == Mount::BAD) {
-				goto error;
+			if (!tooling) {
+				Mount::set_strict();
+				Perm::set_strict();
+				Cmd::strict = true;
+				Cmd::flags.push_back(arg);
 			}
-			Cmd::flags.push_back(one);
-			N = N->next();
-		} else if (arg.begins_with("--mount")) {
+		} else if (arg.begins_with("--mount=")) {
 			if (Mount::parse_flag(arg) == Mount::BAD) {
 				goto error;
 			}
@@ -472,41 +448,61 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 		} else if (Perm::parse_flag(arg)) {
 			// Preserve permission flags for child processes.
 			Cmd::flags.push_back(arg);
-		} else if (!Cmd::pkg.is_empty() && (arg == "--latest" || arg == "--frozen" || arg == "--cached-only" || arg == "--dry-run")) {
-			Cmd::pkg_args.push_back(arg); // Collect package-command options.
-		} else if (arg == "--" || arg == "++") {
-			adding_user_args = true;
-		} else if (!arg.begins_with("-") && Cmd::name.is_empty() && Cmd::script.is_empty() && Cmd::is_subcommand(arg)) {
-			// Use the first positional argument as a subcommand when its name matches.
-			Cmd::name = arg;
-			if (Cmd::is_pkg_cmd(arg)) {
-				Cmd::pkg = arg; // Dispatch package commands through the embedded script.
-			}
-		} else if (!arg.begins_with("-") && !Cmd::pkg.is_empty()) {
-			Cmd::pkg_args.push_back(arg); // Pass package arguments unchanged to the embedded script.
-		} else if (!arg.begins_with("-") && Cmd::name == "eval" && Cmd::eval_src.is_empty()) {
-			Cmd::eval_src = arg;
-		} else if (!arg.begins_with("-") && Cmd::script.is_empty() && Cmd::name != "eval" && !GDCompile::has_embedded()) {
-			// Use the positional script path as the execution target.
-			// For embedded packages the entry is fixed, so pass every argument to that entry.
-			Cmd::script = arg;
-		} else if (!arg.begins_with("-") && (!Cmd::script.is_empty() || GDCompile::has_embedded())) {
-			Cmd::args.push_back(arg); // Collect script arguments.
+		} else if (arg == "--godot") {
+			// Share project placement with commands delegated by the display executable.
+			OS::get_singleton()->set_environment("GD_FOR_GODOT", "1");
+		} else if (arg == "--global" || arg == "--force") {
+			Cmd::pkg_args.push_back(arg);
+		} else if (arg == "--root") {
+			Cmd::install_root = N->get();
+			N = N->next();
+		} else if (arg == "--name") {
+			Cmd::pkg_args.push_back(arg);
+			Cmd::pkg_args.push_back(N->get());
+			N = N->next();
+		} else if (arg == "--latest" || arg == "--frozen" || arg == "--cached-only" || arg == "--dry-run" || arg == "--sync") {
+			Cmd::pkg_args.push_back(arg); // Retain package options on either side of the command.
 		} else {
-			// Unknown flags were rejected at the start of the loop; remaining values are
-			// recognized flags handled later, such as --check, or positional arguments.
-			main_args.push_back(arg);
+			main_args.push_back(arg); // Retain validated options read by command implementations.
 		}
 
 		I = N;
 	}
 
+	if (Cmd::display() && selected_project_path) {
+		Cmd::pkg_args.push_back(project_path); // Forward the selected project to the display executable.
+	}
 	if (!Cmd::pkg.is_empty()) {
 		Mount::set_pkg_mode(); // Allow package-storage writes only for the package command.
 	}
+	// Select global storage independently of downloaded package caches.
+	if (Cmd::display() || Cmd::pkg_args.find("--global")) {
+		String root = Cmd::install_root;
+		if (root.is_empty()) root = GDSystem::env("GD_INSTALL_ROOT");
+		if (root.is_empty()) root = GDSystem::cache_dir();
+		root = root.replace_char('\\', '/');
+		if (!root.is_absolute_path()) root = GDSystem::cwd().path_join(root);
+		root = root.simplify_path();
+		if (root.length() > 1 && !root.ends_with(":/")) root = root.trim_suffix("/");
+		Cmd::global_bin = root.get_file() == "bin" ? root : root.path_join("bin");
+	} else if (Cmd::pkg == "upgrade") {
+		Cmd::global_bin = OS::get_singleton()->get_executable_path().replace_char('\\', '/').get_base_dir(); // Replace the running executable in place.
+	}
+	// Tie user:// to the executable, the selected project, or the entry script's directory.
+	if (GDCompile::has_embedded()) {
+		GDSystem::set_user_scope(OS::get_singleton()->get_executable_path());
+	} else if (!selected_project_path && !Cmd::script.is_empty()) {
+		const String entry = Cmd::script.is_absolute_path() ? Cmd::script : GDSystem::cwd().path_join(Cmd::script);
+		GDSystem::set_user_scope(entry.simplify_path().get_base_dir());
+	} else {
+		GDSystem::set_user_scope(project_path.is_absolute_path() ? project_path : GDSystem::cwd().path_join(project_path).simplify_path());
+	}
 	// Establish mounts after flags and before configuration loading.
 	// Both res:// and user:// must resolve against these roots before settings are read.
-	if (!Mount::setup()) {
+	if (!Mount::setup(Cmd::global_bin)) {
+		goto error;
+	}
+	if (!Mount::bind_res(project_path)) {
 		goto error;
 	}
 	// Allow a script entry without a project configuration file.
@@ -557,6 +553,7 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 	// Resolve pkg:// before any script or extension list is read, fetching what gd.json names but
 	// the machine lacks. Package commands manage the same files themselves.
 	if (Cmd::pkg.is_empty() && Cmd::name != "init" && Cmd::name != "doc" && Cmd::name != "completions" &&
+			!(Cmd::name == "info" && Cmd::for_godot()) && // Addon inventory reads copies without loading script dependencies.
 			!(Cmd::script.is_empty() && Cmd::eval_src.is_empty() && Cmd::name.is_empty() && GDCompile::embedded_entry().is_empty()) &&
 			!GDPkgMap::prepare()) {
 		goto error;
@@ -598,7 +595,7 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 	// Print usage and exit when no execution target is selected.
 	// A project.godot file alone does not select a scene entry or keep this process waiting.
 	if (!dump_extension_api && Cmd::script.is_empty() && Cmd::eval_src.is_empty() && Cmd::name.is_empty() && GDCompile::embedded_entry().is_empty()) {
-		Help::show(execpath);
+		Help::show();
 		goto error;
 	}
 
@@ -722,10 +719,6 @@ error:
 
 	args.clear();
 	main_args.clear();
-
-	if (show_help) {
-		Help::show(execpath);
-	}
 
 	EngineDebugger::deinitialize();
 
@@ -974,7 +967,7 @@ int Main::start() {
 		return EXIT_FAILURE;
 	}
 	if (Cmd::workers > 1 && OS::get_singleton()->get_environment("GD_WORKER").is_empty()) {
-		return Cmd::workers_loop(Cmd::child_args("--workers="), Cmd::workers);
+		return Cmd::workers_loop(Cmd::child_args("--workers"), Cmd::workers);
 	}
 
 	// Run watch mode by restarting this executable after changes.
@@ -1011,9 +1004,6 @@ int Main::start() {
 	}
 	if (Cmd::name == "repl") {
 		return Cmd::repl();
-	}
-	if (Cmd::name == "bench") {
-		return Cmd::run_bench(Cmd::script, Cmd::flags, 5);
 	}
 	if (Cmd::name == "completions") {
 		return Cmd::completions(Cmd::script);
@@ -1053,6 +1043,7 @@ int Main::start() {
 
 	// Run package commands through the embedded script, including the subcommand in its arguments.
 	if (!Cmd::pkg.is_empty()) {
+		const bool global_install = Cmd::pkg_args.find("--global") != nullptr;
 		Ref<Script> pkg_res = Cmd::script_from_source(String::utf8((const char *)gd_pkg_script, sizeof(gd_pkg_script)));
 		ERR_FAIL_COND_V_MSG(pkg_res.is_null(), EXIT_FAILURE, "GDScript language is not available.");
 		if (!pkg_res->is_valid()) {
@@ -1060,8 +1051,21 @@ int Main::start() {
 		}
 		List<String> pkg_argv;
 		pkg_argv.push_back(Cmd::pkg);
+		if (Cmd::display() || Cmd::pkg == "upgrade" || ((Cmd::pkg == "install" || Cmd::pkg == "uninstall") && global_install)) {
+			pkg_argv.push_back("--global-bin=" + Cmd::global_bin); // Give the trusted installer its selected destination.
+			if (Cmd::pkg == "install") {
+				for (const String &flag : Cmd::flags) {
+					pkg_argv.push_back("--global-run=" + flag); // Preserve the permissions chosen for the installed command.
+				}
+			}
+		}
 		for (const String &a : Cmd::pkg_args) {
 			pkg_argv.push_back(a);
+		}
+		// Preserve fixed script arguments after the delimiter without interpreting them as runtime options.
+		if (((global_install && Cmd::pkg == "install") || Cmd::display()) && !Cmd::args.is_empty()) {
+			pkg_argv.push_back("--");
+			for (const String &a : Cmd::args) pkg_argv.push_back(a);
 		}
 		SceneTree *pkg_tree = memnew(SceneTree);
 		GDEntry *pkg_entry = memnew(GDEntry);
@@ -1084,7 +1088,7 @@ int Main::start() {
 		}
 		SceneTree *eval_tree = memnew(SceneTree);
 		GDEntry *eval_entry = memnew(GDEntry);
-		if (eval_entry->setup(eval_res, List<String>()) != OK) {
+		if (eval_entry->setup(eval_res, Cmd::args) != OK) {
 			memdelete(eval_entry);
 			memdelete(eval_tree);
 			return EXIT_FAILURE;
@@ -1097,7 +1101,11 @@ int Main::start() {
 	if (!main_loop && !script.is_empty()) {
 		// Report a missing input early and concisely.
 		if (!script.begins_with("res://") && !FileAccess::exists(script)) {
-			print_error(vformat("\nerror: no such script: %s\n", script));
+			if (Cmd::name.is_empty() && !script.ends_with(".gd") && !script.contains("/")) {
+				OS::get_singleton()->printerr("error: unknown command: %s\nRun gd --help to list commands.\n", script.utf8().get_data());
+			} else {
+				OS::get_singleton()->printerr("error: no such script: %s\n", script.utf8().get_data());
+			}
 			return EXIT_FAILURE;
 		}
 
@@ -1547,6 +1555,9 @@ bool Main::iteration() {
 		script_scheduled = true;
 	}
 #endif
+	if (!script_scheduled) {
+		std::fflush(stdout); // Publish printed output before sleeping, so pipes and logs see it while the script waits.
+	}
 	if (script_scheduled) {
 		// Advance VM continuations to the next time slice independently of SceneTree frequency.
 	} else if (IdleWait::count() > 0 || Pool::has_work()) {

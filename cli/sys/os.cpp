@@ -7,6 +7,7 @@
 // Implement environment and filesystem operations declared in os.h.
 
 #include "cli/sys/os.h"
+#include "cli/data/utf8.h"
 
 #include "cli/sys/perm.h"
 #include "cli/sys/mount.h"
@@ -345,7 +346,12 @@ public:
 			keep_error(ERR_OUT_OF_MEMORY);
 			return false;
 		}
-		r_text = String::utf8((const char *)r_raw.ptr(), r_raw.size());
+		const VariantPair decoded = utf8_text(r_raw.ptr(), r_raw.size());
+		if (decoded.error.get_type() != Variant::NIL) {
+			keep_error(Ref<Err>(decoded.error)->get_kind() == Err::LIMITED ? ERR_OUT_OF_MEMORY : ERR_INVALID_DATA);
+			return false;
+		}
+		r_text = decoded.value;
 		return true;
 	}
 
@@ -466,44 +472,57 @@ public:
 	}
 };
 
-// Serialize in-process updates on platforms without native file locking.
+#if !defined(UNIX_ENABLED) && !defined(WINDOWS_ENABLED)
+// Serialize in-process updates when the platform has no native file lock.
 Mutex &write_mutex() {
 	static Mutex mutex;
 	return mutex;
 }
+#endif
 
-// Return operation failures with machine-readable details.
-// Classify only known causes and preserve original errno or Win32 codes.
-Ref<R> fail(const String &p_path, const char *p_op, Error p_err, const String &p_msg, const Variant &p_value = Variant()) {
-	const Ref<R> result = SourceError::path(p_path, p_op, p_err, p_msg);
-	return p_value.get_type() == Variant::NIL ? result : R::err(result->get_e(), Err::NONE, p_value);
+// Attach any completed value to its failure while leaving successful values unchanged.
+VariantPair completed(const Variant &p_value, const Variant &p_error) {
+	Ref<Err> error = p_error;
+	return { p_value, error.is_valid() ? Variant(error->with_partial(p_value)) : Variant() };
+}
+
+// Return path failures with machine-readable details and the original OS cause.
+VariantPair fail(const String &p_path, const char *p_op, Error p_err, const String &p_msg, const Variant &p_value = Variant()) {
+	return completed(p_value, SourceError::path(p_path, p_op, p_err, p_msg));
+}
+
+// Close an owned file and preserve both the operation and close failures.
+VariantPair finish_file(const Ref<GDFile> &p_file, const String &p_path, const VariantPair &p_prior) {
+	const Error closed = p_file->close();
+	const Ref<Err> later = closed == OK ? Ref<Err>() : SourceError::path(p_path, "close", closed, vformat("cannot close %s", p_path));
+	return { p_prior.value, Err::join(Ref<Err>(p_prior.error), later) };
 }
 
 // Return two-path failures with old and new paths.
-Ref<R> link_fail(const String &p_old, const String &p_new, const char *p_op, Error p_err, const String &p_msg) {
+VariantPair link_fail(const String &p_old, const String &p_new, const char *p_op, Error p_err, const String &p_msg) {
 	Dictionary info;
 	info["op"] = p_op;
 	info["old"] = p_old;
 	info["new"] = p_new;
 	const Error err = SourceError::put(info, p_err);
-	return R::err(Err::make(p_msg, Err::of(err), info));
+	return { Variant(), Err::make(p_msg, Err::of(err), info) };
 }
 
 // Attach the same operation and target context to failures detected without an OS call.
-Ref<R> fail_engine(const String &p_path, const char *p_op, Error p_err, const String &p_msg) {
+VariantPair fail_engine(const String &p_path, const char *p_op, Error p_err, const String &p_msg) {
 	SourceError::clear();
 	return fail(p_path, p_op, p_err, p_msg);
 }
 
 // Keep permission category names distinct from the actual operation name.
-Ref<R> denied(const String &p_path, const char *p_access, const char *p_op) {
+VariantPair denied(const String &p_path, const char *p_access, const char *p_op) {
 	SourceError::clear();
 	return fail(p_path, p_op, ERR_UNAUTHORIZED,
 			vformat("%s access to \"%s\" is not allowed", p_access, p_path));
 }
 
 // Preserve old and new paths in rename denial, including an empty destination.
-Ref<R> link_denied(const String &p_old, const String &p_new, const String &p_denied) {
+VariantPair link_denied(const String &p_old, const String &p_new, const String &p_denied) {
 	SourceError::clear();
 	return link_fail(p_old, p_new, "rename", ERR_UNAUTHORIZED,
 			vformat("write access to \"%s\" is not allowed", p_denied));
@@ -512,7 +531,7 @@ Ref<R> link_denied(const String &p_old, const String &p_new, const String &p_den
 // Read an open failure immediately after the corresponding file open.
 // The per-type get_open_error slot belongs only to that open operation.
 // Reading it after another operation or from another type would report an unrelated failure.
-Ref<R> file_error(const String &p_path, const char *p_access) {
+VariantPair file_error(const String &p_path, const char *p_access) {
 	return fail(p_path, "open", GDFile::get_open_error(),
 			vformat("cannot open %s for %s", p_path, p_access));
 }
@@ -524,7 +543,7 @@ Error file_io_error(const Ref<GDFile> &p_file, Error p_fallback) {
 }
 
 // Read an opened file through EOF, preserving bytes obtained before an intermediate failure.
-Ref<R> read_opened(const String &p_path, const Ref<GDFile> &p_file, uint64_t p_offset, uint64_t p_max) {
+VariantPair read_opened(const String &p_path, const Ref<GDFile> &p_file, uint64_t p_offset, uint64_t p_max) {
 	p_file->seek(p_offset);
 	const Error sought = p_file->get_error();
 	if (sought != OK && sought != ERR_FILE_EOF) {
@@ -556,18 +575,18 @@ Ref<R> read_opened(const String &p_path, const Ref<GDFile> &p_file, uint64_t p_o
 			return fail(p_path, "read", ERR_FILE_CANT_READ, vformat("cannot read %s", p_path), body);
 		}
 	}
-	return R::ok(body);
+	return { body, Variant() };
 }
 
 // Capture directory-open failure immediately, without consulting file-open state.
-Ref<R> dir_error(const String &p_path, const char *p_access) {
+VariantPair dir_error(const String &p_path, const char *p_access) {
 	return fail(p_path, "open", GDDir::get_open_error(),
 			vformat("cannot open %s for %s", p_path, p_access));
 }
 
 #ifndef UNIX_ENABLED
 // Remove one file or a directory that has already been emptied.
-Ref<R> drop_one(const String &p_path) {
+VariantPair drop_one(const String &p_path) {
 	// Deletion requires write permission; opening the directory checked only read access.
 	GD_PERM_FAIL_V(WRITE, p_path, denied(p_path, "write", "remove"));
 	SourceError::clear();
@@ -579,15 +598,16 @@ Ref<R> drop_one(const String &p_path) {
 	if (err != OK) {
 		return fail(p_path, "remove", err, vformat("cannot remove %s", p_path));
 	}
-	return R::ok();
+	return {};
 }
 
 // Determine whether directory opening failed because the target was a file.
-bool not_dir_error(const Ref<R> &p_result) {
-	if (p_result.is_null() || p_result->get_e().is_null()) {
+bool not_dir_error(const VariantPair &p_result) {
+	Ref<Err> error = p_result.error;
+	if (error.is_null()) {
 		return false;
 	}
-	const Dictionary info = p_result->get_e()->get_info();
+	const Dictionary info = error->get_info();
 #ifdef WINDOWS_ENABLED
 	return info.get("source", "") == "win32" && (int64_t)info.get("source_code", 0) == ERROR_PATH_NOT_FOUND;
 #else
@@ -654,7 +674,7 @@ Error make_dirs(const Ref<GDDir> &p_dir, const String &p_path) {
 }
 
 // Collect descendants recursively, stopping on failure.
-Ref<R> walk_into(const String &p_path, bool p_want_dirs, bool p_hidden, PackedStringArray &r_out) {
+VariantPair walk_into(const String &p_path, bool p_want_dirs, bool p_hidden, PackedStringArray &r_out) {
 	SourceError::clear();
 	Ref<GDDir> dir = GDDir::open(p_path);
 	if (dir.is_null()) {
@@ -673,8 +693,8 @@ Ref<R> walk_into(const String &p_path, bool p_want_dirs, bool p_hidden, PackedSt
 				if (p_want_dirs) {
 					r_out.push_back(full);
 				}
-				const Ref<R> sub = walk_into(full, p_want_dirs, p_hidden, r_out);
-				if (sub->get_e().is_valid()) {
+				const VariantPair sub = walk_into(full, p_want_dirs, p_hidden, r_out);
+				if (Ref<Err>(sub.error).is_valid()) {
 					dir->list_dir_end();
 					return sub;
 				}
@@ -688,12 +708,12 @@ Ref<R> walk_into(const String &p_path, bool p_want_dirs, bool p_hidden, PackedSt
 	if (SourceError::kept()) {
 		return fail(p_path, "readdir", FAILED, vformat("cannot list %s", p_path));
 	}
-	return R::ok();
+	return {};
 }
 } // namespace
 
 // Acquire an OS file lock and retain it for the object's lifetime.
-Ref<R> GDFileLock::take(const String &p_path) {
+VariantPair GDFileLock::take(const String &p_path) {
 	GD_PERM_FAIL_V(READ, p_path, denied(p_path, "read", "lock"));
 	GD_PERM_FAIL_V(WRITE, p_path, denied(p_path, "write", "lock"));
 	WriteLock *lock = memnew(WriteLock);
@@ -704,7 +724,7 @@ Ref<R> GDFileLock::take(const String &p_path) {
 		return fail(p_path, "lock", err, vformat("cannot lock %s", p_path));
 	}
 	state = lock;
-	return R::ok();
+	return {};
 }
 
 // Release the retained OS file lock.
@@ -716,32 +736,32 @@ GDFileLock::~GDFileLock() {
 }
 
 // Walk the directory tree and return the requested files or directories.
-Ref<R> Os::walk(const String &p_path, bool p_want_dirs, bool p_hidden) {
+VariantPair Os::walk(const String &p_path, bool p_want_dirs, bool p_hidden) {
 	PackedStringArray out;
-	const Ref<R> err = walk_into(p_path, p_want_dirs, p_hidden, out);
-	if (err->get_e().is_valid()) {
-		return R::err(err->get_e(), Err::NONE, out);
+	const VariantPair err = walk_into(p_path, p_want_dirs, p_hidden, out);
+	if (Ref<Err>(err.error).is_valid()) {
+		return completed(out, err.error);
 	}
-	return R::ok(out);
+	return { out, Variant() };
 }
 
 // Return file paths matching a pattern.
-Ref<R> Os::glob(const String &p_path, const String &p_pattern, bool p_hidden) {
+VariantPair Os::glob(const String &p_path, const String &p_pattern, bool p_hidden) {
 	PackedStringArray all;
-	const Ref<R> err = walk_into(p_path, false, p_hidden, all);
+	const VariantPair err = walk_into(p_path, false, p_hidden, all);
 	PackedStringArray out;
 	for (const String &n : all) {
 		if (n.match(p_pattern) || n.get_file().match(p_pattern)) {
 			out.push_back(n);
 		}
 	}
-	return err->get_ok() ? R::ok(out) : R::err(err->get_e(), Err::NONE, out);
+	return completed(out, err.error);
 }
 
 // Remove the specified directory tree recursively.
-Ref<R> Os::remove_all(const String &p_path) {
+VariantPair Os::remove_all(const String &p_path) {
 	if (p_path.is_empty()) {
-		return R::ok(); // An empty path is a no-op.
+		return {}; // An empty path is a no-op.
 	}
 	const String slash = p_path.replace("\\", "/");
 	if (slash == "." || slash.ends_with("/.")) {
@@ -762,45 +782,46 @@ Ref<R> Os::remove_all(const String &p_path) {
 	Error gate = OK;
 	if (!Mount::at(p_path, true, at, why, &gate, true)) {
 		if (gate == ERR_FILE_NOT_FOUND) {
-			return R::ok();
+			return {};
 		}
 		return fail(p_path, "RemoveAll", gate, why);
 	}
 	RemoveIssue issue;
 	if (remove_all_at(at.fd, at.leaf.utf8(), p_path, issue)) {
-		return R::ok();
+		return {};
 	}
 	SourceError::posix(issue.code);
 	return fail(issue.path, issue.op, SourceError::posix_error(issue.code), vformat("cannot remove %s", issue.path));
 #else
 	// Try removing one object first; success or NotFound completes the operation.
 	// Otherwise inspect it as a directory without treating a failed existence probe as absence.
-	const Ref<R> first = drop_one(p_path);
-	if (first->get_e().is_null() || first->get_e()->is(Err::NOT_FOUND)) {
-		return R::ok();
+	const VariantPair first = drop_one(p_path);
+	Ref<Err> first_error = first.error;
+	if (first_error.is_null() || first_error->is(Err::NOT_FOUND)) {
+		return {};
 	}
-	if (!first->get_e()->is(Err::ALREADY_EXISTS) && !first->get_e()->is(Err::PERMISSION_DENIED)) {
+	if (!first_error->is(Err::ALREADY_EXISTS) && !first_error->is(Err::PERMISSION_DENIED)) {
 		return first; // Do not infer a directory from an I/O failure and begin deleting children.
 	}
-	Ref<R> child_error;
+	VariantPair child_error;
 	bool done = false;
 	while (!done) {
 		SourceError::clear();
 		Ref<GDDir> dir = GDDir::open(p_path);
 		if (dir.is_null()) {
-			const Ref<R> opened = dir_error(p_path, "read");
+			const VariantPair opened = dir_error(p_path, "read");
 			if (not_dir_error(opened)) {
 				return first; // For a file, return the original removal failure rather than the directory-open error.
 			}
-			if (opened->get_e()->is(Err::NOT_FOUND)) {
-				return R::ok(); // Another process removed the target before recursion began.
+			if (Ref<Err>(opened.error)->is(Err::NOT_FOUND)) {
+				return {}; // Another process removed the target before recursion began.
 			}
-			return child_error.is_valid() ? child_error : opened;
+			return Ref<Err>(child_error.error).is_valid() ? child_error : opened;
 		}
 		const Error began = dir->list_dir_begin();
 		if (began != OK) {
-			const Ref<R> listed = fail(p_path, "readdir", began, vformat("cannot list %s", p_path));
-			return child_error.is_valid() ? child_error : listed;
+			const VariantPair listed = fail(p_path, "readdir", began, vformat("cannot list %s", p_path));
+			return Ref<Err>(child_error.error).is_valid() ? child_error : listed;
 		}
 		while (true) {
 			PackedStringArray kids;
@@ -815,14 +836,14 @@ Ref<R> Os::remove_all(const String &p_path) {
 			}
 			if (SourceError::kept()) {
 				dir->list_dir_end();
-				const Ref<R> stopped = fail(p_path, "readdir", FAILED, vformat("cannot list %s", p_path));
-				return child_error.is_valid() ? child_error : stopped;
+				const VariantPair stopped = fail(p_path, "readdir", FAILED, vformat("cannot list %s", p_path));
+				return Ref<Err>(child_error.error).is_valid() ? child_error : stopped;
 			}
 			bool removed = false;
 			for (const String &kid : kids) {
-				const Ref<R> r = remove_all(kid);
-				if (r->get_e().is_valid()) {
-					if (child_error.is_null()) {
+				const VariantPair r = remove_all(kid);
+				if (Ref<Err>(r.error).is_valid()) {
+					if (Ref<Err>(child_error.error).is_null()) {
 						child_error = r; // Preserve the first failure.
 					}
 				} else {
@@ -837,35 +858,36 @@ Ref<R> Os::remove_all(const String &p_path) {
 			// If the full batch could not be removed, advance on the same enumeration stream.
 		}
 	}
-	const Ref<R> last = drop_one(p_path);
-	return child_error.is_valid() ? child_error : last;
+	const VariantPair last = drop_one(p_path);
+	return Ref<Err>(child_error.error).is_valid() ? child_error : last;
 #endif
 }
 
 // ---------------- Files ----------------
 
-Ref<R> Os::read_text(const String &p_path) {
+VariantPair Os::read_text(const String &p_path) {
 	SourceError::clear();
 	Ref<GDFile> f = GDFile::open(p_path, GDFile::READ);
 	if (f.is_null()) {
 		return file_error(p_path, "read");
 	}
-	const Ref<R> read = read_opened(p_path, f, 0, 0);
-	if (read->get_v().get_type() != Variant::PACKED_BYTE_ARRAY) {
+	const VariantPair read = read_opened(p_path, f, 0, 0);
+	if (read.value.get_type() != Variant::PACKED_BYTE_ARRAY) {
 		return read;
 	}
-	const PackedByteArray body = read->get_v();
+	const PackedByteArray body = read.value;
 	// Keep the text decoder's int length and terminating character within range before narrowing.
 	if (body.size() >= INT_MAX) {
 		SourceError::clear();
 		return fail(p_path, "decode", ERR_OUT_OF_MEMORY, "file text exceeds String decoder representation; use read_bytes or a stream");
 	}
-	const String text = String::utf8((const char *)body.ptr(), (int)body.size());
-	return read->get_ok() ? R::ok(text) : R::err(read->get_e(), Err::NONE, text);
+	const VariantPair decoded = utf8_text(body.ptr(), body.size());
+	if (decoded.error.get_type() != Variant::NIL) return { Variant(), Err::join(Ref<Err>(read.error), Ref<Err>(decoded.error)) };
+	return completed(decoded.value, read.error);
 }
 
 // Read the entire file as bytes.
-Ref<R> Os::read_bytes(const String &p_path, int64_t p_offset, int64_t p_max) {
+VariantPair Os::read_bytes(const String &p_path, int64_t p_offset, int64_t p_max) {
 	if (p_offset < 0 || p_max < 0) {
 		return fail_engine(p_path, "read", ERR_INVALID_PARAMETER, "offset and max must not be negative");
 	}
@@ -883,7 +905,7 @@ Ref<R> Os::read_bytes(const String &p_path, int64_t p_offset, int64_t p_max) {
 }
 
 // Replace file content with text.
-Ref<R> Os::write_text(const String &p_path, const String &p_body) {
+VariantPair Os::write_text(const String &p_path, const String &p_body) {
 	SourceError::clear();
 	Ref<GDFile> f = GDFile::open(p_path, GDFile::WRITE);
 	if (f.is_null()) {
@@ -891,17 +913,18 @@ Ref<R> Os::write_text(const String &p_path, const String &p_body) {
 	}
 	// Check the write result so a full device cannot be reported as success.
 	if (!f->store_string(p_body)) {
-		return fail(p_path, "write", file_io_error(f, ERR_FILE_CANT_WRITE), vformat("cannot write %s", p_path));
+		return finish_file(f, p_path, fail(p_path, "write", file_io_error(f, ERR_FILE_CANT_WRITE), vformat("cannot write %s", p_path)));
 	}
-	const Error closed = f->close();
-	return closed == OK ? R::ok() : fail(p_path, "close", closed, vformat("cannot close %s", p_path));
+	return finish_file(f, p_path, {});
 }
 
 // Replace a text file only if its prior content still matches.
-Ref<R> Os::replace_text(const String &p_path, const Variant &p_old, const String &p_body) {
+VariantPair Os::replace_text(const String &p_path, const Variant &p_old, const String &p_body) {
 	GD_PERM_FAIL_V(READ, p_path, denied(p_path, "read", "replace"));
 	GD_PERM_FAIL_V(WRITE, p_path, denied(p_path, "write", "replace"));
+#if !defined(UNIX_ENABLED) && !defined(WINDOWS_ENABLED)
 	MutexLock guard(write_mutex());
+#endif
 	WriteLock lock;
 	bool existed = false;
 	const int taken = lock.take(p_path, p_old.get_type() == Variant::NIL, existed);
@@ -927,15 +950,17 @@ Ref<R> Os::replace_text(const String &p_path, const Variant &p_old, const String
 	if (!lock.write(raw, p_body.utf8())) {
 		return fail(p_path, "write", lock.error(ERR_FILE_CANT_WRITE), vformat("cannot write %s", p_path));
 	}
-	return R::ok();
+	return {};
 }
 
 // Compare through the same file descriptor and remove only matching text content.
-Ref<R> Os::remove_text(const String &p_path, const String &p_old) {
+VariantPair Os::remove_text(const String &p_path, const String &p_old) {
 	GD_PERM_FAIL_V(READ, p_path, denied(p_path, "read", "remove"));
 	GD_PERM_FAIL_V(WRITE, p_path, denied(p_path, "write", "remove"));
 	{
+#if !defined(UNIX_ENABLED) && !defined(WINDOWS_ENABLED)
 		MutexLock guard(write_mutex());
+#endif
 		WriteLock lock;
 		bool existed = false;
 		const int taken = lock.take(p_path, false, existed);
@@ -958,56 +983,53 @@ Ref<R> Os::remove_text(const String &p_path, const String &p_old) {
 }
 
 // Retain one lock across operations involving multiple files.
-Ref<R> Os::lock_file(const String &p_path) {
+VariantPair Os::lock_file(const String &p_path) {
 	Ref<GDFileLock> lock;
 	lock.instantiate();
-	Ref<R> taken = lock->take(p_path);
-	if (taken->get_e().is_valid()) {
+	VariantPair taken = lock->take(p_path);
+	if (Ref<Err>(taken.error).is_valid()) {
 		return taken;
 	}
-	return R::ok(lock);
+	return { lock, Variant() };
 }
 
 // Replace file content with bytes.
-Ref<R> Os::write_bytes(const String &p_path, const PackedByteArray &p_body) {
+VariantPair Os::write_bytes(const String &p_path, const PackedByteArray &p_body) {
 	SourceError::clear();
 	Ref<GDFile> f = GDFile::open(p_path, GDFile::WRITE);
 	if (f.is_null()) {
 		return file_error(p_path, "write");
 	}
 	if (!f->store_buffer(p_body)) {
-		return fail(p_path, "write", file_io_error(f, ERR_FILE_CANT_WRITE), vformat("cannot write %s", p_path));
+		return finish_file(f, p_path, fail(p_path, "write", file_io_error(f, ERR_FILE_CANT_WRITE), vformat("cannot write %s", p_path)));
 	}
-	const Error closed = f->close();
-	return closed == OK ? R::ok() : fail(p_path, "close", closed, vformat("cannot close %s", p_path));
+	return finish_file(f, p_path, {});
 }
 
 // Append bytes to the file.
-Ref<R> Os::append_bytes(const String &p_path, const PackedByteArray &p_body) {
+VariantPair Os::append_bytes(const String &p_path, const PackedByteArray &p_body) {
 	SourceError::clear();
 	Ref<GDFile> f = GDFile::open(p_path, GDFile::APPEND);
 	if (f.is_null()) {
 		return file_error(p_path, "write");
 	}
 	if (!f->store_buffer(p_body)) {
-		return fail(p_path, "write", file_io_error(f, ERR_FILE_CANT_WRITE), vformat("cannot write %s", p_path));
+		return finish_file(f, p_path, fail(p_path, "write", file_io_error(f, ERR_FILE_CANT_WRITE), vformat("cannot write %s", p_path)));
 	}
-	const Error closed = f->close();
-	return closed == OK ? R::ok() : fail(p_path, "close", closed, vformat("cannot close %s", p_path));
+	return finish_file(f, p_path, {});
 }
 
 // Append text to the file.
-Ref<R> Os::append_text(const String &p_path, const String &p_body) {
+VariantPair Os::append_text(const String &p_path, const String &p_body) {
 	SourceError::clear();
 	Ref<GDFile> f = GDFile::open(p_path, GDFile::APPEND);
 	if (f.is_null()) {
 		return file_error(p_path, "write");
 	}
 	if (!f->store_string(p_body)) {
-		return fail(p_path, "write", file_io_error(f, ERR_FILE_CANT_WRITE), vformat("cannot write %s", p_path));
+		return finish_file(f, p_path, fail(p_path, "write", file_io_error(f, ERR_FILE_CANT_WRITE), vformat("cannot write %s", p_path)));
 	}
-	const Error closed = f->close();
-	return closed == OK ? R::ok() : fail(p_path, "close", closed, vformat("cannot close %s", p_path));
+	return finish_file(f, p_path, {});
 }
 
 // Check whether the path exists.
@@ -1018,7 +1040,7 @@ bool Os::exists(const String &p_path) {
 }
 
 // Remove the specified object.
-Ref<R> Os::remove(const String &p_path) {
+VariantPair Os::remove(const String &p_path) {
 	GD_PERM_FAIL_V(WRITE, p_path, denied(p_path, "write", "remove"));
 	SourceError::clear();
 	Ref<GDDir> d = GDDir::open(p_path.get_base_dir());
@@ -1029,45 +1051,52 @@ Ref<R> Os::remove(const String &p_path) {
 	if (err != OK) {
 		return fail(p_path, "remove", err, vformat("cannot remove %s", p_path));
 	}
-	return R::ok();
+	return {};
 }
 
 // Return the file size in bytes.
-Ref<R> Os::size_of(const String &p_path) {
+VariantPair Os::size_of(const String &p_path) {
 	SourceError::clear();
 	Ref<GDFile> f = GDFile::open(p_path, GDFile::READ);
 	if (f.is_null()) {
 		return file_error(p_path, "read");
 	}
 	const uint64_t size = f->get_length();
-	return f->get_error() == OK ? R::ok((int64_t)size) : fail(p_path, "stat", f->get_error(), vformat("cannot inspect %s", p_path));
+	return f->get_error() == OK ? VariantPair{ (int64_t)size, Variant() } : fail(p_path, "stat", f->get_error(), vformat("cannot inspect %s", p_path));
 }
 
 // Reject copying onto the same file and transfer through EOF with the copy buffer.
-Ref<R> Os::copy(const String &p_src, const String &p_dst) {
+VariantPair Os::copy(const String &p_src, const String &p_dst) {
 	SourceError::clear();
 	Ref<GDFile> src = GDFile::open(p_src, GDFile::READ);
-	if (src.is_null()) return file_error(p_src, "read")->note("copy failed");
+	if (src.is_null()) {
+		const VariantPair failed = file_error(p_src, "read");
+		return { failed.value, Ref<Err>(failed.error)->note("copy failed") };
+	}
+	auto finish_src = [&](const VariantPair &p_result) { return finish_file(src, p_src, p_result); };
 	Ref<GDFile> dst = GDFile::open(p_dst, GDFile::CREATE);
-	if (dst.is_null()) return file_error(p_dst, "write")->note("copy failed");
-	if (src->same(dst)) return fail_engine(p_src, "copy", ERR_INVALID_PARAMETER, "copy source and destination must differ");
-	if (src->get_error() != OK) return fail(p_src, "stat", src->get_error(), "cannot inspect copy source");
-	if (dst->resize(0) != OK) return fail(p_dst, "truncate", dst->get_error(), "cannot truncate copy destination");
+	if (dst.is_null()) {
+		const VariantPair failed = file_error(p_dst, "write");
+		return finish_src({ failed.value, Ref<Err>(failed.error)->note("copy failed") });
+	}
+	auto finish = [&](const VariantPair &p_result) { return finish_src(finish_file(dst, p_dst, p_result)); };
+	if (src->same(dst)) return finish(fail_engine(p_src, "copy", ERR_INVALID_PARAMETER, "copy source and destination must differ"));
+	if (src->get_error() != OK) return finish(fail(p_src, "stat", src->get_error(), "cannot inspect copy source"));
+	if (dst->resize(0) != OK) return finish(fail(p_dst, "truncate", dst->get_error(), "cannot truncate copy destination"));
 	PackedByteArray chunk;
-	if (chunk.resize(COPY_CHUNK) != OK) return fail_engine(p_src, "copy", ERR_OUT_OF_MEMORY, "cannot allocate copy buffer");
+	if (chunk.resize(COPY_CHUNK) != OK) return finish(fail_engine(p_src, "copy", ERR_OUT_OF_MEMORY, "cannot allocate copy buffer"));
 	for (;;) {
 		const uint64_t got = src->get_buffer(chunk.ptrw(), COPY_CHUNK);
 		const Error error = src->get_error();
-		if (got && !dst->store_buffer(chunk.ptr(), got)) return fail(p_dst, "write", dst->get_error(), "copy failed while writing");
+		if (got && !dst->store_buffer(chunk.ptr(), got)) return finish(fail(p_dst, "write", dst->get_error(), "copy failed while writing"));
 		if (error == ERR_FILE_EOF) break;
-		if (error != OK || !got) return fail(p_src, "read", error == OK ? ERR_FILE_CANT_READ : error, "copy failed while reading");
+		if (error != OK || !got) return finish(fail(p_src, "read", error == OK ? ERR_FILE_CANT_READ : error, "copy failed while reading"));
 	}
-	const Error closed = dst->close();
-	return closed == OK ? R::ok() : fail(p_dst, "close", closed, "cannot close copy destination");
+	return finish({});
 }
 
 // Move a file or directory to the destination.
-Ref<R> Os::rename(const String &p_src, const String &p_dst) {
+VariantPair Os::rename(const String &p_src, const String &p_dst) {
 	GD_PERM_FAIL_V(WRITE, p_src, link_denied(p_src, p_dst, p_src));
 	GD_PERM_FAIL_V(WRITE, p_dst, link_denied(p_src, p_dst, p_dst));
 	// Classify this operation's error rather than consulting open-error state.
@@ -1077,12 +1106,12 @@ Ref<R> Os::rename(const String &p_src, const String &p_dst) {
 	if (err != OK) {
 		return link_fail(p_src, p_dst, "rename", err, vformat("cannot rename %s", p_src));
 	}
-	return R::ok();
+	return {};
 }
 
 // ---------------- Directories ----------------
 
-Ref<R> Os::list_dir(const String &p_path) {
+VariantPair Os::list_dir(const String &p_path) {
 	SourceError::clear();
 	Ref<GDDir> d = GDDir::open(p_path);
 	if (d.is_null()) {
@@ -1102,13 +1131,13 @@ Ref<R> Os::list_dir(const String &p_path) {
 	}
 	d->list_dir_end();
 	if (SourceError::kept()) {
-		return R::err(fail(p_path, "readdir", FAILED, vformat("cannot list %s", p_path))->get_e(), Err::NONE, names);
+		return completed(names, fail(p_path, "readdir", FAILED, vformat("cannot list %s", p_path)).error);
 	}
-	return R::ok(names);
+	return { names, Variant() };
 }
 
 // Create one directory.
-Ref<R> Os::make_dir(const String &p_path) {
+VariantPair Os::make_dir(const String &p_path) {
 	// Check the caller's path spelling; mount resolution determines the native target.
 	GD_PERM_FAIL_V(WRITE, p_path, denied(p_path, "write", "mkdir"));
 	// Classify this operation's error rather than consulting open-error state.
@@ -1118,12 +1147,12 @@ Ref<R> Os::make_dir(const String &p_path) {
 	if (err != OK) {
 		return fail(p_path, "mkdir", err, vformat("cannot make directory %s", p_path));
 	}
-	return R::ok();
+	return {};
 }
 
 // Create a directory together with missing parents.
-Ref<R> Os::ensure_dir(const String &p_path) {
-	return GDDir::dir_exists_absolute(p_path) ? R::ok() : make_dir(p_path);
+VariantPair Os::ensure_dir(const String &p_path) {
+	return GDDir::dir_exists_absolute(p_path) ? VariantPair{} : make_dir(p_path);
 }
 
 // ---------------- Permissions ----------------

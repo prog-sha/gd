@@ -1,19 +1,21 @@
-# 行動規範
+# Code of conduct
 
-このprojectでは、経験、国籍、性別、障害、外見、信条、立場にかかわらず、安心して参加できる場を保ちます。
+English | [日本語](CODE_OF_CONDUCT.ja.md)
 
-## 期待する行動
+This project maintains a welcoming place for everyone, regardless of experience, nationality, gender, disability, appearance, beliefs, or role.
 
-- 技術と事実を対象にし、人を攻撃しない。
-- 初心者にも再現できる説明と、根拠のあるreviewを行う。
-- 間違いを認め、修正へ協力する。
-- 個人情報、未公開の脆弱性、私信を本人の同意なく公開しない。
+## Expected behavior
 
-侮辱、嫌がらせ、差別、脅迫、望まれない性的表現、執拗な接触は認めません。
+- Discuss technical issues and facts without attacking people.
+- Give explanations beginners can reproduce and reviews supported by evidence.
+- Acknowledge mistakes and help correct them.
+- Do not disclose personal information, unpublished vulnerabilities, or private messages without consent.
 
-## 対応
+Insults, harassment, discrimination, threats, unwanted sexual content, and persistent unwanted contact are not acceptable.
 
-問題はmaintainerへ非公開で知らせてください。安全上の問題は[SECURITY.md](SECURITY.md)を使います。
-maintainerは事情を確認し、注意、投稿制限、一時停止、参加禁止など影響に釣り合う措置を取ります。
+## Enforcement
 
-この規範はprojectのrepository、issue、pull request、release、公式な対話の場に適用します。
+Report problems privately to a maintainer. For security issues, follow the [security policy](SECURITY.md).
+Maintainers investigate and take proportionate action, including warnings, posting restrictions, temporary suspension, or exclusion from participation.
+
+This code applies to the project's repositories, issues, pull requests, releases, and official discussion spaces.

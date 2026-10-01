@@ -7,6 +7,7 @@
 // Implement embedded SQL connections, binding, row conversion, and resource settings declared in sqlite.h.
 
 #include "cli/db/sqlite.h"
+#include "cli/db/options.h"
 #include "cli/sys/clock.h"
 #include "cli/data/utf8.h"
 #include "cli/db/rows.h"
@@ -29,9 +30,16 @@
 
 namespace {
 
+// Fill native value and error slots for embedded SQL calls.
+VariantPair sql_ok(const Variant &p_value = Variant()) { return { p_value, Variant() }; }
+// Return an existing embedded SQL failure in the error slot.
+VariantPair sql_fail(const Ref<Err> &p_error) { return { Variant(), p_error }; }
+// Build an embedded SQL failure in the error slot.
+VariantPair sql_fail(const String &p_message, Err::Kind p_kind) { return { Variant(), Err::make(p_message, p_kind) }; }
+
 constexpr int ROW_DEFAULT = 0; // Apply row limits only when explicitly configured.
 constexpr int BYTES_DEFAULT = 0; // Apply byte limits only when explicitly configured.
-constexpr int BUSY_DEFAULT = 5000; // Default lock-wait timeout in milliseconds.
+constexpr int BUSY_DEFAULT = 0; // Return lock contention unless a wait is requested.
 constexpr int TIME_DEFAULT = 0; // Allow embedded SQL to finish unless a deadline is explicitly configured.
 constexpr int STMT_MAX = 128; // Prepared statements reused per connection.
 constexpr int64_t STMT_BYTES_MAX = 4LL * 1024 * 1024; // Maximum prepared-statement cache bytes per connection.
@@ -90,7 +98,7 @@ bool pinned_parts(const char *p_path, uint64_t &r_id, const char *&r_suffix) {
 	return true;
 }
 
-// Pass the main database to the default VFS without changing file operations or locking.
+// Open database and rollback-journal files through the pinned directory.
 int pinned_open(sqlite3_vfs *, sqlite3_filename p_name, sqlite3_file *p_file, int p_flags, int *r_flags) {
 	uint64_t id = 0;
 	const char *suffix = nullptr;
@@ -100,10 +108,26 @@ int pinned_open(sqlite3_vfs *, sqlite3_filename p_name, sqlite3_file *p_file, in
 	p_file->pMethods = nullptr;
 	MutexLock lock(pinned_mutex);
 	const HashMap<uint64_t, PinnedDb *>::ConstIterator found = pinned_dbs.find(id);
-	if (!found || *suffix != '\0') {
+	if (!found || (strcmp(suffix, "") != 0 && strcmp(suffix, "-journal") != 0)) {
 		return SQLITE_CANTOPEN;
 	}
-	return pinned_base->xOpen(pinned_base, found->value->path.ptr(), p_file, p_flags, r_flags);
+	if (*suffix == '\0') {
+		return pinned_base->xOpen(pinned_base, found->value->path.ptr(), p_file, p_flags, r_flags);
+	}
+	const CharString name = (String::utf8(found->value->leaf.get_data()) + suffix).utf8();
+	int flags = (p_flags & SQLITE_OPEN_READONLY) ? O_RDONLY : O_RDWR;
+	if (p_flags & SQLITE_OPEN_CREATE) flags |= O_CREAT;
+	if (p_flags & SQLITE_OPEN_EXCLUSIVE) flags |= O_EXCL;
+	const int fd = ::openat(found->value->dir_fd, name.get_data(), flags | O_NOFOLLOW | O_CLOEXEC, 0600);
+	if (fd < 0) return SQLITE_CANTOPEN;
+	// Descriptor links are symbolic on Linux and the default VFS refuses to follow them,
+	// so name the file through its held directory there and through its own descriptor elsewhere.
+	const CharString by_dir = (vformat("/proc/self/fd/%d/", found->value->dir_fd) + String::utf8(name.get_data())).utf8();
+	const CharString by_fd = vformat("/dev/fd/%d", fd).utf8();
+	const CharString &path = ::access(by_dir.get_data(), F_OK) == 0 ? by_dir : by_fd;
+	const int result = pinned_base->xOpen(pinned_base, path.get_data(), p_file, p_flags & ~SQLITE_OPEN_EXCLUSIVE, r_flags);
+	::close(fd);
+	return result;
 }
 
 // Check main-database or sidecar existence relative to the pinned parent.
@@ -128,14 +152,20 @@ int pinned_access(sqlite3_vfs *, const char *p_name, int p_flags, int *r_found) 
 	return errno == ENOENT ? SQLITE_OK : SQLITE_IOERR_ACCESS;
 }
 
-// Reject virtual-path deletion without introducing a parent-path deletion fallback.
+// Remove only the rollback journal in the pinned directory.
 int pinned_delete(sqlite3_vfs *, const char *p_name, int p_sync_dir) {
 	uint64_t id = 0;
 	const char *suffix = nullptr;
 	if (!pinned_parts(p_name, id, suffix)) {
 		return pinned_base->xDelete(pinned_base, p_name, p_sync_dir);
 	}
-	return SQLITE_IOERR_DELETE;
+	MutexLock lock(pinned_mutex);
+	const HashMap<uint64_t, PinnedDb *>::ConstIterator found = pinned_dbs.find(id);
+	if (!found || strcmp(suffix, "-journal") != 0) return SQLITE_IOERR_DELETE;
+	const CharString name = (String::utf8(found->value->leaf.get_data()) + suffix).utf8();
+	if (::unlinkat(found->value->dir_fd, name.get_data(), 0) != 0 && errno != ENOENT) return SQLITE_IOERR_DELETE;
+	if (p_sync_dir && ::fsync(found->value->dir_fd) != 0) return SQLITE_IOERR_DIR_FSYNC;
+	return SQLITE_OK;
 }
 
 // Preserve pinned names without resolving symlinks; delegate other paths to the default VFS.
@@ -172,7 +202,7 @@ const char *pinned_vfs_name() {
 	return ready ? PINNED_VFS_NAME : nullptr;
 }
 
-// Reject existing sidecars and WAL format, then register the main database under a pinned virtual path.
+// Reject WAL sidecars and register the main database under a pinned virtual path.
 uint64_t hold_database(int p_dir_fd, const String &p_leaf, String &r_bad, Error &r_err) {
 	SourceError::clear();
 	r_err = OK;
@@ -191,14 +221,14 @@ uint64_t hold_database(int p_dir_fd, const String &p_leaf, String &r_bad, Error 
 		const String name = p_leaf + suffix;
 		struct stat st = {};
 		const int found = ::fstatat(held->dir_fd, name.utf8().get_data(), &st, AT_SYMLINK_NOFOLLOW);
-		if (found == 0) {
+		if (found == 0 && (strcmp(suffix, "-journal") != 0 || !S_ISREG(st.st_mode))) {
 			memdelete(held);
 			SourceError::clear();
 			r_err = ERR_INVALID_DATA;
-			r_bad = "sqlite database has a sidecar; recover it before opening inside a mount";
+			r_bad = "sqlite database has an unsafe sidecar";
 			return 0;
 		}
-		if (errno != ENOENT) {
+		if (found != 0 && errno != ENOENT) {
 			const int code = errno;
 			memdelete(held);
 			SourceError::posix(code);
@@ -421,14 +451,14 @@ Dictionary sqlite_info(int p_code, const String &p_msg) {
 	return info;
 }
 
-// Wrap the latest embedded SQL error in R.
-Ref<R> db_error(sqlite3 *p_db, int p_code, const String &p_prefix = String()) {
+// Retain the native SQL failure category and source details.
+Ref<Err> db_error(sqlite3 *p_db, int p_code, const String &p_prefix = String()) {
 	if (p_db && sqlite3_errcode(p_db) != SQLITE_OK) {
 		p_code = sqlite3_extended_errcode(p_db);
 	}
 	const char *raw = p_db ? sqlite3_errmsg(p_db) : sqlite3_errstr(p_code);
 	const String msg = raw ? String::utf8(raw) : String("sqlite error");
-	return R::err(Err::make(p_prefix.is_empty() ? msg : p_prefix + ": " + msg, kind_of(p_code), sqlite_info(p_code, msg)));
+	return Err::make(p_prefix.is_empty() ? msg : p_prefix + ": " + msg, kind_of(p_code), sqlite_info(p_code, msg));
 }
 
 // Reject SQL that expands resource access to other files or the entire process.
@@ -497,7 +527,7 @@ int64_t value_bytes(const Variant &p_value) {
 }
 
 // Bind validated argument sets to one program and execute updates sequentially.
-Ref<R> execute_many(sqlite3 *p_db, sqlite3_stmt *p_stmt, const Array &p_rows, uint64_t p_due, int64_t &r_changes) {
+Ref<Err> execute_many(sqlite3 *p_db, sqlite3_stmt *p_stmt, const Array &p_rows, uint64_t p_due, int64_t &r_changes) {
 	r_changes = 0;
 	for (int row_at = 0; row_at < p_rows.size(); row_at++) {
 		const Array params = p_rows[row_at];
@@ -515,7 +545,7 @@ Ref<R> execute_many(sqlite3 *p_db, sqlite3_stmt *p_stmt, const Array &p_rows, ui
 		}
 		r_changes += sqlite3_changes64(p_db);
 		if (p_due > 0 && (row_at & 255) == 255 && GDClock::msec() > p_due) {
-			return R::err("sqlite batch execution timed out", Err::TIMED_OUT);
+			return Err::make("sqlite batch execution timed out", Err::TIMED_OUT);
 		}
 		if (row_at + 1 < p_rows.size()) {
 			const int reset_code = sqlite3_reset(p_stmt);
@@ -524,31 +554,37 @@ Ref<R> execute_many(sqlite3 *p_db, sqlite3_stmt *p_stmt, const Array &p_rows, ui
 			}
 		}
 	}
-	return Ref<R>();
+	return Ref<Err>();
 }
 
 // Convert one embedded SQL column into the corresponding Variant.
-Variant column_of(sqlite3_stmt *p_stmt, int p_at) {
+VariantPair column_of(sqlite3_stmt *p_stmt, int p_at) {
 	switch (sqlite3_column_type(p_stmt, p_at)) {
 		case SQLITE_INTEGER:
-			return int64_t(sqlite3_column_int64(p_stmt, p_at));
+			return { int64_t(sqlite3_column_int64(p_stmt, p_at)), Variant() };
 		case SQLITE_FLOAT:
-			return sqlite3_column_double(p_stmt, p_at);
+			return { sqlite3_column_double(p_stmt, p_at), Variant() };
 		case SQLITE_TEXT: {
-			const char *text = reinterpret_cast<const char *>(sqlite3_column_text(p_stmt, p_at));
-			return String::utf8(text, sqlite3_column_bytes(p_stmt, p_at));
+			const uint8_t *text = sqlite3_column_text(p_stmt, p_at);
+			if (!text) return sql_fail(db_error(sqlite3_db_handle(p_stmt), sqlite3_errcode(sqlite3_db_handle(p_stmt)), "cannot decode sqlite text"));
+			const VariantPair value = utf8_value(text, sqlite3_column_bytes(p_stmt, p_at), true);
+			if (value.error.get_type() != Variant::NIL) return value;
+			return value.value.get_type() == Variant::STRING ? value : sql_fail("sqlite text contains NUL", Err::INVALID_DATA);
 		}
 		case SQLITE_BLOB: {
+			const void *bytes = sqlite3_column_blob(p_stmt, p_at);
+			const int blob_error = bytes ? SQLITE_OK : sqlite3_errcode(sqlite3_db_handle(p_stmt));
 			const int size = sqlite3_column_bytes(p_stmt, p_at);
+			if ((size > 0 && !bytes) || blob_error == SQLITE_NOMEM) return sql_fail(db_error(sqlite3_db_handle(p_stmt), blob_error, "cannot read sqlite blob"));
 			PackedByteArray out;
-			out.resize(size);
+			if (out.resize(size) != OK) return sql_fail("cannot allocate sqlite blob", Err::LIMITED);
 			if (size > 0) {
-				memcpy(out.ptrw(), sqlite3_column_blob(p_stmt, p_at), size);
+				memcpy(out.ptrw(), bytes, size);
 			}
-			return out;
+			return { out, Variant() };
 		}
 		default:
-			return Variant();
+			return { Variant(), Variant() };
 	}
 }
 
@@ -574,14 +610,14 @@ int check_tail(sqlite3 *p_db, const char *p_tail) {
 }
 
 // Validate SQL and prepare exactly one statement.
-Ref<R> prepare_stmt(sqlite3 *p_db, const String &p_sql, Stmt &r_stmt) {
+Ref<Err> prepare_stmt(sqlite3 *p_db, const String &p_sql, Stmt &r_stmt) {
 	if (p_sql.is_empty() || utf8_bytes(p_sql) > sqlite3_limit(p_db, SQLITE_LIMIT_SQL_LENGTH, -1)) {
-		return R::err("sqlite SQL length is outside the limit", Err::LIMITED);
+		return Err::make("sqlite SQL length is outside the limit", Err::LIMITED);
 	}
 	const CharString sql = p_sql.utf8();
 	for (int i = 0; i < sql.length(); i++) {
 		if (sql[i] == 0) {
-			return R::err("sqlite SQL contains a zero byte", Err::INVALID_DATA);
+			return Err::make("sqlite SQL contains a zero byte", Err::INVALID_DATA);
 		}
 	}
 	const char *tail = nullptr;
@@ -590,13 +626,13 @@ Ref<R> prepare_stmt(sqlite3 *p_db, const String &p_sql, Stmt &r_stmt) {
 		return db_error(p_db, code, "cannot prepare sqlite SQL");
 	}
 	if (!r_stmt.get()) {
-		return R::err("sqlite SQL has no statement", Err::INVALID_DATA);
+		return Err::make("sqlite SQL has no statement", Err::INVALID_DATA);
 	}
 	const int tail_code = check_tail(p_db, tail);
 	if (tail_code != SQLITE_OK) {
-		return tail_code == SQLITE_MISUSE ? R::err("sqlite accepts one statement at a time", Err::INVALID_DATA) : db_error(p_db, tail_code, "cannot parse sqlite SQL tail");
+		return tail_code == SQLITE_MISUSE ? Err::make("sqlite accepts one statement at a time", Err::INVALID_DATA) : db_error(p_db, tail_code, "cannot parse sqlite SQL tail");
 	}
-	return Ref<R>();
+	return Ref<Err>();
 }
 
 } // namespace
@@ -621,34 +657,35 @@ void GDSQLiteDB::clear_stmts() {
 }
 
 // Validate mount permissions and options, then create one connection.
-Ref<R> GDSQLiteDB::open(const String &p_path, const Dictionary &p_opts) {
+VariantPair GDSQLiteDB::open(const String &p_path, const Dictionary &p_opts) {
 	if (p_path.is_empty()) {
-		return R::err("sqlite path is empty", Err::INVALID_DATA);
+		return sql_fail("sqlite path is empty", Err::INVALID_DATA);
 	}
 	const bool memory = p_path == ":memory:";
 	String path = p_path;
 	if (!memory) {
-		if (Mount::name_of(p_path) != "user") {
-			return R::err("persistent sqlite databases must use user://", Err::PERMISSION_DENIED);
-		}
 		if (!Perm::check(Perm::READ, p_path) || !Perm::check(Perm::WRITE, p_path)) {
-			return R::err(vformat("cannot open sqlite database %s", p_path), Err::PERMISSION_DENIED);
+			return sql_fail(vformat("cannot open sqlite database %s", p_path), Err::PERMISSION_DENIED);
 		}
 		String why;
 		path = Mount::resolve(p_path, true, why);
 		if (path.is_empty()) {
-			return R::err(why, Err::PERMISSION_DENIED);
+			return sql_fail(why, Err::PERMISSION_DENIED);
 		}
 	}
 
-	const int64_t busy_raw = p_opts.get("busy_ms", BUSY_DEFAULT);
-	const int64_t rows_raw = p_opts.get("max_rows", ROW_DEFAULT);
-	const int64_t bytes_raw = p_opts.get("max_bytes", BYTES_DEFAULT);
-	const int64_t time_raw = p_opts.get("max_ms", TIME_DEFAULT);
-	if (busy_raw < 0 || busy_raw > INT_MAX || rows_raw < 0 || rows_raw > INT_MAX || bytes_raw < 0 || bytes_raw > INT_MAX || time_raw < 0 || time_raw > INT_MAX) {
-		return R::err("sqlite limits must be between 0 and 2147483647", Err::INVALID_DATA);
+	int64_t busy_raw = 0, rows_raw = 0, bytes_raw = 0, time_raw = 0;
+	if (!DbOption::integer(p_opts, "busy_ms", BUSY_DEFAULT, busy_raw) || !DbOption::integer(p_opts, "max_rows", ROW_DEFAULT, rows_raw) ||
+			!DbOption::integer(p_opts, "max_bytes", BYTES_DEFAULT, bytes_raw) || !DbOption::integer(p_opts, "max_ms", TIME_DEFAULT, time_raw) ||
+			busy_raw < 0 || busy_raw > INT_MAX || rows_raw < 0 || rows_raw > INT_MAX || bytes_raw < 0 || bytes_raw > INT_MAX || time_raw < 0 || time_raw > INT_MAX) {
+		return sql_fail("sqlite limits must be between 0 and 2147483647", Err::INVALID_DATA);
 	}
 	const int busy_ms = (int)busy_raw;
+	const Variant foreign_value = p_opts.get("foreign_keys", false);
+	if (foreign_value.get_type() != Variant::BOOL) {
+		return sql_fail("foreign_keys must be a boolean", Err::INVALID_DATA);
+	}
+	const bool foreign_keys = foreign_value;
 	const int rows = (int)rows_raw;
 	const int bytes = (int)bytes_raw;
 	const int time_ms = (int)time_raw;
@@ -665,7 +702,7 @@ Ref<R> GDSQLiteDB::open(const String &p_path, const Dictionary &p_opts) {
 			info["op"] = "open";
 			info["path"] = p_path;
 			at_err = SourceError::put(info, at_err);
-			return R::err(Err::make(at_why, Err::of(at_err), info));
+			return sql_fail(Err::make(at_why, Err::of(at_err), info));
 		}
 		// Open embedded SQL through the pinned descriptor without resolving the parent path again.
 		Error hold_err = OK;
@@ -675,7 +712,7 @@ Ref<R> GDSQLiteDB::open(const String &p_path, const Dictionary &p_opts) {
 			info["op"] = "open";
 			info["path"] = p_path;
 			hold_err = SourceError::put(info, hold_err);
-			return R::err(Err::make(at_why, Err::of(hold_err), info));
+			return sql_fail(Err::make(at_why, Err::of(hold_err), info));
 		}
 		open_path = vformat("%s%d", PINNED_PATH_PREFIX, pinned);
 	}
@@ -691,20 +728,20 @@ Ref<R> GDSQLiteDB::open(const String &p_path, const Dictionary &p_opts) {
 		vfs = pinned_vfs_name();
 		if (!vfs) {
 			release_database(pinned);
-			return R::err("cannot register sqlite file holder", Err::UNSUPPORTED);
+			return sql_fail("cannot register sqlite file holder", Err::UNSUPPORTED);
 		}
 	}
 #endif
 	const int code = sqlite3_open_v2(raw.get_data(), &handle, flags, vfs);
 	if (code != SQLITE_OK) {
-		const Ref<R> err = db_error(handle, code, "cannot open sqlite database");
+		const Ref<Err> err = db_error(handle, code, "cannot open sqlite database");
 		if (handle) {
 			sqlite3_close_v2(handle);
 		}
 #ifdef UNIX_ENABLED
 		release_database(pinned);
 #endif
-		return err;
+		return sql_fail(err);
 	}
 	sqlite3_extended_result_codes(handle, 1);
 	sqlite3_busy_timeout(handle, busy_ms);
@@ -714,15 +751,15 @@ Ref<R> GDSQLiteDB::open(const String &p_path, const Dictionary &p_opts) {
 	sqlite3_db_config(handle, SQLITE_DBCONFIG_DEFENSIVE, 1, nullptr);
 	sqlite3_db_config(handle, SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0, nullptr);
 	// Keep updates within the pinned database and memory without opening sidecars through the original path.
-	const String setup = vformat("PRAGMA journal_mode=MEMORY; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-%d", SQLITE_CACHE_KIB);
+	const String setup = vformat("PRAGMA journal_mode=%s; PRAGMA foreign_keys=%s; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-%d", memory ? "MEMORY" : "DELETE", foreign_keys ? "ON" : "OFF", SQLITE_CACHE_KIB);
 	const int setup_code = sqlite3_exec(handle, setup.utf8().get_data(), nullptr, nullptr, nullptr);
 	if (setup_code != SQLITE_OK) {
-		const Ref<R> err = db_error(handle, setup_code, "cannot configure sqlite database");
+		const Ref<Err> err = db_error(handle, setup_code, "cannot configure sqlite database");
 		sqlite3_close_v2(handle);
 #ifdef UNIX_ENABLED
 		release_database(pinned);
 #endif
-		return err;
+		return sql_fail(err);
 	}
 	sqlite3_set_authorizer(handle, authorize, nullptr);
 
@@ -736,11 +773,11 @@ Ref<R> GDSQLiteDB::open(const String &p_path, const Dictionary &p_opts) {
 	out->pinned_id = pinned;
 #endif
 	sqlite3_progress_handler(handle, 10000, GDSQLiteDB::stop, out.ptr());
-	return R::ok(out);
+	return sql_ok(out);
 }
 
 // Prepare SQL and select binding and result shape for the API entry point.
-Ref<R> GDSQLiteDB::run(const String &p_sql, const Array &p_params, RunMode p_mode, const SafeFlag *p_stop) {
+VariantPair GDSQLiteDB::run(const String &p_sql, const Array &p_params, RunMode p_mode, const SafeFlag *p_stop) {
 	MutexLock lock(mutex);
 	// Expose cancellation only during this call so the next operation does not inherit it.
 	struct StopScope {
@@ -750,14 +787,14 @@ Ref<R> GDSQLiteDB::run(const String &p_sql, const Array &p_params, RunMode p_mod
 	stop_flag = p_stop;
 	StopScope stop_scope{ stop_flag };
 	if (!db) {
-		return R::err("sqlite database is closed", Err::INVALID_DATA);
+		return sql_fail("sqlite database is closed", Err::INVALID_DATA);
 	}
 	if (p_sql.is_empty() || utf8_bytes(p_sql) > sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, -1)) {
-		return R::err("sqlite SQL length is outside the limit", Err::LIMITED);
+		return sql_fail("sqlite SQL length is outside the limit", Err::LIMITED);
 	}
 	const CharString sql = p_sql.utf8();
 	if (p_params.size() > sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1)) {
-		return R::err("sqlite parameter count exceeds the limit", Err::LIMITED);
+		return sql_fail("sqlite parameter count exceeds the limit", Err::LIMITED);
 	}
 	due = max_ms > 0 ? GDClock::msec() + max_ms : 0;
 
@@ -766,9 +803,9 @@ Ref<R> GDSQLiteDB::run(const String &p_sql, const Array &p_params, RunMode p_mod
 	if (found) {
 		stmt.reuse(found->value.stmt, stmts, stmt_bytes, p_sql);
 	} else {
-		const Ref<R> failed = prepare_stmt(db, p_sql, stmt);
+		const Ref<Err> failed = prepare_stmt(db, p_sql, stmt);
 		if (failed.is_valid()) {
-			return failed;
+			return sql_fail(failed);
 		}
 		const int64_t bytes = int64_t(p_sql.length()) * sizeof(char32_t) + sqlite3_stmt_status(stmt.get(), SQLITE_STMTSTATUS_MEMUSED, 0);
 		if (stmts.size() >= STMT_MAX || stmt_bytes + bytes > STMT_BYTES_MAX) {
@@ -784,12 +821,12 @@ Ref<R> GDSQLiteDB::run(const String &p_sql, const Array &p_params, RunMode p_mod
 }
 
 // Bind and execute a prepared program.
-Ref<R> GDSQLiteDB::execute(sqlite3_stmt *p_stmt, const Array &p_params, RunMode p_mode) {
+VariantPair GDSQLiteDB::execute(sqlite3_stmt *p_stmt, const Array &p_params, RunMode p_mode) {
 	if (p_params.size() > sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1)) {
-		return R::err("sqlite parameter count exceeds the limit", Err::LIMITED);
+		return sql_fail("sqlite parameter count exceeds the limit", Err::LIMITED);
 	}
 	if (sqlite3_bind_parameter_count(p_stmt) != p_params.size()) {
-		return R::err("sqlite parameter count does not match", Err::INVALID_DATA);
+		return sql_fail("sqlite parameter count does not match", Err::INVALID_DATA);
 	}
 	int code = SQLITE_OK;
 	for (int i = 0; i < p_params.size(); i++) {
@@ -798,19 +835,19 @@ Ref<R> GDSQLiteDB::execute(sqlite3_stmt *p_stmt, const Array &p_params, RunMode 
 			const CharString name = (String("$") + String::num_int64(i + 1)).utf8();
 			at = sqlite3_bind_parameter_index(p_stmt, name.get_data());
 			if (at == 0) {
-				return R::err(vformat("portable SQL parameter $%d is missing", i + 1), Err::INVALID_DATA);
+				return sql_fail(vformat("portable SQL parameter $%d is missing", i + 1), Err::INVALID_DATA);
 			}
 		}
 		code = bind_one(p_stmt, at, p_params[i]);
 		if (code == SQLITE_MISMATCH) {
-			return R::err(vformat("sqlite parameter %d has an unsupported type", i + 1), Err::INVALID_DATA);
+			return sql_fail(vformat("sqlite parameter %d has an unsupported type", i + 1), Err::INVALID_DATA);
 		}
 		if (code != SQLITE_OK) {
-			return db_error(db, code, "cannot bind sqlite parameter");
+			return sql_fail(db_error(db, code, "cannot bind sqlite parameter"));
 		}
 	}
 	if ((p_mode == RUN_QUERY || p_mode == RUN_GET) && !sqlite3_stmt_readonly(p_stmt)) {
-		return R::err("sqlite query accepts read-only SQL", Err::PERMISSION_DENIED);
+		return sql_fail("sqlite query accepts read-only SQL", Err::PERMISSION_DENIED);
 	}
 
 	Array rows;
@@ -827,7 +864,7 @@ Ref<R> GDSQLiteDB::execute(sqlite3_stmt *p_stmt, const Array &p_params, RunMode 
 			continue;
 		}
 		if (max_rows > 0 && rows.size() >= max_rows) {
-			return R::err("sqlite result row count exceeds the limit", Err::LIMITED);
+			return sql_fail("sqlite result row count exceeds the limit", Err::LIMITED);
 		}
 		Dictionary row;
 		const int count = sqlite3_column_count(p_stmt);
@@ -836,41 +873,43 @@ Ref<R> GDSQLiteDB::execute(sqlite3_stmt *p_stmt, const Array &p_params, RunMode 
 			const int64_t cell_bytes = ((type == SQLITE_TEXT || type == SQLITE_BLOB) ? sqlite3_column_bytes(p_stmt, i) : 8) + strlen(sqlite3_column_name(p_stmt, i)) + 16;
 			result_bytes += cell_bytes;
 			if (max_bytes > 0 && result_bytes > max_bytes) {
-				return R::err("sqlite result byte count exceeds the limit", Err::LIMITED);
+				return sql_fail("sqlite result byte count exceeds the limit", Err::LIMITED);
 			}
-			row[String::utf8(sqlite3_column_name(p_stmt, i))] = column_of(p_stmt, i);
+			const VariantPair cell = column_of(p_stmt, i);
+			if (cell.error.get_type() != Variant::NIL) return sql_fail(Ref<Err>(cell.error)->note(vformat("sqlite column %d", i + 1)));
+			row[String::utf8(sqlite3_column_name(p_stmt, i))] = cell.value;
 		}
 		if (p_mode == RUN_GET || p_mode == RUN_PORTABLE_ONE) {
 			// Finish the statement before reporting a row whose write may still fail to commit.
 			const int ended = sqlite3_reset(p_stmt);
-			return ended == SQLITE_OK ? R::ok(row) : db_error(db, ended, "cannot finish sqlite SQL");
+			return ended == SQLITE_OK ? sql_ok(row) : sql_fail(db_error(db, ended, "cannot finish sqlite SQL"));
 		}
 		rows.push_back(row);
 	}
 	if (code != SQLITE_DONE) {
-		return db_error(db, code, "cannot execute sqlite SQL");
+		return sql_fail(db_error(db, code, "cannot execute sqlite SQL"));
 	}
 	if (p_mode == RUN_QUERY) {
-		return R::ok(rows);
+		return sql_ok(rows);
 	}
 	if (p_mode == RUN_GET || p_mode == RUN_PORTABLE_ONE) {
-		return R::err("database query returned no rows", Err::NOT_FOUND);
+		return sql_fail("database query returned no rows", Err::NOT_FOUND);
 	}
 	if (p_mode == RUN_PORTABLE) {
 		Dictionary out;
 		out["columns"] = columns;
 		out["rows"] = rows;
 		out["tag"] = sqlite3_stmt_readonly(p_stmt) ? vformat("SELECT %d", rows.size()) : vformat("CHANGE %d", sqlite3_changes64(db));
-		return R::ok(out);
+		return sql_ok(out);
 	}
 	Dictionary out;
 	out["changes"] = int64_t(sqlite3_changes64(db));
 	out["last_id"] = int64_t(sqlite3_last_insert_rowid(db));
-	return R::ok(out);
+	return sql_ok(out);
 }
 
 // Prepare a shared Rows statement owned by the embedded SQL worker.
-Ref<R> GDSQLiteDB::open_rows(GDDatabaseRows *p_rows, const String &p_sql, const Array &p_params, const SafeFlag *p_stop) {
+Ref<Err> GDSQLiteDB::open_rows(GDDatabaseRows *p_rows, const String &p_sql, const Array &p_params, const SafeFlag *p_stop) {
 	MutexLock lock(mutex);
 	struct StopScope {
 		const SafeFlag *&flag;
@@ -879,29 +918,29 @@ Ref<R> GDSQLiteDB::open_rows(GDDatabaseRows *p_rows, const String &p_sql, const 
 	stop_flag = p_stop;
 	StopScope stop_scope{ stop_flag };
 	if (!db || !p_rows) {
-		return R::err("sqlite database is closed", Err::INTERRUPTED);
+		return Err::make("sqlite database is closed", Err::INTERRUPTED);
 	}
 	if (p_params.size() > sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1)) {
-		return R::err("sqlite parameter count exceeds the limit", Err::LIMITED);
+		return Err::make("sqlite parameter count exceeds the limit", Err::LIMITED);
 	}
 	due = max_ms > 0 ? GDClock::msec() + max_ms : 0;
 	Stmt prepared_stmt;
-	const Ref<R> prepared_result = prepare_stmt(db, p_sql, prepared_stmt);
+	const Ref<Err> prepared_result = prepare_stmt(db, p_sql, prepared_stmt);
 	if (prepared_result.is_valid()) {
 		return prepared_result;
 	}
 	if (sqlite3_bind_parameter_count(prepared_stmt.get()) != p_params.size()) {
-		return R::err("sqlite parameter count does not match", Err::INVALID_DATA);
+		return Err::make("sqlite parameter count does not match", Err::INVALID_DATA);
 	}
 	for (int i = 0; i < p_params.size(); i++) {
 		const CharString name = (String("$") + String::num_int64(i + 1)).utf8();
 		const int at = sqlite3_bind_parameter_index(prepared_stmt.get(), name.get_data());
 		if (at == 0) {
-			return R::err(vformat("portable SQL parameter $%d is missing", i + 1), Err::INVALID_DATA);
+			return Err::make(vformat("portable SQL parameter $%d is missing", i + 1), Err::INVALID_DATA);
 		}
 		const int code = bind_one(prepared_stmt.get(), at, p_params[i]);
 		if (code == SQLITE_MISMATCH) {
-			return R::err(vformat("sqlite parameter %d has an unsupported type", i + 1), Err::INVALID_DATA);
+			return Err::make(vformat("sqlite parameter %d has an unsupported type", i + 1), Err::INVALID_DATA);
 		}
 		if (code != SQLITE_OK) {
 			return db_error(db, code, "cannot bind sqlite parameter");
@@ -913,7 +952,7 @@ Ref<R> GDSQLiteDB::open_rows(GDDatabaseRows *p_rows, const String &p_sql, const 
 		columns.push_back(String::utf8(sqlite3_column_name(prepared_stmt.get(), i)));
 	}
 	p_rows->sqlite_opened(prepared_stmt.release(), columns);
-	return R::ok();
+	return Ref<Err>();
 }
 
 // Advance a shared Rows statement by one row with sqlite3_step.
@@ -938,29 +977,36 @@ bool GDSQLiteDB::step_rows(GDDatabaseRows *p_rows) {
 	stop_flag = &p_rows->stopped;
 	StopScope stop_scope{ stop_flag };
 	const int code = sqlite3_step(active);
+	Ref<Err> error;
 	if (code == SQLITE_ROW) {
 		Array values;
 		const int count = sqlite3_column_count(active);
 		values.resize(count);
 		for (int i = 0; i < count; i++) {
-			values[i] = column_of(active, i);
+			const VariantPair cell = column_of(active, i);
+			if (cell.error.get_type() != Variant::NIL) {
+				error = Ref<Err>(cell.error)->note(vformat("sqlite column %d", i + 1));
+				break;
+			}
+			values[i] = cell.value;
 		}
-		p_rows->sqlite_result(values, false, Ref<Err>(), String());
-		return false;
+		if (error.is_null()) {
+			p_rows->sqlite_result(values, false, Ref<Err>(), String());
+			return false;
+		}
 	}
 	String complete_tag;
-	Ref<Err> error;
-	if (code == SQLITE_DONE) {
+	if (error.is_null() && code == SQLITE_DONE) {
 		int64_t count = 0;
 		{
 			MutexLock rows_lock(p_rows->mutex);
 			count = p_rows->row_count;
 		}
 		complete_tag = sqlite3_stmt_readonly(active) ? vformat("SELECT %d", count) : vformat("CHANGE %d", sqlite3_changes64(db));
-	} else if (p_rows->stopped.is_set()) {
+	} else if (error.is_null() && p_rows->stopped.is_set()) {
 		error = Err::make("database Rows was closed", Err::INTERRUPTED);
-	} else {
-		error = db_error(db, code, "cannot advance sqlite Rows")->get_e();
+	} else if (error.is_null()) {
+		error = db_error(db, code, "cannot advance sqlite Rows");
 	}
 	sqlite3_finalize(active);
 	{
@@ -988,7 +1034,7 @@ void GDSQLiteDB::close_rows(GDDatabaseRows *p_rows) {
 	if (active) {
 		const int code = sqlite3_finalize(active);
 		if (code != SQLITE_OK) {
-			const Ref<Err> error = db_error(db, code, "cannot close sqlite Rows")->get_e();
+			const Ref<Err> error = db_error(db, code, "cannot close sqlite Rows");
 			MutexLock rows_lock(p_rows->mutex);
 			if (p_rows->failed.is_null()) {
 				p_rows->failed = error;
@@ -998,36 +1044,36 @@ void GDSQLiteDB::close_rows(GDDatabaseRows *p_rows) {
 }
 
 // Create a prepared statement that parses SQL once.
-Ref<R> GDSQLiteDB::prepare(const String &p_sql) {
+VariantPair GDSQLiteDB::prepare(const String &p_sql) {
 	MutexLock lock(mutex);
 	if (!db) {
-		return R::err("sqlite database is closed", Err::INVALID_DATA);
+		return sql_fail("sqlite database is closed", Err::INVALID_DATA);
 	}
 	due = max_ms > 0 ? GDClock::msec() + max_ms : 0;
 	Stmt stmt;
-	const Ref<R> failed = prepare_stmt(db, p_sql, stmt);
+	const Ref<Err> failed = prepare_stmt(db, p_sql, stmt);
 	if (failed.is_valid()) {
-		return failed;
+		return sql_fail(failed);
 	}
 	if (sqlite3_bind_parameter_count(stmt.get()) > sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1)) {
-		return R::err("sqlite parameter count exceeds the limit", Err::LIMITED);
+		return sql_fail("sqlite parameter count exceeds the limit", Err::LIMITED);
 	}
 	Ref<GDSQLiteStatement> out;
 	out.instantiate();
 	out->owner = Ref<GDSQLiteDB>(this);
 	out->stmt = stmt.release();
 	prepared.insert(out.ptr());
-	return R::ok(out);
+	return sql_ok(out);
 }
 
 // Execute an explicit prepared statement under the connection lock.
-Ref<R> GDSQLiteDB::run_prepared(GDSQLiteStatement *p_owner, const Array &p_params, RunMode p_mode) {
+VariantPair GDSQLiteDB::run_prepared(GDSQLiteStatement *p_owner, const Array &p_params, RunMode p_mode) {
 	MutexLock lock(mutex);
 	if (!db || !prepared.has(p_owner) || !p_owner->stmt) {
-		return R::err("sqlite prepared statement is closed", Err::INVALID_DATA);
+		return sql_fail("sqlite prepared statement is closed", Err::INVALID_DATA);
 	}
 	due = max_ms > 0 ? GDClock::msec() + max_ms : 0;
-	Ref<R> out;
+	VariantPair out;
 	{
 		ResetStmt reset(p_owner->stmt);
 		out = execute(p_owner->stmt, p_params, p_mode);
@@ -1036,58 +1082,61 @@ Ref<R> GDSQLiteDB::run_prepared(GDSQLiteStatement *p_owner, const Array &p_param
 }
 
 // Execute a write statement for multiple argument sets in one native call.
-Ref<R> GDSQLiteDB::run_many_prepared(GDSQLiteStatement *p_owner, const Array &p_rows) {
+VariantPair GDSQLiteDB::run_many_prepared(GDSQLiteStatement *p_owner, const Array &p_rows) {
 	MutexLock lock(mutex);
 	if (!db || !prepared.has(p_owner) || !p_owner->stmt) {
-		return R::err("sqlite prepared statement is closed", Err::INVALID_DATA);
+		return sql_fail("sqlite prepared statement is closed", Err::INVALID_DATA);
 	}
 	due = max_ms > 0 ? GDClock::msec() + max_ms : 0;
 	sqlite3_stmt *stmt = p_owner->stmt;
 	if (sqlite3_stmt_readonly(stmt)) {
-		return R::err("sqlite run_many accepts update SQL", Err::PERMISSION_DENIED);
+		return sql_fail("sqlite run_many accepts update SQL", Err::PERMISSION_DENIED);
 	}
 	if (p_rows.is_empty()) {
-		return R::err("sqlite batch size is outside the limit", Err::LIMITED);
+		Dictionary out;
+		out["changes"] = int64_t(0);
+		out["last_id"] = int64_t(sqlite3_last_insert_rowid(db));
+		return sql_ok(out);
 	}
 
 	const int expected = sqlite3_bind_parameter_count(stmt);
 	uint64_t input_count = 0;
 	for (int row_at = 0; row_at < p_rows.size(); row_at++) {
 		if (due > 0 && (row_at & 255) == 255 && GDClock::msec() > due) {
-			return R::err("sqlite batch validation timed out", Err::TIMED_OUT);
+			return sql_fail("sqlite batch validation timed out", Err::TIMED_OUT);
 		}
 		if (p_rows[row_at].get_type() != Variant::ARRAY) {
-			return R::err(vformat("sqlite batch row %d is not an Array", row_at + 1), Err::INVALID_DATA);
+			return sql_fail(vformat("sqlite batch row %d is not an Array", row_at + 1), Err::INVALID_DATA);
 		}
 		const Array params = p_rows[row_at];
 		if (params.size() != expected) {
-			return R::err(vformat("sqlite batch row %d parameter count does not match", row_at + 1), Err::INVALID_DATA);
+			return sql_fail(vformat("sqlite batch row %d parameter count does not match", row_at + 1), Err::INVALID_DATA);
 		}
 		for (int i = 0; i < params.size(); i++) {
 			input_count++;
 			const int64_t bytes = value_bytes(params[i]);
 			if (bytes < 0) {
-				return R::err(vformat("sqlite batch row %d parameter %d has an unsupported type", row_at + 1, i + 1), Err::INVALID_DATA);
+				return sql_fail(vformat("sqlite batch row %d parameter %d has an unsupported type", row_at + 1, i + 1), Err::INVALID_DATA);
 			}
 			if (due > 0 && (input_count & 1023) == 0 && GDClock::msec() > due) {
-				return R::err("sqlite batch validation timed out", Err::TIMED_OUT);
+				return sql_fail("sqlite batch validation timed out", Err::TIMED_OUT);
 			}
 		}
 	}
 
-	Ref<R> failed;
+	Ref<Err> failed;
 	int64_t changes = 0;
 	{
 		ResetStmt reset(stmt);
 		failed = execute_many(db, stmt, p_rows, due, changes);
 	}
 	if (failed.is_valid()) {
-		return failed;
+		return sql_fail(failed);
 	}
 	Dictionary out;
 	out["changes"] = changes;
 	out["last_id"] = int64_t(sqlite3_last_insert_rowid(db));
-	return R::ok(out);
+	return sql_ok(out);
 }
 
 // Detach and release an explicit prepared statement.
@@ -1114,23 +1163,23 @@ GDSQLiteStatement::~GDSQLiteStatement() {
 }
 
 // Execute a write statement and return affected rows.
-Ref<R> GDSQLiteStatement::run(const Array &p_params) {
-	return owner.is_valid() ? owner->run_prepared(this, p_params, GDSQLiteDB::RUN_EXEC) : R::err("sqlite prepared statement is closed", Err::INVALID_DATA);
+VariantPair GDSQLiteStatement::run(const Array &p_params) {
+	return owner.is_valid() ? owner->run_prepared(this, p_params, GDSQLiteDB::RUN_EXEC) : sql_fail("sqlite prepared statement is closed", Err::INVALID_DATA);
 }
 
 // Execute a write statement for multiple argument sets.
-Ref<R> GDSQLiteStatement::run_many(const Array &p_rows) {
-	return owner.is_valid() ? owner->run_many_prepared(this, p_rows) : R::err("sqlite prepared statement is closed", Err::INVALID_DATA);
+VariantPair GDSQLiteStatement::run_many(const Array &p_rows) {
+	return owner.is_valid() ? owner->run_many_prepared(this, p_rows) : sql_fail("sqlite prepared statement is closed", Err::INVALID_DATA);
 }
 
 // Return the first read-only query row.
-Ref<R> GDSQLiteStatement::one(const Array &p_params) {
-	return owner.is_valid() ? owner->run_prepared(this, p_params, GDSQLiteDB::RUN_GET) : R::err("sqlite prepared statement is closed", Err::INVALID_DATA);
+VariantPair GDSQLiteStatement::one(const Array &p_params) {
+	return owner.is_valid() ? owner->run_prepared(this, p_params, GDSQLiteDB::RUN_GET) : sql_fail("sqlite prepared statement is closed", Err::INVALID_DATA);
 }
 
 // Return all read-only query rows.
-Ref<R> GDSQLiteStatement::all(const Array &p_params) {
-	return owner.is_valid() ? owner->run_prepared(this, p_params, GDSQLiteDB::RUN_QUERY) : R::err("sqlite prepared statement is closed", Err::INVALID_DATA);
+VariantPair GDSQLiteStatement::all(const Array &p_params) {
+	return owner.is_valid() ? owner->run_prepared(this, p_params, GDSQLiteDB::RUN_QUERY) : sql_fail("sqlite prepared statement is closed", Err::INVALID_DATA);
 }
 
 // Release the prepared statement explicitly.
@@ -1153,10 +1202,10 @@ void GDSQLiteStatement::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("all", "params"), &GDSQLiteStatement::all, DEFVAL(Array()));
 	ClassDB::bind_method(D_METHOD("close"), &GDSQLiteStatement::close);
 	ClassDB::bind_method(D_METHOD("is_valid"), &GDSQLiteStatement::is_valid);
-	ADD_RESULT("run", "Dictionary");
-	ADD_RESULT("run_many", "Dictionary");
-	ADD_RESULT("one", "Variant");
-	ADD_RESULT("all", "Array");
+	ADD_PAIR_RESULT("run", "Dictionary");
+	ADD_PAIR_RESULT("run_many", "Dictionary");
+	ADD_PAIR_RESULT("one", "Variant");
+	ADD_PAIR_RESULT("all", "Array");
 }
 
 // Interrupt an operation running on another thread.
@@ -1199,7 +1248,7 @@ void GDSQLiteDB::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("prepare", "sql"), &GDSQLiteDB::prepare);
 	ClassDB::bind_method(D_METHOD("close"), &GDSQLiteDB::close);
 	ClassDB::bind_method(D_METHOD("is_open"), &GDSQLiteDB::is_open);
-	ADD_RESULT("exec", "Dictionary");
-	ADD_RESULT("query", "Array");
-	ADD_RESULT("prepare", "GDSQLiteStatement");
+	ADD_PAIR_RESULT("exec", "Dictionary");
+	ADD_PAIR_RESULT("query", "Array");
+	ADD_PAIR_RESULT("prepare", "GDSQLiteStatement");
 }

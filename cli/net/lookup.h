@@ -12,7 +12,7 @@ class GDLookupJob : public PoolJob {
 	GDCLASS(GDLookupJob, PoolJob);
 	String host; // Resolver input with case and zone preserved.
 	List<Ref<GDLookupCall>> calls; // Independent callers awaiting the shared result.
-	Ref<R> result; // All address candidates passed from the worker to the main thread.
+	VariantPair result; // Address candidates and failure passed from the worker to the main thread.
 	friend class GDLookupCall;
 
 protected:
@@ -29,8 +29,10 @@ class GDLookupCall : public RefCounted {
 	List<Ref<GDLookupCall>>::Element *entry = nullptr; // List position for constant-time cancellation.
 	int port = -1; // Check resolved-IP permissions when resolution precedes a connection.
 	bool single = false; // Whether the public resolver expects a single value.
+	VariantPair pending; // Numeric address delivered after the caller can connect.
 	friend class GDLookupJob;
-	void done(const Ref<R> &p_result); // Adapt the shared result to this caller's result shape.
+	void done(const VariantPair &p_result); // Adapt the shared result to this caller's result shape.
+	void deliver(); // Deliver a numeric result on the next runtime turn.
 
 protected:
 	static void _bind_methods(); // Register completion and cancellation only.
@@ -43,5 +45,5 @@ public:
 
 namespace GDLookup {
 // Return all candidates in OS order for connection retries by address family.
-Ref<R> all(const String &p_host);
+VariantPair all(const String &p_host);
 }

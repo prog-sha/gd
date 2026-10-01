@@ -36,11 +36,15 @@ class GDWait : public RefCounted {
 	HashMap<int, int> shared; // Input index to the earlier index it repeats, for ALL over one signal given twice.
 	Array values; // Values collected for ALL.
 	Variant ready_value; // Value to forward when no suspension is needed.
+	Variant ready_error; // Error for an already completed two-result operation.
 	bool has_ready_value = false; // Distinguish null from an empty aggregate result.
+	bool pair_ready = false; // Deliver an already completed operation through two signal arguments.
 	// Retain the continuation source of spawned work.
 	// Without ownership, it could disappear before resumption.
 	Ref<RefCounted> hold_obj;
+	Signal observed; // Operation completion monitored while a context owns the wait.
 	Callable spawn_fn; // Work started on the next runtime turn.
+	uint64_t scope = 0; // Logical coroutine scope inherited by spawned work.
 	Ref<RefCounted> cancel_context; // Retain the cancellation source until completion.
 	Array rivals; // Signals participating in the race.
 	bool pending = false; // No input remains to await; delivery is deferred to the next turn.
@@ -51,14 +55,15 @@ class GDWait : public RefCounted {
 	bool posted = false; // Prevent duplicate insertion into the completion queue.
 
 	void step(); // Advance the wait on event-loop notification.
-	void spawn_result(const Variant &p_value); // Await returned operations or deliver a spawned value.
+	void spawn_result(const Variant &p_value, const Variant &p_error = Variant()); // Await returned operations or deliver a spawned value.
 	void post(); // Deliver retained completion on the next event-loop turn.
 	// Cancel losing timers rather than retaining them until expiry.
 	void drop_rivals();
 	// Receive an input signal with any argument count.
 	Variant rang(const Variant **p_args, int p_count, Callable::CallError &r_err);
 	void cancel_target(); // Forward context cancellation to the awaited operation.
-	void done(const Variant &p_value);
+	void drop_observed(); // Remove the context wrapper's operation subscription.
+	void done(const Variant &p_value, const Variant *p_error = nullptr);
 	void abandon();
 	void cancel(); // Release a wait without delivering a result.
 	void retain(); // Retain through completion and register shutdown cleanup.
@@ -96,10 +101,12 @@ protected:
 public:
 	// Cancel once; repeated calls do nothing.
 	void cancel(const String &p_msg, Err::Kind p_kind);
+	void cancel_value(const String &p_msg, const Ref<Err> &p_kind);
 	// Create a child inheriting parent cancellation.
 	Ref<GDAsyncContext> with_cancel();
 	// Set a deadline that cancels the context automatically.
 	Ref<GDAsyncContext> with_timeout(double p_sec);
+	// Return whether cancellation or the deadline has completed this context.
 	bool is_done() const { return done; }
 	Ref<Err> get_reason() const { return reason; }
 	~GDAsyncContext();
@@ -108,6 +115,9 @@ public:
 // Internal wait composition exposed through GD.async.
 class Async {
 public:
+	// Identify work resumed from one logical coroutine across await boundaries.
+	static uint64_t scope();
+	static void set_scope(uint64_t p_scope);
 	// One retained callback published to the main-thread ready queue.
 	struct Post {
 		Ref<RefCounted> hold; // Target ownership kept through callback delivery.
@@ -132,6 +142,8 @@ public:
 	static Ref<GDWait> start_race(const Array &p_signals);
 	// Deliver an already-ready value on the next turn.
 	static Signal ready(const Variant &p_value);
+	// Deliver native value and error slots on the next runtime turn.
+	static Signal ready_pair(const VariantPair &p_pair);
 	// Pack signal arguments into null, one value, or an array of values.
 	static Variant signal_value(const Variant **p_args, int p_count);
 
@@ -140,6 +152,8 @@ public:
 	// Start a Callable and return its completion signal.
 	// Support concurrent script coroutines without discarding their completion.
 	static Signal spawn(const Callable &p_fn);
+	// Run a Callable whose completion has separate value and error slots.
+	static Signal spawn_pair(const Callable &p_fn);
 	// Start supplied Callables, await their results and supplied Signals, and preserve input order.
 	static Signal all(const Array &p_signals);
 	// Wait for the first signal and return its winning index.
@@ -147,11 +161,29 @@ public:
 	// Return zero if completion beats the deadline, otherwise one.
 	static Signal with_timeout(const Signal &p_signal, double p_sec);
 	// Propagate context cancellation and return the operation's completion value.
-	static Signal with_context(const Ref<GDAsyncContext> &p_context, const Signal &p_signal);
+	static Signal with_context(const Ref<GDAsyncContext> &p_context, const Signal &p_signal, bool p_pair = false);
+	// Emit an operation's completion, or hold it while a preempted task may still attach its listener.
+	// Preemption happens between any two instructions, so an operation started just before it could otherwise
+	// finish, lose its only result, and be freed before the task reaches its own await or all().
+	template <typename... A>
+	static void finish(Object *p_obj, const StringName &p_signal, const A &...p_args) {
+		if (!must_hold(p_obj, p_signal)) {
+			p_obj->emit_signal(p_signal, p_args...);
+			return;
+		}
+		hold(p_obj, p_signal, Vector<Variant>{ Variant(p_args)... });
+	}
+	// Count tasks suspended by a time slice rather than by await.
+	static void preempted(bool p_on);
 	// Return seconds until the nearest asynchronous timer.
 	static double time_to_next_timer();
 	// Add an external I/O deadline to kernel waiting and remove it on completion.
 	static void track_deadline(const void *p_owner, uint64_t p_due, const Callable &p_call = Callable());
 	static void drop_deadline(const void *p_owner, uint64_t p_due);
 	static Ref<GDAsyncContext> ctx();
+
+private:
+	static bool must_hold(Object *p_obj, const StringName &p_signal); // Whether nobody can observe the completion yet.
+	static void hold(Object *p_obj, const StringName &p_signal, const Vector<Variant> &p_args); // Keep a completion for later delivery.
+	static void release_held(); // Emit held completions once no task is preempted.
 };

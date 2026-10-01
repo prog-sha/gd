@@ -5,12 +5,19 @@ Import("env")
 
 env.scene_sources = []
 
-# Godot source files
-env.add_source_files(env.scene_sources, "*.cpp")
+# Select display registration only for the view executable.
+if env["view"]:
+    sources = [item for item in Glob("*.cpp") if item.name != "register_scene_types.cpp"]
+    sources.append(File("#tmp/view-src/scene/register_scene_types.cpp"))
+    env.add_source_files(env.scene_sources, sources)
+else:
+    env.add_source_files(env.scene_sources, "*.cpp")
 
 # Chain load SCsubs
 SConscript("main/SCsub")
 SConscript("resources/SCsub")
+if env["view"]:
+    SConscript("#game/scene/SCsub")
 
 # Build it all as a library
 lib = env.add_library("scene", env.scene_sources)

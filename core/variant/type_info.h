@@ -158,6 +158,10 @@ struct GetTypeInfo<Variant> {
 	}
 };
 
+// Describe the first result of a native pair as a dynamic script value.
+template <>
+struct GetTypeInfo<VariantPair> : GetTypeInfo<Variant> {};
+
 #define MAKE_TEMPLATE_TYPE_INFO(m_template, m_type, m_var_type) \
 	template <> \
 	struct GetTypeInfo<m_template<m_type>> { \

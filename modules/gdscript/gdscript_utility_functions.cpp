@@ -33,6 +33,7 @@
 #include "gdscript.h"
 
 #include "core/io/resource_loader.h"
+#include "cli/sys/std.h"
 #include "core/object/class_db.h"
 #include "core/object/object.h"
 #include "cli/sys/perm.h"
@@ -99,6 +100,46 @@
 	}
 
 struct GDScriptUtilityFunctionsDefinitions {
+	// Build a failure with optional category, details, and completed work.
+	static inline void _Err(Variant *r_ret, const Variant **p_args, int p_arg_count, Callable::CallError &r_error) {
+		if (p_arg_count > 4) {
+			*r_ret = Variant();
+			r_error.error = Callable::CallError::CALL_ERROR_TOO_MANY_ARGUMENTS;
+			r_error.expected = 4;
+			return;
+		}
+		if (p_arg_count > 0 && !Variant::can_convert_strict(p_args[0]->get_type(), Variant::STRING)) {
+			*r_ret = Variant();
+			r_error.error = Callable::CallError::CALL_ERROR_INVALID_ARGUMENT;
+			r_error.argument = 0;
+			r_error.expected = Variant::STRING;
+			return;
+		}
+		Ref<::Err> kind;
+		if (p_arg_count > 1) {
+			kind = *p_args[1];
+			if ((kind.is_null() && p_args[1]->get_type() != Variant::NIL) || (kind.is_valid() && !kind->is_shared())) {
+				*r_ret = Variant();
+				r_error.error = Callable::CallError::CALL_ERROR_INVALID_ARGUMENT;
+				r_error.argument = 1;
+				r_error.expected = Variant::OBJECT;
+				return;
+			}
+		}
+		if (p_arg_count > 2 && p_args[2]->get_type() != Variant::DICTIONARY) {
+			*r_ret = Variant();
+			r_error.error = Callable::CallError::CALL_ERROR_INVALID_ARGUMENT;
+			r_error.argument = 2;
+			r_error.expected = Variant::DICTIONARY;
+			return;
+		}
+		const String msg = p_arg_count > 0 ? String(*p_args[0]) : String();
+		const Dictionary info = p_arg_count > 2 ? Dictionary(*p_args[2]) : Dictionary();
+		const Variant partial = p_arg_count > 3 ? *p_args[3] : Variant();
+		const ::Err::Kind category = kind.is_valid() ? kind->get_kind() : ::Err::NONE;
+		*r_ret = msg.is_empty() && info.is_empty() && partial.get_type() == Variant::NIL ? ::Err::category(category) : ::Err::make(msg, category, info, partial);
+	}
+
 #ifndef DISABLE_DEPRECATED
 	static inline void convert(Variant *r_ret, const Variant **p_args, int p_arg_count, Callable::CallError &r_error) {
 		DEBUG_VALIDATE_ARG_COUNT(2, 2);
@@ -572,6 +613,7 @@ static void _register_function(const StringName &p_name, const MethodInfo &p_met
 
 void GDScriptUtilityFunctions::register_functions() {
 	/* clang-format off */
+	REGISTER_FUNC( _Err,          false, RETCLS("Err"),       ARGS( ARG("msg", STRING), PropertyInfo(Variant::OBJECT, "kind", PROPERTY_HINT_RESOURCE_TYPE, "Err"), ARG("info", DICTIONARY), ARGVAR("partial") ), false, varray( String(), Ref<::Err>(), Dictionary(), Variant() ));
 #ifndef DISABLE_DEPRECATED
 	REGISTER_FUNC( convert,        true,  RETVAR,             ARGS( ARGVAR("what"), ARGTYPE("type") ), false, varray(     ));
 	REGISTER_FUNC( type_exists,    true,  RET(BOOL),          ARGS( ARG("type", STRING_NAME)        ), false, varray(     ));

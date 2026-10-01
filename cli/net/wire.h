@@ -46,7 +46,7 @@ public:
 	// Default to plaintext locally and certificate plus hostname verification externally.
 	static Variant default_guard(const String &p_host);
 	// Prepare name resolution and optional CA-file loading for an I/O worker.
-	static Ref<R> prepare(const String &p_host, const String &p_ca_path);
+	static VariantPair prepare(const String &p_host, const String &p_ca_path);
 
 private:
 	Ref<GDStream> tcp;
@@ -98,7 +98,7 @@ class GDWireDial : public RefCounted {
 	Wire *owner = nullptr; // Detached first by Wire::close.
 	Signal pending; // Cancellation target for this shared-dial call.
 	friend class Wire;
-	void connected(const Ref<R> &p_result); // Transfer the connection to Wire and wake its caller.
+	void connected(const Variant &p_value, const Ref<Err> &p_error); // Transfer the connection to Wire and wake its caller.
 
 protected:
 	static void _bind_methods() {} // Keep the relay outside the script API.

@@ -20,11 +20,12 @@ class GDLogCall : public RefCounted {
 	GDCLASS(GDLogCall, RefCounted);
 
 	Ref<GDLogCall> self_hold; // Retain the call until writing completes.
-	Ref<R> value; // CPU-formatted line or formatting failure.
-	std::function<Ref<R>(const Ref<R> &)> writer; // Writer executed on the ordered I/O queue.
+	VariantPair value; // CPU-formatted line and its error.
+	bool prepared_ready = false; // Whether formatting finished for this queue entry.
+	std::function<Ref<Err>(const Variant &)> writer; // Writer executed on the ordered I/O queue.
 
-	void prepared(const Ref<R> &p_value); // Return formatted results to submission order.
-	void written(const Ref<R> &p_result); // Deliver the write result and release ownership.
+	void prepared(const Variant &p_value, const Variant &p_error); // Return formatted results to submission order.
+	void written(const Variant &p_value, const Variant &p_error); // Deliver the write error and release ownership.
 	static void drain(); // Send consecutive formatted entries to ordered I/O.
 
 protected:
@@ -32,7 +33,7 @@ protected:
 
 public:
 	// Reserve order before CPU formatting; an empty formatter acts as a barrier for prior logs.
-	static Signal start(std::function<Ref<R>()> p_format, std::function<Ref<R>(const Ref<R> &)> p_write);
+	static Signal start(std::function<VariantPair()> p_format, std::function<Ref<Err>(const Variant &)> p_write);
 };
 
 // Accept declared command-line flags and reject unknown ones.
@@ -61,11 +62,12 @@ public:
 	void flag_int(const String &p_name, int64_t p_fallback, const String &p_help);
 
 	// Accept both --name=value and --name value.
-	Ref<R> parse(const Array &p_args);
+	VariantPair parse(const Array &p_args);
 
 	bool get_bool(const String &p_name) const;
 	String get_str(const String &p_name) const;
 	int64_t get_int(const String &p_name) const;
+	// Return positional arguments left after parsing registered flags.
 	PackedStringArray get_rest() const { return rest; }
 	String usage() const; // Return usage guidance.
 };
@@ -109,7 +111,7 @@ private:
 	Signal warn(const String &p_msg, const Variant &p_extra);
 	Signal error(const String &p_msg, const Variant &p_extra);
 	// Log results directly, using ERROR for failures.
-	Signal result(const Ref<R> &p_r, const String &p_msg);
+	Signal result(const Ref<Err> &p_error, const String &p_msg);
 	String format(Level p_at, const String &p_msg, const Variant &p_extra) const;
 	String _line(Level p_at, const String &p_msg, const String &p_extra, bool p_color, int64_t p_time) const;
 };
@@ -119,8 +121,8 @@ class Net {
 public:
 	static bool is_free(int64_t p_port, const String &p_host); // Check availability by binding and immediately closing.
 	// Find a free port, using kernel selection when zero is requested.
-	static Ref<R> free_port(int64_t p_from, const String &p_host);
-	static Ref<R> local_addresses(); // Return local OS addresses or a failure with its original cause.
+	static VariantPair free_port(int64_t p_from, const String &p_host);
+	static VariantPair local_addresses(); // Return local OS addresses or a failure with its original cause.
 	static bool is_ip(const String &p_text);
 	// Split host:port, using the default when the port is absent.
 	static Dictionary split_host(const String &p_text, int64_t p_default_port);

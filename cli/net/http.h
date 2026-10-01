@@ -26,6 +26,18 @@
 // Return status reason text, also used outside transport framing by routes.
 const char *http_reason(int p_status);
 
+// Identify common response types without constructing a String for each reply.
+enum HttpType : uint8_t {
+	HTTP_TYPE_CUSTOM = 0, // Caller-supplied content type.
+	HTTP_TYPE_TEXT = 1, // Plain UTF-8 text.
+	HTTP_TYPE_HTML = 2, // UTF-8 HTML.
+	HTTP_TYPE_JSON = 3, // JSON bytes.
+	HTTP_TYPE_BYTES = 4, // Opaque bytes.
+};
+const char *http_type_bytes(HttpType p_type);
+int http_type_size(HttpType p_type);
+HttpType http_type_of(const String &p_type);
+
 constexpr int64_t HTTP_HEADER_LIMIT_MAX = INT_MAX - 4096; // Request-header boundary leaving read-ahead room within int-indexed storage.
 
 class GDWebServer : public RefCounted {
@@ -136,7 +148,8 @@ class GDWebServer : public RefCounted {
 		PackedByteArray reply_body; // Response body waiting for draining.
 		Ref<GDBodySource> reply_file; // Incremental body to send after draining.
 		String reply_type; // Response content type waiting for draining.
-		Dictionary reply_headers; // Additional response headers waiting for draining.
+		HttpType reply_kind = HTTP_TYPE_CUSTOM; // Fixed content type retained without a String.
+		std::unique_ptr<Dictionary> reply_headers; // Additional response headers waiting for draining.
 		bool reply_waiting = false; // Whether to send the retained response after draining.
 		int m_at = 0, m_len = 0; // Method position and length, such as GET.
 		int t_at = 0, t_len = 0; // Request-target position and length.
@@ -151,6 +164,9 @@ class GDWebServer : public RefCounted {
 	Callable ready_call; // Application serve task.
 	bool accept_ready = false; // Whether the listener is ready to accept.
 	bool accept_turn = true; // Alternate a saturated listener with already-runnable connections.
+	uint64_t accept_due = 0; // Timer for retrying temporary listener resource failures.
+	uint64_t accept_delay = 5; // Initial retry delay in milliseconds.
+	Ref<Err> accept_error; // Permanent listener failure retained for the application.
 	bool ready_posted = false; // Whether the serve task is already in the runtime queue.
 	bool polling = false; // Defer reentrant polling to the next runtime turn.
 	String type_memo; // Most recently transmitted content type.
@@ -171,7 +187,7 @@ class GDWebServer : public RefCounted {
 	bool h2_flush(Conn *p_c); // Flush one queued transport unit without blocking receive progress.
 	void h2_write(Conn *p_c); // Give ready response producers one fair flow-controlled turn each.
 	int h2_body(Conn *p_c, int64_t p_max, PackedByteArray &r_data, bool p_limit); // Consume DATA and return window credit through the physical connection.
-	void h2_reply(Conn *p_c, int64_t p_status, const PackedByteArray &p_body, const String &p_type, const Dictionary *p_extra, const Ref<GDBodySource> &p_file); // Submit a multiplexed response using existing body producers.
+	void h2_reply(Conn *p_c, int64_t p_status, const PackedByteArray &p_body, const String &p_type, const Dictionary *p_extra, const Ref<GDBodySource> &p_file, HttpType p_kind = HTTP_TYPE_CUSTOM); // Submit a multiplexed response using existing body producers.
 	void h2_done(Conn *p_c); // Retire completed streams or cancel unread bodies after their response is sent.
 	bool has_output(const Conn *p_c) const; // Report pending response headers or body bytes.
 	bool background_read(Conn *p_c, int p_end, bool p_write_open = false); // Retain one pipelined byte or detect a suspended producer's disconnect.
@@ -182,6 +198,7 @@ class GDWebServer : public RefCounted {
 	void rebuild_deadlines(); // Rebuild the deadline index when timeout settings change.
 	void arm_deadline(); // Pass the earliest receive deadline to the event loop.
 	void listener_ready(); // Mark the listener runnable.
+	void accept_retry(); // Resume accepting after a temporary resource failure.
 	void socket_ready(int p_id); // Mark only the ready connection runnable.
 	void deadline_ready(); // Mark connections that need deadline checks runnable.
 	void queue_ready(Conn *p_c); // Enqueue a connection once in the ready queue.
@@ -218,13 +235,13 @@ class GDWebServer : public RefCounted {
 	// Send 100 Continue only when body reading starts.
 	void send_continue(Conn *p_c);
 	// Drain unread input if necessary before sending the response.
-	void queue_reply(Conn *p_c, int64_t p_status, const PackedByteArray &p_body, const String &p_type, const Dictionary *p_extra);
+	void queue_reply(Conn *p_c, int64_t p_status, const PackedByteArray &p_body, const String &p_type, const Dictionary *p_extra, HttpType p_kind = HTTP_TYPE_CUSTOM);
 	// Drain unread input before sending a file response.
-	void queue_file_reply(Conn *p_c, int64_t p_status, const Ref<GDBodySource> &p_file, const String &p_type, const Dictionary *p_extra);
+	void queue_file_reply(Conn *p_c, int64_t p_status, const Ref<GDBodySource> &p_file, const String &p_type, const Dictionary *p_extra, HttpType p_kind = HTTP_TYPE_CUSTOM);
 	// Discard the completed request.
 	void consume(Conn *p_c);
 	// Assemble response headers and pass a shared body reference to transmission.
-	void build_out(Conn *p_c, int64_t p_status, const PackedByteArray &p_body, const String &p_type, const Dictionary *p_extra, bool p_consume = true, const Ref<GDBodySource> &p_file = Ref<GDBodySource>());
+	void build_out(Conn *p_c, int64_t p_status, const PackedByteArray &p_body, const String &p_type, const Dictionary *p_extra, bool p_consume = true, const Ref<GDBodySource> &p_file = Ref<GDBodySource>(), HttpType p_kind = HTTP_TYPE_CUSTOM);
 
 protected:
 	static void _bind_methods();
@@ -240,7 +257,7 @@ public:
 	void set_body_timeout(double p_seconds);
 	// Set the application task that processes ready connections.
 	void set_ready_callback(const Callable &p_call);
-	Ref<R> listen(int64_t p_port, const String &p_host);
+	VariantPair listen(int64_t p_port, const String &p_host);
 	void set_identity(const Ref<GDTLSIdentity> &p_identity) { identity = p_identity; } // Configure encryption before accepting connections.
 	// Return the actual listen port, including kernel-assigned ports.
 	int get_port() const;
@@ -250,6 +267,8 @@ public:
 	static bool share_port;
 	void stop();
 	bool is_listening() const;
+	// Return the terminal listener failure after accepting has stopped.
+	Ref<Err> get_failure() const { return accept_error; }
 
 	// Advance connections and return ready request IDs, valid until the next poll.
 	PackedInt32Array poll();
@@ -281,12 +300,16 @@ public:
 
 	// Submit the common response form with just content and type.
 	void respond(int p_id, int64_t p_status, const PackedByteArray &p_body, const String &p_type);
+	void abort_request(int p_id); // Stop only the failed request and keep the listener active.
+	void respond_fixed(int p_id, int64_t p_status, const PackedByteArray &p_body, HttpType p_type); // Emit a standard type from fixed wire bytes.
 	// Submit an assembled body directly, avoiding an intermediate copy.
 	void respond_bytes(int p_id, int p_status, const uint8_t *p_body, int p_len, const String &p_type);
 	// Submit a response with additional headers.
 	void respond_with(int p_id, int64_t p_status, const Dictionary &p_headers, const PackedByteArray &p_body);
 	// Stream worker-delivered file chunks as socket capacity becomes available.
 	void respond_file(int p_id, int64_t p_status, const Dictionary &p_headers, const Ref<GDBodySource> &p_file, const String &p_type);
+	void respond_file_plain(int p_id, int64_t p_status, const Ref<GDBodySource> &p_file, const String &p_type); // Stream without additional headers.
+	void respond_file_fixed(int p_id, int64_t p_status, const Ref<GDBodySource> &p_file, HttpType p_type); // Stream with a standard type.
 
 	int connection_count() const;
 	uint64_t dropped_headers() const { return drop_n; } // Cumulative number of omitted headers.

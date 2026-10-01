@@ -328,7 +328,8 @@ public:
 			return EXIT_FAILURE;
 		}
 		if (!FileAccess::exists(p_entry)) {
-			ERR_FAIL_V_MSG(EXIT_FAILURE, vformat("No such script: %s", p_entry));
+			OS::get_singleton()->printerr("error: no such script: %s\n", p_entry.utf8().get_data());
+			return EXIT_FAILURE;
 		}
 
 		// Use the working directory, where gd.json and res:// live, as the root.

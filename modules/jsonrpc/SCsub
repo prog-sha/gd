@@ -7,3 +7,7 @@ Import("env_modules")
 env_jsonrpc = env_modules.Clone()
 env_jsonrpc.add_source_files(env.modules_sources, "*.cpp")
 
+if env["tests"]:
+    # Compile the remote-call tests into this module.
+    env_jsonrpc.add_source_files(env.modules_sources, "./tests/*.cpp")
+

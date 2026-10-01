@@ -18,7 +18,7 @@
 // Support cleartext, MD5, and SCRAM-SHA-256 authentication.
 //
 // Scripts can call `await db.query("select $1", [1])`.
-// Return R containing a dictionary with columns, rows, and tag.
+// Return a value and Err; query values include columns, rows, and tag.
 
 #include "cli/data/bytes.h"
 #include "cli/sys/pool.h"
@@ -46,7 +46,7 @@ class GDPostgresPackJob : public PoolJob {
 	Array rows; // Argument snapshot read only by the worker.
 	LocalVector<uint8_t> fmts; // Snapshot of per-column result formats.
 	ByteBuf packed; // Outbound bytes produced by the worker.
-	Ref<R> error; // Validation or encoding failure.
+	Ref<Err> error; // Validation or encoding failure.
 	int64_t queued_bytes = 0; // Conservative byte footprint in the connection queue.
 	int64_t work_bytes = 0; // Estimated encoding bytes used to select main-thread processing.
 	uint64_t due = 0; // Encoding deadline.
@@ -80,8 +80,10 @@ class GDPostgresCallInternal : public RefCounted {
 	Ref<GDPostgresCallInternal> self_hold; // Remain alive until completion even without a script reference.
 	Mode mode = QUERYING;
 	uint64_t due = 0; // Operation deadline.
-	Ref<R> pending; // Result delivered on the next scheduler turn.
-	Ref<R> outcome; // Complete result emitted after removal from the queue.
+	VariantPair pending; // Result delivered on the next scheduler turn.
+	VariantPair outcome; // Complete result emitted after removal from the queue.
+	bool pending_ready = false; // Whether a deferred result is waiting.
+	bool outcome_ready = false; // Whether decoding produced an outcome.
 	Dictionary opts; // Username, database name, and password.
 
 	// Accumulate the current result.
@@ -91,6 +93,8 @@ class GDPostgresCallInternal : public RefCounted {
 	LocalVector<uint8_t> fmts; // Per-column result format; one denotes binary.
 	String sql; // SQL key identifying cached column metadata.
 	String stmt; // Server-side statement name used by this query.
+	bool parse_pending = false; // A new statement has not received ParseComplete.
+	bool temporary_stmt = false; // Close a concurrent Parse that is not retained in the cache.
 	bool dropped = false; // Discard canceled replies while retaining queue position.
 	bool shared = false; // Preserve unrelated pooled queries when this caller expires.
 	bool notified = false; // Whether the waiter has already received a result.
@@ -102,9 +106,11 @@ class GDPostgresCallInternal : public RefCounted {
 	int result_rows = 0; // Rows received so far.
 	// Accumulate batch results separately for each query.
 	Array batches;
+	Vector<Ref<Err>> extra_failures; // Later independent SQL failures retained until the batch ends.
 	int want_n = 0; // Expected query count; zero means one query.
 	int done_n = 0; // Completed query count in the batch.
 	int sync_n = 0; // Queries drained through their individual Sync boundaries.
+	bool statement_failed = false; // Current batch member failed; later members still retain their rows.
 	bool discard_many = false; // Return only the completion count without building individual results.
 	bool flat_many = false; // Flatten rows from all batch results into one array.
 	bool values_only = false; // Return each row as a column-ordered array.
@@ -127,13 +133,14 @@ class GDPostgresCallInternal : public RefCounted {
 	void dispatch(uint64_t p_generation); // Dispatch only notifications for the current generation.
 	void deliver_pending(uint64_t p_generation); // Deliver pending results only to the matching operation generation.
 	void deliver_cancel(uint64_t p_generation); // Deliver cancellation once after the waiter attaches.
-	void notify(const Ref<R> &p_out); // Deliver the result once to either the direct waiter or pool operation.
-	void interrupt(const Ref<R> &p_out); // Notify cancellation while retaining the protocol position.
-	void done(const Ref<R> &p_out);
+	void notify(const VariantPair &p_out); // Deliver the result once to either the direct waiter or pool operation.
+	void interrupt(const VariantPair &p_out); // Notify cancellation while retaining the protocol position.
+	void done(const VariantPair &p_out);
 	void reset(); // Reset state for reuse.
+	Ref<Err> all_failures() const; // Combine completed SQL failures when reporting an outcome.
 	void finish(); // Emit the result after leaving the queue.
 	// Defer immediate failures until the caller can begin waiting.
-	void fail_later(const Ref<R> &p_out);
+	void fail_later(const VariantPair &p_out);
 	void set_due(uint64_t p_wait); // Register the deadline with the kernel wait layer.
 	// Process one message and return true on completion.
 	bool take(char p_kind, const uint8_t *p_body, int p_len);
@@ -149,6 +156,7 @@ class GDPostgresCallInternal : public RefCounted {
 
 public:
 	void cancel(); // Report waiter cancellation and retain the operation until protocol synchronization.
+	void abort(); // Close an abandoned connection whose reply may never arrive.
 
 protected:
 	static void _bind_methods();
@@ -178,7 +186,7 @@ class ScramKeyJob : public PoolJob {
 	PackedByteArray password; // Key-derivation input.
 	PackedByteArray salt;
 	int iters = 0; // Peer-selected iteration count.
-	Ref<R> salted; // Derived key or its original failure.
+	VariantPair salted; // Derived key and its original failure.
 	String combined; // Peer nonce used by the continuation.
 	String server_first; // Peer's initial message used by the continuation.
 
@@ -224,6 +232,7 @@ class GDPostgresClient : public RefCounted {
 
 	// Retain prepared statements to avoid reparsing identical SQL.
 	HashMap<String, String> stmts; // SQL mapped to its server-side statement name.
+	HashSet<String> stmt_pending; // Cached names awaiting ParseComplete.
 	List<String> stmt_lru; // Most recently used statements at the front.
 	HashMap<String, List<String>::Element *> stmt_lru_pos; // SQL mapped to its LRU position.
 	// Cache column names per statement to omit repeated Describe exchanges.
@@ -249,7 +258,7 @@ class GDPostgresClient : public RefCounted {
 	void post_pump(); // Schedule buffered continuation or fair yielding for the next turn.
 	void dispatch_pump(); // Pump from the completion queue only when needed.
 	void watch(bool p_on);
-	void drain(const Ref<R> &p_why); // Deliver a failure reason to all waiters.
+	void drain(const VariantPair &p_why); // Deliver a failure reason to all waiters.
 	// Send argument sets through the shared query and query_many implementation.
 	Signal send_rows(const String &p_sql, const Array &p_rows, bool p_many, bool p_discard, bool p_flat = false, int p_max_rows = 0, int64_t p_max_bytes = 0, bool p_values = false, bool p_flat_values = false, bool p_first = false, bool p_flush_now = false);
 	// Create a sequential Rows query that prefetches at most its first row.
@@ -281,7 +290,7 @@ class GDPostgresClient : public RefCounted {
 	Ref<ScramKeyJob> scram_job; // Retain the key-derivation job while it runs on a worker.
 	bool md5_done = false; // Prevent switching away from MD5 authentication.
 
-	Ref<R> fill(int p_max_bytes); // Read socket bytes up to the requested amount.
+	Ref<Err> fill(int p_max_bytes); // Read socket bytes up to the requested amount.
 	// Extract a complete message by buffer position without copying its body.
 	bool next_msg(char &r_kind, int &r_at, int &r_len);
 	// Return the next message's full byte count without advancing the cursor.
@@ -302,13 +311,13 @@ class GDPostgresClient : public RefCounted {
 	bool flush_queued = false;
 	void flush_out(); // Send buffered queries.
 	// Continue connection setup after worker-based hostname resolution.
-	void resolved(const Ref<R> &p_result, const Ref<GDPostgresCallInternal> &p_call);
+	void resolved(const Variant &p_value, const Ref<Err> &p_error, const Ref<GDPostgresCallInternal> &p_call);
 
-	Ref<R> sasl_begin(const PackedByteArray &p_data);
-	Ref<R> sasl_continue(const PackedByteArray &p_data, const String &p_password);
+	Ref<Err> sasl_begin(const PackedByteArray &p_data);
+	Ref<Err> sasl_continue(const PackedByteArray &p_data, const String &p_password);
 	// Build the authentication continuation after worker key derivation completes.
-	void sasl_derived(const Ref<R> &p_salted, const String &p_combined, const String &p_server_first);
-	Ref<R> sasl_final(const PackedByteArray &p_data);
+	void sasl_derived(const VariantPair &p_salted, const String &p_combined, const String &p_server_first);
+	Ref<Err> sasl_final(const PackedByteArray &p_data);
 
 	PackedStringArray row_desc(const uint8_t *p_data, int p_len);
 	Variant data_row(const uint8_t *p_data, int p_len, const LocalVector<StringName> &p_keys, const LocalVector<int32_t> &p_oids, const LocalVector<uint8_t> &p_fmts, bool p_values, Array *r_flat = nullptr);
@@ -333,7 +342,7 @@ public:
 	static void shutdown_all();
 	bool is_open() const;
 	void close();
-	// Return a signal; scripts receive R with `await db.open(...)`.
+	// Return a signal whose completion carries a value and an Err.
 	Signal open(const String &p_host, int64_t p_port, const Dictionary &p_opts);
 	// Send $1 and $2 values separately without interpolating them into SQL.
 	Signal query(const String &p_sql, const Array &p_args);
@@ -375,7 +384,8 @@ class GDPostgresPoolCall : public RefCounted {
 	Ref<GDPostgresCallInternal> inner; // Underlying query receiving cancellation.
 	String sql; // SQL to execute.
 	Array args; // Bind arguments or batched argument sets.
-	Ref<R> pending; // Result delivered once from the completion queue.
+	VariantPair pending; // Result delivered once from the completion queue.
+	bool pending_ready = false; // Whether a completion is waiting.
 	Ref<GDDatabaseRows> stream; // Sequential Rows retained until delivery to the caller.
 	int kind = 0; // Selected query operation kind.
 	int max_rows = 0; // Maximum returned row count.
@@ -388,14 +398,15 @@ class GDPostgresPoolCall : public RefCounted {
 	bool delivery_posted = false; // Prevent duplicate queued result delivery.
 
 	void start(const Ref<GDPostgresClient> &p_conn); // Start the query on the borrowed connection.
-	void answered(const Ref<R> &p_result); // Return connection results through the pool operation.
+	void answered(const VariantPair &p_result); // Return connection results through the pool operation.
 	void settled(); // Return the connection only after draining protocol replies, even after cancellation.
-	void fail_later(const Ref<R> &p_result); // Defer failure until the next turn after the waiter attaches.
+	void fail_later(const VariantPair &p_result); // Defer failure until the next turn after the waiter attaches.
 	void deliver(); // Deliver a pending failure through its signal.
+	void emit_result(const VariantPair &p_result); // Emit both result slots with matching partial work.
 	void deliver_lease(); // Deliver the connection on the next turn after the waiter attaches.
 	void deliver_stream(); // Deliver sequential Rows on the next turn after the waiter attaches.
-	void post_result(const Ref<R> &p_result, bool p_release); // Retain the result and schedule its delivery for the next turn.
-	void finish(const Ref<R> &p_result); // Clean up the connection and self-reference.
+	void post_result(const VariantPair &p_result, bool p_release); // Retain the result and schedule its delivery for the next turn.
+	void finish(const VariantPair &p_result); // Clean up the connection and self-reference.
 	void release(); // Release the occupied connection and self-reference.
 
 	friend class GDPostgresPool;
@@ -408,6 +419,7 @@ protected:
 
 public:
 	void cancel(); // Cancel connection acquisition or the active query.
+	void abort(); // Close an abandoned query's connection and free pool capacity.
 	Ref<GDPostgresClient> connection() const { return conn; } // Physical connection borrowed by a transaction.
 	void release_lease() { release(); } // Return the connection after transaction completion.
 };
@@ -422,24 +434,27 @@ class GDPostgresPool : public RefCounted {
 	String host; // Destination hostname for lazy connection creation.
 	Dictionary opts; // Options for lazily created connections.
 	int port = 5432; // Destination port for lazy connection creation.
-	int default_size = 4; // Maximum connection count selected by the factory.
-	int max_open = 4; // Most recently configured maximum connection count.
+	int default_size = INT_MAX; // Maximum connection count selected by the factory.
+	int max_open = INT_MAX; // Most recently configured maximum connection count.
+	int max_idle = 2; // Maximum connections retained after work completes.
 	int opening = 0; // Connections currently being created.
 	uint64_t query_wait_ms = 0; // Query timeout including connection acquisition.
 	uint64_t generation = 0; // Generation rejecting connection results from before closure.
 	int64_t wait_count = 0; // Cumulative number of queries that waited for a connection.
 	int64_t wait_usec = 0; // Cumulative connection-acquisition wait time.
+	int64_t max_idle_closed = 0; // Connections released above the idle retention count.
 	uint64_t wait_due = 0; // Earliest deadline registered with the kernel wait layer.
 	bool configured = false; // Whether queries may create connections on demand.
 
-	Ref<GDPostgresClient> pick(bool p_exclusive) const; // Prefer unused connections and share the least busy when capacity is reached.
+	Ref<GDPostgresClient> pick() const; // Find a free connection for one operation.
 	Signal send(int p_kind, const String &p_sql, const Array &p_args, int p_max_rows = 0, int64_t p_max_bytes = 0); // Borrow a connection and send a query.
 	void dispatch(); // Assign the first waiter to an available connection.
 	void grow(); // Create only the connections needed by waiters, up to configured capacity.
-	void opened(const Ref<R> &p_result, const Ref<GDPostgresClient> &p_conn, uint64_t p_generation); // Apply lazy-connection results to waiting operations.
+	void opened(const Variant &p_value, const Variant &p_error, const Ref<GDPostgresClient> &p_conn, uint64_t p_generation); // Apply lazy-connection results to waiting operations.
 	void trim_closed(); // Remove closed connections from the physical connection count.
+	void trim_idle(const Ref<GDPostgresClient> &p_preferred); // Retain only the configured number of idle connections.
 	void cancel_wait(GDPostgresPoolCall *p_call); // Remove one waiting operation from the queue.
-	void released(const Ref<GDPostgresClient> &p_conn, bool p_exclusive); // Return one operation without releasing another caller's reservation.
+	void released(const Ref<GDPostgresClient> &p_conn); // Return a borrowed connection after the operation settles.
 	void record_wait(GDPostgresPoolCall *p_call); // Accumulate connection-acquisition time.
 	void sync_wait(); // Register only the earliest deadline with the event loop.
 	void step(); // Finish all waiters whose deadlines have expired.
@@ -452,7 +467,7 @@ protected:
 
 public:
 	GDPostgresPool();
-	void set_default_size(int64_t p_size); // Use CPU-derived capacity for zero or the specified positive maximum.
+	void set_default_size(int64_t p_size); // Use the uncapped default for zero or the specified positive maximum.
 	Signal acquire(); // Acquire a transaction connection through the ordinary query wait queue.
 	static Signal no_conn(); // Return a failure when the pool is not open.
 	// Configure the pool and create connections lazily on first use.
@@ -476,6 +491,7 @@ public:
 	// Batch updates through one connection and return only the completion count.
 	Signal exec_many(const String &p_sql, const Array &p_rows);
 	void close();
+	// Return the number of physical connections currently owned by this pool.
 	int size() const { return conns.size(); }
 	int in_flight() const;
 	Dictionary stats() const; // Return connection-pool state and cumulative wait statistics.

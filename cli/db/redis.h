@@ -10,7 +10,7 @@
 // Send array-form commands and read both RESP2 and RESP3 replies.
 //
 // Scripts can call `await db.query("GET", ["k"])`.
-// The result is an R value.
+// Operations return a value and an Err through two result slots.
 
 #include "cli/data/bytes.h"
 #include "cli/sys/pool.h"
@@ -34,7 +34,7 @@ class GDRedisPackJob : public PoolJob {
 	Array args; // Single-command arguments.
 	Array cmds; // Pipeline commands.
 	ByteBuf packed; // Outbound bytes produced by the worker.
-	Ref<R> error; // Encoding failure.
+	Ref<Err> error; // Encoding failure.
 	int64_t queued_bytes = 0; // Conservative byte footprint in the connection queue.
 	bool batch = false; // Whether to encode a pipeline.
 	bool subscription = false; // Whether success switches to passive subscription reads.
@@ -55,6 +55,7 @@ class GDRedisCallInternal : public RefCounted {
 	enum Mode {
 		RESOLVING, // Resolve the hostname on a worker.
 		OPENING, // Wait for connection establishment.
+		WRITING, // Wait for command bytes to leave the socket.
 		READING, // Wait for a complete reply.
 	};
 
@@ -62,13 +63,15 @@ class GDRedisCallInternal : public RefCounted {
 	Ref<GDRedisCallInternal> self_hold; // Remain alive until completion even without a script reference.
 	Mode mode = READING;
 	uint64_t due = 0; // Operation deadline.
-	Ref<R> pending; // Result delivered on the next scheduler turn.
+	VariantPair pending; // Both result slots delivered on the next scheduler turn.
+	bool pending_ready = false; // Whether a deferred result is waiting.
 	String password; // Password sent immediately after connecting, or empty if absent.
 	int want_replies = 1; // Expected reply count, increased for pipelines.
 	Array collected; // Replies collected from a pipeline.
 	enum Shape { VALUE, BATCH, EXEC }; // Public result shape independent of reply count.
 	Shape shape = VALUE; // Single command, pipeline, or transaction result.
 	bool dropped = false; // Discard canceled replies while retaining queue position.
+	bool authenticating = false; // The opening operation owns a pending authentication command.
 	bool notified = false; // Whether the waiter has already received a result.
 	bool posted = false; // Prevent duplicate runtime ready-queue entries.
 	uint64_t generation = 1; // Generation identifying stale notifications after reuse.
@@ -77,18 +80,20 @@ class GDRedisCallInternal : public RefCounted {
 	void step(); // Advance from the runtime ready queue.
 	void schedule(); // Schedule once for the next event-loop turn.
 	void dispatch(uint64_t p_generation); // Dispatch only notifications for the current generation.
-	void done(const Ref<R> &p_out);
+	void done(const VariantPair &p_out);
+	void emit_result(const Variant &p_value, const Ref<Err> &p_error); // Deliver both slots with matching partial work.
 	// Defer immediate failures until the caller can begin waiting.
-	void fail_later(const Ref<R> &p_out);
+	void fail_later(const VariantPair &p_out);
 	void set_due(uint64_t p_wait); // Register the deadline with the kernel wait layer.
-	Ref<R> result(const Ref<R> &p_error = Ref<R>()) const; // Preserve command positions and failure causes.
-	void on_auth(const Ref<R> &p_out); // Receive the authentication result.
+	VariantPair result(const VariantPair &p_error = VariantPair()) const; // Preserve command positions and failure causes.
+	void on_auth(const Variant &p_value, const Variant &p_error); // Receive the authentication result.
 
 	friend class GDRedisClient;
 	friend class GDRedisPool;
 
 public:
 	void cancel(); // Close the connection when the waiter cancels.
+	void abort(); // Close an abandoned connection whose reply may never arrive.
 
 protected:
 	static void _bind_methods();
@@ -105,6 +110,10 @@ class GDRedisClient : public RefCounted {
 	// to avoid one socket write per command.
 	ByteBuf out_buf;
 	ByteBuf next_buf; // Next bytes completed by a worker during the previous send.
+	Ref<GDRedisCallInternal> writing; // Operation whose bytes occupy the current output buffer.
+	Ref<GDRedisCallInternal> next_writing; // Operation whose bytes occupy the next output buffer.
+	uint64_t writing_generation = 0; // Reject an operation recycled before output completion.
+	uint64_t next_writing_generation = 0; // Reject a recycled next operation.
 	bool flush_queued = false; // Whether a flush is scheduled for the next turn.
 	PackedByteArray buf; // Partially consumed receive buffer.
 	int buf_at = 0; // Read cursor advanced without deleting the prefix.
@@ -124,7 +133,8 @@ class GDRedisClient : public RefCounted {
 	String host;
 	int port = 6379;
 	String password;
-	uint64_t wait_ms = 10000; // Connection and response timeout; zero waits until cancellation.
+	uint64_t read_ms = 5000; // Timeout for a complete command reply.
+	uint64_t write_ms = 5000; // Timeout for encoding and sending one command.
 
 	// Complete queued replies in send order for pipelined operations.
 	List<Ref<GDRedisCallInternal>> inflight;
@@ -141,8 +151,8 @@ class GDRedisClient : public RefCounted {
 	LocalVector<Ref<GDRedisCallInternal>> spare; // Reusable operation objects.
 
 	// Resume parsing one reply; retain incomplete state and return ok(false).
-	Ref<R> take_reply(int &r_at, Variant &r_value, bool &r_ready, uint64_t p_due);
-	Ref<R> fill(); // Read all currently available socket bytes.
+	Ref<Err> take_reply(int &r_at, Variant &r_value, bool &r_ready, uint64_t p_due);
+	Ref<Err> fill(); // Read all currently available socket bytes.
 	// Borrow and return operation objects to avoid repeated registration.
 	Ref<GDRedisCallInternal> lend();
 	void give_back(GDRedisCallInternal *p_call);
@@ -152,7 +162,6 @@ class GDRedisClient : public RefCounted {
 	Ref<GDRedisCallInternal> start_batch(const Array &p_cmds);
 	// Encode one command directly into bytes.
 	static bool pack_cmd(ByteBuf &r_out, const String &p_cmd, const Array &p_args);
-	bool write_cmd(const String &p_cmd, const Array &p_args); // Buffer a command when it fits the configured limits.
 	void queue_pack(const Ref<GDRedisPackJob> &p_job); // Append to the connection's encoding queue.
 	void start_pack(); // Submit only the first encoding job to the CPU pool.
 	void packed(GDRedisPackJob *p_job); // Move worker-produced bytes into the send queue in arrival order.
@@ -164,9 +173,9 @@ class GDRedisClient : public RefCounted {
 	void dispatch_pump(); // Pump from the ready queue only when needed.
 	void emit_push(const Variant &p_reply); // Deliver an unsolicited message.
 	void watch(bool p_on);
-	void fail_connection(const Ref<R> &p_why); // Close the connection and all waiters after losing response framing.
+	void fail_connection(const VariantPair &p_why); // Close the connection and all waiters after losing response framing.
 	// Continue connection setup after worker-based hostname resolution.
-	void resolved(const Ref<R> &p_result, const Ref<GDRedisCallInternal> &p_call);
+	void resolved(const Variant &p_value, const Ref<Err> &p_error, const Ref<GDRedisCallInternal> &p_call);
 
 	friend class GDRedisCallInternal;
 	friend class GDRedisPackJob;
@@ -184,7 +193,7 @@ public:
 	bool is_open() const;
 	void close();
 	// Connect and immediately authenticate when a password is supplied.
-	// Return a signal; scripts receive R with `await db.open(...)`.
+	// Return a signal whose completion carries a value and an Err.
 	Signal open(const String &p_host, int64_t p_port, const Dictionary &p_opts);
 	// Send one command and read one reply; additional commands may queue without waiting.
 	Signal query(const String &p_cmd, const Array &p_args);
@@ -195,7 +204,9 @@ public:
 	Signal transaction(const Array &p_cmds);
 	// Begin subscription reads and emit message for each received item.
 	Signal subscribe(const PackedStringArray &p_channels);
+	// Count commands queued for encoding or awaiting server replies.
 	int in_flight() const { return inflight.size() + packing.size(); }
+	// Return whether this connection is in subscription mode.
 	bool is_subscribed() const { return subscribed; }
 };
 
@@ -208,15 +219,15 @@ class GDRedisPoolCall : public RefCounted {
 	Signal inner; // Connection or query completion signal.
 	String cmd; // Command name to send.
 	Array args; // Arguments retained at call time.
-	Ref<R> outcome; // Result delivered on the next ready-queue turn.
+	VariantPair outcome; // Value and error delivered on the next ready-queue turn.
 	List<Ref<GDRedisPoolCall>>::Element *entry = nullptr; // Entry in the pool's complete operation list.
 	List<Ref<GDRedisPoolCall>>::Element *waiting = nullptr; // Position in the connection wait queue.
 	uint64_t due = 0; // Connection-wait deadline; zero waits until cancellation.
 	bool opening = false; // Whether a physical connection is being established.
 	bool done = false; // Prevent duplicate completion or cancellation.
 	void start(const Ref<GDRedisClient> &p_conn, bool p_open); // Borrow a connection and start the operation.
-	void received(const Ref<R> &p_out); // Receive connection or query results.
-	void finish(const Ref<R> &p_out, bool p_close = false); // Return the connection and release the wait entry.
+	void received(const Variant &p_value, const Variant &p_error); // Receive connection or query results.
+	void finish(const VariantPair &p_out, bool p_close = false); // Return the connection and release the wait entry.
 	void deliver(); // Deliver the result exactly once.
 	void expired(); // Check the connection-wait deadline.
 	friend class GDRedisPool;
@@ -232,18 +243,23 @@ public:
 class GDRedisPool : public RefCounted {
 	GDCLASS(GDRedisPool, RefCounted);
 
+	struct Idle {
+		Ref<GDRedisClient> conn; // Reusable physical connection.
+		uint64_t since = 0; // Time it became idle.
+	};
 	Vector<Ref<GDRedisClient>> conns;
-	Vector<Ref<GDRedisClient>> idle; // Reuse returned connections in LIFO order.
+	Vector<Idle> idle; // Reuse returned connections in LIFO order.
 	List<Ref<GDRedisPoolCall>> calls; // All incomplete operations.
 	List<Ref<GDRedisPoolCall>> waits; // Operations waiting for a connection in arrival order.
 	String host; // Configured destination.
 	Dictionary opts; // Options passed to each physical connection.
 	int port = 6379; // Default key-value server port.
-	int default_size = 0; // Factory maximum connection count; zero leaves it unspecified.
-	int max_open = 0; // Configured maximum connection count; zero is unlimited.
+	int default_size = 0; // Factory maximum connection count; zero selects the CPU-derived default.
+	int max_open = 0; // Configured maximum connection count.
 	int dial_limit = 1; // CPU-derived concurrent connection-creation limit.
 	int opening = 0; // Connections currently being established.
 	uint64_t wait_ms = 0; // Connection-wait timeout.
+	uint64_t idle_ms = 1800000; // Maximum time a returned connection may be reused.
 	bool configured = false; // Whether a usable destination is configured.
 	bool posted = false; // Prevent duplicate scheduling of connection-wait resumptions.
 	void schedule(); // Schedule connection-wait continuation on the ready queue.
@@ -262,6 +278,7 @@ public:
 	// Borrow a connection exclusively, waiting for return when the pool is at capacity.
 	Signal query(const String &p_cmd, const Array &p_args);
 	void close();
+	// Return the number of physical connections currently owned by this pool.
 	int size() const { return conns.size(); }
 	int in_flight() const;
 };

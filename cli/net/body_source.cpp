@@ -1,11 +1,14 @@
 // Adapt asynchronous response producers to ordered byte writes without scene-tree work.
 #include "cli/net/body_source.h"
+#include "cli/sys/gdtask.h"
+#include "cli/net/serve.h"
 #include "cli/data/utf8.h"
 #include "cli/sys/clock.h"
 #include "cli/sys/sched.h"
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
 #include "modules/gdscript/gdscript_function.h"
+#include "cli/sys/task.h"
 
 namespace {
 #ifdef WINDOWS_ENABLED
@@ -16,18 +19,14 @@ constexpr int64_t high_water = 64 * 1024; // Published-byte backpressure, never 
 }
 
 // Create a response while leaving producer execution lazy for HEAD and suppressed bodies.
-Dictionary GDWebWriter::reply(const Callable &p_producer, int64_t p_length, const String &p_type, int64_t p_status) {
+Ref<GDWebResponse> GDWebWriter::reply(const Callable &p_producer, int64_t p_length, const String &p_type, int64_t p_status) {
 	Ref<GDWebWriter> writer;
 	writer.instantiate();
 	writer->producer = p_producer;
 	writer->length = p_length;
 	if (!p_producer.is_valid() || p_length < -1) { writer->why = "invalid response producer"; writer->ended = true; }
-	Dictionary headers, response;
-	headers["Content-Type"] = p_type;
-	response["headers"] = headers;
-	response["status"] = p_status;
-	response["body"] = writer;
-	return response;
+	const HttpType kind = http_type_of(p_type);
+	return GDWebResponse::make(p_status, kind, writer, kind == HTTP_TYPE_CUSTOM ? p_type : String());
 }
 
 // Acknowledge the preceding batch, then transfer all currently queued ranges together.
@@ -38,7 +37,7 @@ bool GDWebWriter::take(BodyChunk &r_chunk) {
 		batch = false;
 		while (!queue.is_empty() && queue.front()->get()->end <= consumed) {
 			const Ref<GDWebWriteCall> call = queue.front()->get();
-			call->settle(R::ok(call->count));
+			call->settle({ call->count, Variant() });
 			queue.pop_front();
 		}
 	}
@@ -58,10 +57,10 @@ bool GDWebWriter::take(BodyChunk &r_chunk) {
 }
 
 // Retain complete input ranges and apply backpressure without rejecting oversized writes.
-Variant GDWebWriter::write(const PackedByteArray &p_bytes, int64_t p_offset, int64_t p_count) {
-	if (ended || !why.is_empty()) return R::err("response writer is closed", Err::INTERRUPTED, 0);
+VariantPair GDWebWriter::write(const PackedByteArray &p_bytes, int64_t p_offset, int64_t p_count) {
+	if (ended || !why.is_empty()) return { 0, Err::make("response writer is closed", Err::INTERRUPTED) };
 	if (p_offset < 0 || p_offset > p_bytes.size() || p_count < -1 || p_count > p_bytes.size() - p_offset)
-		return R::err("invalid write range", Err::INVALID_DATA, 0);
+		return { 0, Err::make("invalid write range", Err::INVALID_DATA) };
 	if (p_count < 0) p_count = p_bytes.size() - p_offset;
 	if (input.is_empty()) return accept(p_bytes, p_offset, p_count);
 	Input item;
@@ -72,22 +71,22 @@ Variant GDWebWriter::write(const PackedByteArray &p_bytes, int64_t p_offset, int
 }
 
 // Commit only measured operations; producer EOF does not reject previously queued input.
-Variant GDWebWriter::accept(const PackedByteArray &p_bytes, int64_t p_offset, int64_t p_count, const Ref<GDWebWriteCall> &p_call) {
-	if (!why.is_empty()) return R::err("response writer is closed", Err::INTERRUPTED, 0);
+VariantPair GDWebWriter::accept(const PackedByteArray &p_bytes, int64_t p_offset, int64_t p_count, const Ref<GDWebWriteCall> &p_call) {
+	if (!why.is_empty()) return { 0, Err::make("response writer is closed", Err::INTERRUPTED) };
 	if (p_offset < 0 || p_offset > p_bytes.size() || p_count < -1 || p_count > p_bytes.size() - p_offset)
-		return R::err("invalid write range", Err::INVALID_DATA, 0);
+		return { 0, Err::make("invalid write range", Err::INVALID_DATA) };
 	if (p_count < 0) p_count = p_bytes.size() - p_offset;
 	if (p_count > INT64_MAX - total || (length >= 0 && p_count > length - total)) {
 		why = "response exceeds declared length";
 		post();
-		return R::err(why, Err::INVALID_DATA, 0);
+		return { 0, Err::make(why, Err::INVALID_DATA) };
 	}
 	total += p_count;
 	buffered.append(p_bytes, p_offset, p_count);
 	// Let consecutive small writes share a transport batch; an empty write is a flush barrier.
 	if (p_count && total - consumed < high_water) {
 		post();
-		return R::okv(p_count);
+		return { p_count, Variant() };
 	}
 	Ref<GDWebWriteCall> call = p_call;
 	if (call.is_null()) call.instantiate();
@@ -96,22 +95,22 @@ Variant GDWebWriter::accept(const PackedByteArray &p_bytes, int64_t p_offset, in
 	queue.push_back(call);
 	if (drain.is_valid()) drain.call();
 	else post();
-	if (call->result.is_valid()) return call->result;
+	if (call->settled) return call->result;
 	call->waiting = true;
-	return Signal(call.ptr(), "finished");
+	return { Signal(call.ptr(), "finished"), Variant() };
 }
 
 // Keep explicit asynchronous calls signal-valued even when the buffer accepts bytes immediately.
 Signal GDWebWriter::write_async(const PackedByteArray &p_bytes, int64_t p_offset, int64_t p_count) {
-	const Variant result = write(p_bytes, p_offset, p_count);
-	return result.get_type() == Variant::SIGNAL ? Signal(result) : Async::ready(result);
+	const VariantPair result = write(p_bytes, p_offset, p_count);
+	return result.value.get_type() == Variant::SIGNAL ? Signal(result.value) : Async::ready_pair(result);
 }
 
 // Encode a selected character range without copying the source text or bypassing byte-write accounting.
-Variant GDWebWriter::write_text(const String &p_text, int64_t p_offset, int64_t p_count) {
-	if (ended || !why.is_empty()) return R::err("response writer is closed", Err::INTERRUPTED, 0);
+VariantPair GDWebWriter::write_text(const String &p_text, int64_t p_offset, int64_t p_count) {
+	if (ended || !why.is_empty()) return { 0, Err::make("response writer is closed", Err::INTERRUPTED) };
 	if (p_offset < 0 || p_offset > p_text.length() || p_count < -1 || p_count > p_text.length() - p_offset)
-		return R::err("cannot encode text range", Err::INVALID_DATA, 0);
+		return { 0, Err::make("cannot encode text range", Err::INVALID_DATA) };
 	Utf8Text text;
 	text.text = p_text;
 	text.begin = int(p_offset);
@@ -120,7 +119,7 @@ Variant GDWebWriter::write_text(const String &p_text, int64_t p_offset, int64_t 
 	const uint64_t outer = GDScriptFunction::native_time_slice_deadline();
 	const uint64_t until = outer ? outer : GDClock::usec() + GD_SCHED_SLICE_USEC;
 	if (input.is_empty() && total - consumed < high_water && text.advance(until)) {
-		if (text.error != OK) return R::err("cannot encode text range", Err::LIMITED, 0);
+		if (text.error != OK) return { 0, Err::make("cannot encode text range", Err::NONE) };
 		return accept(text.bytes, 0, text.bytes.size());
 	}
 	Input item;
@@ -129,13 +128,13 @@ Variant GDWebWriter::write_text(const String &p_text, int64_t p_offset, int64_t 
 }
 
 // Retain operation order before exposing a completion signal to the producer.
-Variant GDWebWriter::enqueue(Input &&p_input) {
+VariantPair GDWebWriter::enqueue(Input &&p_input) {
 	p_input.call.instantiate();
 	const Ref<GDWebWriteCall> call = p_input.call;
 	call->waiting = true;
 	input.push_back(std::move(p_input));
 	post_pump();
-	return Signal(call.ptr(), "finished");
+	return { Signal(call.ptr(), "finished"), Variant() };
 }
 
 // Schedule only work that can progress; unknown byte reservations never block their own encoder.
@@ -165,7 +164,7 @@ void GDWebWriter::pump() {
 				cancel_conversion();
 				front.error = Err::make("cannot await text conversion", Err::of(connected));
 			} else {
-				if (front.text->error != OK) front.error = Err::make("cannot encode text range", Err::LIMITED);
+				if (front.text->error != OK) front.error = Err::make("cannot encode text range", Err::NONE);
 				front.bytes = std::move(front.text->bytes);
 				front.offset = 0;
 				front.count = front.bytes.size();
@@ -174,22 +173,22 @@ void GDWebWriter::pump() {
 		}
 		Input item = std::move(front);
 		input.pop_front(); // Transport reentry cannot observe this operation twice.
-		Variant result;
+		VariantPair result;
 		if (item.error.is_valid()) {
-			result = R::err(item.error, Err::NONE, 0);
+			result = { 0, item.error };
 		} else {
 			result = accept(item.bytes, item.offset, item.count, item.call);
 		}
-		if (result.get_type() != Variant::SIGNAL) {
-			const Ref<R> value = result;
-			item.call->settle(value);
-			if (!value->get_ok()) {
+		if (result.value.get_type() != Variant::SIGNAL) {
+			item.call->settle(result);
+			const Ref<Err> error = result.error;
+			if (error.is_valid()) {
 				// Fail the unpublished suffix without inventing byte offsets for unmeasured text.
 				while (!input.is_empty()) {
-					input.front()->get().call->settle(R::err("preceding response write failed", Err::INTERRUPTED, 0));
+					input.front()->get().call->settle({ 0, Err::make("preceding response write failed", Err::INTERRUPTED) });
 					input.pop_front();
 				}
-				if (ended && why.is_empty()) why = value->get_e()->text();
+				if (ended && why.is_empty()) why = error->text();
 				break;
 			}
 		}
@@ -212,8 +211,8 @@ void GDWebWriter::converted(const Variant &p_value) {
 		front.offset = 0;
 		front.count = front.bytes.size();
 	} else {
-		const Ref<R> result = p_value.get_type() == Variant::OBJECT ? Ref<R>(p_value) : Ref<R>();
-		front.error = result.is_valid() && !result->get_ok() ? result->get_e() : Err::make("invalid text conversion result", Err::INVALID_DATA);
+		const Ref<Err> error = p_value.get_type() == Variant::OBJECT ? Ref<Err>(p_value) : Ref<Err>();
+		front.error = error.is_valid() ? error : Err::make("invalid text conversion result", Err::INVALID_DATA);
 	}
 	post_pump();
 }
@@ -236,8 +235,8 @@ void GDWebWriter::check_length() {
 
 // Preserve the explicit signal contract for both immediately accepted and suspended text writes.
 Signal GDWebWriter::write_text_async(const String &p_text, int64_t p_offset, int64_t p_count) {
-	const Variant result = write_text(p_text, p_offset, p_count);
-	return result.get_type() == Variant::SIGNAL ? Signal(result) : Async::ready(result);
+	const VariantPair result = write_text(p_text, p_offset, p_count);
+	return result.value.get_type() == Variant::SIGNAL ? Signal(result.value) : Async::ready_pair(result);
 }
 
 // Run producer code with the shared scheduler time slice on the owning runtime.
@@ -246,33 +245,64 @@ void GDWebWriter::step() {
 	const Variant writer = Ref<GDWebWriter>(this);
 	const Variant *args[] = {&writer};
 	Variant result;
+	Variant result_error;
 	Callable::CallError error;
+	error.result_error = &result_error;
 	const bool sliced = GDScriptFunction::begin_time_slice();
 	{
 		GDScriptFunction::SuspendableCall suspendable;
 		producer.callp(args, 1, result, error);
 	}
 	if (sliced) GDScriptFunction::end_time_slice();
-	received(error.error == Callable::CallError::CALL_OK ? result : Variant(R::err("response producer failed", Err::INVALID_DATA)));
+	const bool succeeded = error.error == Callable::CallError::CALL_OK && !error.runtime_failed;
+	received_pair(succeeded ? result : Variant(), succeeded ? result_error : Variant(Err::make("response producer failed", Err::INVALID_DATA)));
 }
 
-// Retain suspended functions and reject non-void producer results except explicit result wrappers.
+// Complete a producer that returns one value.
 void GDWebWriter::received(const Variant &p_value) {
+	received_pair(p_value, Variant());
+}
+
+// Retain suspended producers and keep their error in a separate slot.
+void GDWebWriter::received_pair(const Variant &p_value, const Variant &p_error) {
 	if (ended) return;
 	wait = Signal();
 	hold.unref();
-	if (p_value.get_type() == Variant::SIGNAL) wait = p_value;
-	else if (p_value.get_type() == Variant::OBJECT && Object::cast_to<GDScriptFunctionState>(p_value.get_validated_object())) wait = Signal(p_value.get_validated_object(), "completed");
+	const Ref<Err> failure = p_error;
+	if (failure.is_valid()) {
+		why = failure->text();
+		ended = true;
+		producer = Callable();
+		check_length();
+		post_pump();
+		post();
+		return;
+	}
+	const Variant value = GDTask::as_signal(p_value); // A producer may return a started task.
+	if (value.get_type() == Variant::SIGNAL) wait = value;
+	else if (value.get_type() == Variant::OBJECT && Object::cast_to<GDScriptFunctionState>(value.get_validated_object())) wait = Signal(value.get_validated_object(), "completed");
 	if (!wait.is_null()) {
 		hold = Ref<RefCounted>(Object::cast_to<RefCounted>(wait.get_object()));
-		if (wait.connect(callable_mp(this, &GDWebWriter::received), Object::CONNECT_ONE_SHOT) == OK) return;
+		const GDScriptFunctionState *state = Object::cast_to<GDScriptFunctionState>(wait.get_object());
+		wait_pair = state && state->is_pair_return();
+		if (!wait_pair && wait.get_object()) {
+			List<MethodInfo> signals;
+			wait.get_object()->get_signal_list(&signals);
+			for (const MethodInfo &info : signals) {
+				if (info.name != wait.get_name()) continue;
+				wait_pair = info.arguments.size() == 2 && info.arguments[1].type == Variant::OBJECT && info.arguments[1].hint_string == "Err";
+				break;
+			}
+		}
+		const Callable done = wait_pair ? callable_mp(this, &GDWebWriter::received_pair) : callable_mp(this, &GDWebWriter::received);
+		if (wait.connect(done, Object::CONNECT_ONE_SHOT) == OK) return;
 		wait = Signal();
 		hold.unref();
 		why = "cannot await response producer";
 	} else {
-		const Ref<R> result = p_value.get_type() == Variant::OBJECT ? Ref<R>(p_value) : Ref<R>();
-		if (result.is_valid() && !result->get_ok()) why = result->get_e()->text();
-		else if (p_value.get_type() != Variant::NIL && result.is_null()) why = "response producer must return void or R";
+		const Ref<Err> error = p_value;
+		if (error.is_valid()) why = error->text();
+		else if (p_value.get_type() != Variant::NIL && !(p_value.get_type() == Variant::OBJECT && p_value.get_validated_object() == nullptr)) why = "response producer must return void or Err";
 	}
 	ended = true;
 	producer = Callable();
@@ -317,7 +347,7 @@ void GDWebWriter::discard(int64_t p_sent) {
 	drain = Callable();
 	producer = Callable();
 	if (!wait.is_null() && wait.get_object()) {
-		const Callable resume = callable_mp(this, &GDWebWriter::received);
+		const Callable resume = wait_pair ? callable_mp(this, &GDWebWriter::received_pair) : callable_mp(this, &GDWebWriter::received);
 		if (wait.is_connected(resume)) wait.disconnect(resume);
 		// Keep the producer's own wait connected so failed writes and context cancellation can resume cleanup.
 	}
@@ -330,12 +360,12 @@ void GDWebWriter::discard(int64_t p_sent) {
 	while (!queue.is_empty()) {
 		const Ref<GDWebWriteCall> call = queue.front()->get();
 		const int64_t sent = CLAMP(progress - (call->end - call->count), int64_t(0), call->count);
-		call->settle(R::err("response transport closed", Err::INTERRUPTED, sent));
+		call->settle({ sent, Err::make("response transport closed", Err::INTERRUPTED) });
 		queue.pop_front();
 	}
 	// Published barriers precede every unpublished input, including on cancellation.
 	while (!input.is_empty()) {
-		input.front()->get().call->settle(R::err("response transport closed", Err::INTERRUPTED, 0));
+		input.front()->get().call->settle({ 0, Err::make("response transport closed", Err::INTERRUPTED) });
 		input.pop_front();
 	}
 }
@@ -351,19 +381,22 @@ void GDWebWriter::peer_closed() {
 }
 
 // Publish completion outside the HTTP send stack.
-void GDWebWriteCall::settle(const Ref<R> &p_result) {
-	if (result.is_valid()) return;
+void GDWebWriteCall::settle(const VariantPair &p_result) {
+	if (settled) return;
 	result = p_result;
+	const Ref<Err> error = result.error;
+	if (error.is_valid()) result.error = error->with_partial(result.value);
+	settled = true;
 	if (waiting) Async::post(Ref<RefCounted>(this), callable_mp(this, &GDWebWriteCall::deliver));
 }
 
 // Resume the producer with its settled write result.
 void GDWebWriteCall::deliver() {
-	emit_signal("finished", result);
+	Async::finish(this, SNAME("finished"), result.value, result.error);
 }
 
 // Register the common Writer completion result.
-void GDWebWriteCall::_bind_methods() { ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::OBJECT, "result", PROPERTY_HINT_RESOURCE_TYPE, "R"))); }
+void GDWebWriteCall::_bind_methods() { ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::INT, "count"), PropertyInfo(Variant::OBJECT, "error", PROPERTY_HINT_RESOURCE_TYPE, "Err"))); }
 
 // Expose byte writes and flushing while keeping body lifecycle owned by the HTTP transport.
 void GDWebWriter::_bind_methods() {
@@ -373,7 +406,8 @@ void GDWebWriter::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("write_text_async", "text", "offset", "count"), &GDWebWriter::write_text_async, DEFVAL(0), DEFVAL(-1));
 	ClassDB::bind_method(D_METHOD("flush"), &GDWebWriter::flush);
 	ClassDB::bind_method(D_METHOD("flush_async"), &GDWebWriter::flush_async);
-	ADD_AWAIT("write", "R:int"); ADD_AWAIT("write_async", "R:int"); ADD_AUTO_WAIT("write");
-	ADD_AWAIT("write_text", "R:int"); ADD_AWAIT("write_text_async", "R:int"); ADD_AUTO_WAIT("write_text");
-	ADD_AWAIT("flush", "R:int"); ADD_AWAIT("flush_async", "R:int"); ADD_AUTO_WAIT("flush");
+	ADD_AWAIT("write", "Pair:int"); ADD_AWAIT("write_async", "Pair:int"); ADD_AUTO_WAIT("write");
+	ADD_AWAIT("write_text", "Pair:int"); ADD_AWAIT("write_text_async", "Pair:int"); ADD_AUTO_WAIT("write_text");
+	ADD_AWAIT("flush", "Pair:int"); ADD_AWAIT("flush_async", "Pair:int"); ADD_AUTO_WAIT("flush");
+	ADD_PAIR_RESULT("write", "int"); ADD_PAIR_RESULT("write_text", "int"); ADD_PAIR_RESULT("flush", "int");
 }
